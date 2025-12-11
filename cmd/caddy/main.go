@@ -7,7 +7,7 @@ import (
 
 	// plug in Caddy modules here
 	_ "github.com/caddyserver/caddy/v2/modules/standard"
-	_ "github.com/idct/nuts"
+	_ "github.com/ideaconnect/nuts"
 )
 
 func main() {
