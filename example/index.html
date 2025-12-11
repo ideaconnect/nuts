@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NUTS - NATS SSE Client Demo</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .controls {
+            margin-bottom: 20px;
+        }
+        input[type="text"] {
+            padding: 10px;
+            width: 300px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        button {
+            padding: 10px 20px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        button.disconnect {
+            background: #dc3545;
+        }
+        button.disconnect:hover {
+            background: #c82333;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .status.connected {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status.disconnected {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .status.connecting {
+            background: #fff3cd;
+            color: #856404;
+        }
+        #messages {
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            background: #fafafa;
+        }
+        .message {
+            padding: 10px;
+            margin: 5px 0;
+            background: white;
+            border-radius: 4px;
+            border-left: 4px solid #007bff;
+        }
+        .message .topic {
+            font-weight: bold;
+            color: #007bff;
+        }
+        .message .time {
+            font-size: 12px;
+            color: #999;
+        }
+        .message .payload {
+            margin-top: 5px;
+            font-family: monospace;
+            background: #f5f5f5;
+            padding: 5px;
+            border-radius: 2px;
+            word-break: break-all;
+        }
+        .heartbeat {
+            font-size: 12px;
+            color: #999;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🥜 NUTS - NATS SSE Client</h1>
+        
+        <div class="controls">
+            <input type="text" id="topics" placeholder="Enter topics (comma-separated)" value="test,notifications">
+            <button id="connectBtn" onclick="connect()">Connect</button>
+            <button id="disconnectBtn" onclick="disconnect()" disabled class="disconnect">Disconnect</button>
+        </div>
+        
+        <div id="status" class="status disconnected">Disconnected</div>
+        
+        <h3>Messages</h3>
+        <div id="messages">
+            <p style="color: #999; text-align: center;">No messages yet...</p>
+        </div>
+    </div>
+
+    <script>
+        let eventSource = null;
+        
+        function connect() {
+            const topicsInput = document.getElementById('topics').value;
+            const topics = topicsInput.split(',').map(t => t.trim()).filter(t => t);
+            
+            if (topics.length === 0) {
+                alert('Please enter at least one topic');
+                return;
+            }
+            
+            const params = topics.map(t => `topic=${encodeURIComponent(t)}`).join('&');
+            const url = `/events?${params}`;
+            
+            setStatus('connecting', `Connecting to ${topics.join(', ')}...`);
+            
+            eventSource = new EventSource(url);
+            
+            eventSource.addEventListener('connected', function(e) {
+                const data = JSON.parse(e.data);
+                setStatus('connected', `Connected to topics: ${data.topics.join(', ')}`);
+                document.getElementById('connectBtn').disabled = true;
+                document.getElementById('disconnectBtn').disabled = false;
+            });
+            
+            eventSource.addEventListener('message', function(e) {
+                const data = JSON.parse(e.data);
+                addMessage(data);
+            });
+            
+            eventSource.onerror = function(e) {
+                if (eventSource.readyState === EventSource.CLOSED) {
+                    setStatus('disconnected', 'Connection closed');
+                    resetButtons();
+                } else {
+                    setStatus('connecting', 'Connection error, reconnecting...');
+                }
+            };
+        }
+        
+        function disconnect() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            setStatus('disconnected', 'Disconnected');
+            resetButtons();
+        }
+        
+        function resetButtons() {
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('disconnectBtn').disabled = true;
+        }
+        
+        function setStatus(state, text) {
+            const statusEl = document.getElementById('status');
+            statusEl.className = `status ${state}`;
+            statusEl.textContent = text;
+        }
+        
+        function addMessage(data) {
+            const messagesEl = document.getElementById('messages');
+            
+            // Remove placeholder if present
+            const placeholder = messagesEl.querySelector('p');
+            if (placeholder) {
+                placeholder.remove();
+            }
+            
+            const messageEl = document.createElement('div');
+            messageEl.className = 'message';
+            messageEl.innerHTML = `
+                <div class="topic">${escapeHtml(data.topic)}</div>
+                <div class="time">${data.time}</div>
+                <div class="payload">${escapeHtml(JSON.stringify(data.payload, null, 2))}</div>
+            `;
+            
+            messagesEl.insertBefore(messageEl, messagesEl.firstChild);
+            
+            // Limit to 100 messages
+            while (messagesEl.children.length > 100) {
+                messagesEl.removeChild(messagesEl.lastChild);
+            }
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>

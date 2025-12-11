@@ -1,0 +1,61 @@
+# Example Caddyfile for the nuts module
+#
+# This configuration sets up a Caddy server with the nuts module
+# that bridges NATS.io messages to Server-Sent Events.
+
+{
+	# Global options
+	admin off
+	
+	# Order the nuts directive in the handler chain
+	order nuts before respond
+}
+
+# Main site configuration
+:8080 {
+	# SSE endpoint for NATS messages
+	# Clients can connect to:
+	#   - /events?topic=my-topic
+	#   - /events?topic=topic1&topic=topic2  (multiple topics)
+	#   - /events/my-topic  (path-based topic)
+	route /events* {
+		nuts {
+			# NATS server URL (default: nats://localhost:4222)
+			nats_url nats://localhost:4222
+			
+			# Optional: NATS credentials file for authentication
+			# nats_credentials /path/to/creds.creds
+			
+			# Optional: NATS token authentication
+			# nats_token mytoken
+			
+			# Optional: NATS user/password authentication
+			# nats_user myuser
+			# nats_password mypassword
+			
+			# Optional: Prefix for all topic subscriptions
+			# topic_prefix app.events.
+			
+			# CORS allowed origins (default: *)
+			allowed_origins * 
+			
+			# Heartbeat interval in seconds (default: 30)
+			heartbeat_interval 30
+			
+			# NATS reconnect wait time in seconds (default: 2)
+			reconnect_wait 2
+			
+			# Maximum reconnection attempts (-1 for infinite, default: -1)
+			max_reconnects -1
+		}
+	}
+	
+	# Serve static files (optional - for testing)
+	root * /var/www/html
+	file_server
+	
+	# Health check endpoint
+	respond /health 200 {
+		body "OK"
+	}
+}
