@@ -1,0 +1,54 @@
+services:
+  nats:
+    image: nats:latest
+    container_name: nuts-nats
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
+    volumes:
+      - nats-data:/data
+
+  nuts:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: nuts-server
+    ports:
+      - "8080:8080"
+    environment:
+      - NATS_URL=nats://nats:4222
+      - STREAM_NAME=EVENTS
+      - TOPIC_PREFIX=events.
+    depends_on:
+      - nats-init
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # Init container to create the JetStream stream
+  nats-init:
+    image: natsio/nats-box:latest
+    container_name: nuts-nats-init
+    depends_on:
+      - nats
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sleep 3
+        nats -s nats://nats:4222 stream add EVENTS \
+          --subjects "events.>" \
+          --storage memory \
+          --retention limits \
+          --max-msgs 10000 \
+          --max-age 1h \
+          --discard old \
+          --defaults
+        echo "Stream EVENTS created successfully"
+    restart: "no"
+
+volumes:
+  nats-data:

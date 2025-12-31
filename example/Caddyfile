@@ -1,7 +1,16 @@
 # Example Caddyfile for the nuts module
 #
 # This configuration sets up a Caddy server with the nuts module
-# that bridges NATS.io messages to Server-Sent Events.
+# that bridges NATS.io JetStream messages to Server-Sent Events.
+#
+# Prerequisites:
+#   1. Start NATS with JetStream enabled:
+#      docker run -p 4222:4222 nats:latest -js
+#
+#   2. Create the JetStream stream:
+#      nats stream add EVENTS --subjects "events.>" --storage file --max-msgs 10000 --max-age 24h --discard old
+#
+#   3. Run Caddy with this config
 
 {
 	# Global options
@@ -18,10 +27,19 @@
 	#   - /events?topic=my-topic
 	#   - /events?topic=topic1&topic=topic2  (multiple topics)
 	#   - /events/my-topic  (path-based topic)
+	#   - /events?topic=my-topic&last-id=123  (replay from sequence 123)
 	route /events* {
 		nuts {
 			# NATS server URL (default: nats://localhost:4222)
 			nats_url nats://localhost:4222
+			
+			# JetStream stream name (required)
+			# The stream must be created before starting Caddy
+			stream_name EVENTS
+			
+			# Prefix for all topic subscriptions
+			# Must match the stream subjects pattern (e.g., stream subjects "events.>")
+			topic_prefix events.
 			
 			# Optional: NATS credentials file for authentication
 			# nats_credentials /path/to/creds.creds
@@ -32,9 +50,6 @@
 			# Optional: NATS user/password authentication
 			# nats_user myuser
 			# nats_password mypassword
-			
-			# Optional: Prefix for all topic subscriptions
-			# topic_prefix app.events.
 			
 			# CORS allowed origins (default: *)
 			allowed_origins * 

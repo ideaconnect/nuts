@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -56,7 +57,11 @@ type Handler struct {
 	// MaxReconnects is the maximum number of reconnection attempts (-1 for infinite)
 	MaxReconnects int `json:"max_reconnects,omitempty"`
 
+	// StreamName is the name of the JetStream stream to use (required)
+	StreamName string `json:"stream_name,omitempty"`
+
 	conn   *nats.Conn
+	js     nats.JetStreamContext
 	logger *zap.Logger
 	mu     sync.RWMutex
 }
@@ -95,8 +100,22 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("failed to connect to NATS: %v", err)
 	}
 
+	// Initialize JetStream context
+	js, err := h.conn.JetStream()
+	if err != nil {
+		return fmt.Errorf("failed to create JetStream context: %v", err)
+	}
+	h.js = js
+
+	// Verify stream exists
+	_, err = h.js.StreamInfo(h.StreamName)
+	if err != nil {
+		return fmt.Errorf("JetStream stream '%s' not found. Please create the stream first. See README for instructions. Error: %v", h.StreamName, err)
+	}
+
 	h.logger.Info("nuts handler provisioned",
 		zap.String("nats_url", h.NatsURL),
+		zap.String("stream_name", h.StreamName),
 		zap.String("topic_prefix", h.TopicPrefix),
 	)
 
@@ -159,6 +178,9 @@ func (h *Handler) Validate() error {
 	if h.NatsURL == "" {
 		return fmt.Errorf("nats_url is required")
 	}
+	if h.StreamName == "" {
+		return fmt.Errorf("stream_name is required for JetStream support")
+	}
 	return nil
 }
 
@@ -191,6 +213,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
+	// Parse last-id parameter for message replay (validate early before starting SSE)
+	lastIDStr := r.URL.Query().Get("last-id")
+	var lastID uint64
+	var hasLastID bool
+	if lastIDStr != "" {
+		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
+		if err != nil {
+			http.Error(w, "Invalid last-id parameter: must be a positive integer", http.StatusBadRequest)
+			return nil
+		}
+		lastID = parsedID
+		hasLastID = true
+	}
+
 	// Check if the client supports SSE
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -213,32 +249,74 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	msgChan := make(chan *nats.Msg, 64)
 	defer close(msgChan)
 
-	// Subscribe to all requested topics
+	// Subscribe to all requested topics using JetStream
 	h.mu.RLock()
-	conn := h.conn
+	js := h.js
 	h.mu.RUnlock()
 
-	if conn == nil {
-		http.Error(w, "NATS connection not available", http.StatusServiceUnavailable)
+	if js == nil {
+		http.Error(w, "JetStream not available", http.StatusServiceUnavailable)
 		return nil
 	}
 
 	var subscriptions []*nats.Subscription
 	for _, topic := range topics {
 		fullTopic := h.TopicPrefix + topic
-		sub, err := conn.Subscribe(fullTopic, func(msg *nats.Msg) {
+
+		// Build subscription options for ephemeral consumer
+		opts := []nats.SubOpt{
+			nats.BindStream(h.StreamName),
+			nats.AckNone(), // No ack needed for SSE streaming
+		}
+
+		if hasLastID {
+			// Start from the sequence after the provided last-id
+			opts = append(opts, nats.StartSequence(lastID+1))
+			h.logger.Debug("subscribing from sequence",
+				zap.String("topic", fullTopic),
+				zap.Uint64("start_sequence", lastID+1),
+			)
+		} else {
+			// New subscriber - only deliver new messages
+			opts = append(opts, nats.DeliverNew())
+		}
+
+		sub, err := js.Subscribe(fullTopic, func(msg *nats.Msg) {
 			select {
 			case msgChan <- msg:
 			default:
 				h.logger.Warn("message dropped, channel full", zap.String("topic", msg.Subject))
 			}
-		})
+		}, opts...)
+
 		if err != nil {
-			h.logger.Error("failed to subscribe to topic",
-				zap.String("topic", fullTopic),
-				zap.Error(err),
-			)
-			continue
+			// If sequence not found, fallback to delivering all available messages
+			if hasLastID && (err.Error() == "nats: consumer start sequence is not available" ||
+				err.Error() == "nats: stream sequence not found") {
+				h.logger.Warn("requested sequence not available, falling back to all messages",
+					zap.String("topic", fullTopic),
+					zap.Uint64("requested_sequence", lastID+1),
+				)
+				fallbackOpts := []nats.SubOpt{
+					nats.BindStream(h.StreamName),
+					nats.AckNone(),
+					nats.DeliverAll(),
+				}
+				sub, err = js.Subscribe(fullTopic, func(msg *nats.Msg) {
+					select {
+					case msgChan <- msg:
+					default:
+						h.logger.Warn("message dropped, channel full", zap.String("topic", msg.Subject))
+					}
+				}, fallbackOpts...)
+			}
+			if err != nil {
+				h.logger.Error("failed to subscribe to topic",
+					zap.String("topic", fullTopic),
+					zap.Error(err),
+				)
+				continue
+			}
 		}
 		subscriptions = append(subscriptions, sub)
 		h.logger.Debug("subscribed to topic", zap.String("topic", fullTopic))
@@ -270,7 +348,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			// Remove topic prefix for the event name sent to client
 			eventTopic := strings.TrimPrefix(msg.Subject, h.TopicPrefix)
 
-			// Send SSE event
+			// Get JetStream metadata for message ID
+			var msgID uint64
+			if meta, err := msg.Metadata(); err == nil {
+				msgID = meta.Sequence.Stream
+			}
+
+			// Send SSE event with ID for replay support
+			fmt.Fprintf(w, "id: %d\n", msgID)
 			fmt.Fprintf(w, "event: message\n")
 			fmt.Fprintf(w, "data: %s\n", toJSON(map[string]interface{}{
 				"topic":   eventTopic,
@@ -400,6 +485,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid max_reconnects: %v", err)
 				}
 				h.MaxReconnects = max
+
+			case "stream_name":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.StreamName = d.Val()
 
 			default:
 				return d.Errf("unrecognized option: %s", d.Val())
