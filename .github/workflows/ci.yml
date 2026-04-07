@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run unit tests
+        run: make test-unit
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Start functional test stack
+        run: make docker-up
+
+      - name: Run functional tests
+        env:
+          TEST_BASE_URL: http://localhost:8080
+          TEST_NATS_URL: nats://localhost:4222
+        run: cd functional_test && go test -v -timeout 120s ./...
+
+      - name: Stop functional test stack
+        if: always()
+        run: make docker-down

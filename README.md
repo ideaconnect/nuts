@@ -1,16 +1,17 @@
 # 🥜 NUTS - NATS to SSE for Caddy
 
-A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Events (SSE), similar to [Mercure.rocks](https://mercure.rocks).
+A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Events (SSE), inspired by [Mercure.rocks](https://mercure.rocks).
 
 ## Features
 
 - **Real-time Updates**: Stream NATS messages to web browsers via SSE/EventSource
 - **JetStream Persistence**: Messages are persisted in NATS JetStream for replay
-- **Message Replay**: Clients can reconnect and replay messages from a specific ID using `?last-id=`
+- **Message Replay**: Clients can reconnect and replay messages from a specific ID using `?last-id=` or the standard `Last-Event-ID` header. If the requested sequence is no longer available in JetStream retention, NUTS falls back to replaying all retained messages for that topic.
 - **Multiple Topics**: Subscribe to multiple NATS subjects simultaneously
 - **Automatic Reconnection**: Built-in NATS reconnection handling
 - **CORS Support**: Configurable cross-origin resource sharing
 - **Heartbeat**: Keep-alive mechanism to prevent connection timeouts
+- **No Message Drops For Connected Clients**: When a client falls behind, NUTS disconnects that SSE session before dropping queued messages so the client can resume from the last delivered event ID
 - **Flexible Authentication**: Support for credentials file, token, or user/password auth
 - **Topic Prefixing**: Optional prefix for all NATS subscriptions
 
@@ -19,19 +20,29 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 ### Using xcaddy (Recommended)
 
 ```bash
-xcaddy build --with github.com/idct/nuts
+xcaddy build --with github.com/ideaconnect/nuts
 ```
 
 ### Building from Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/idct/nuts.git
+git clone https://github.com/ideaconnect/nuts.git
 cd nuts
 
 # Build custom Caddy with the module
 go build -o caddy ./cmd/caddy
 ```
+
+## Testing
+
+The repository has two test layers:
+
+- `make test-unit` runs the self-contained Go tests in the root package using an embedded NATS server.
+- `make test-functional` starts the Docker-backed NATS and Caddy test stack, runs the Godog functional suite, then tears the stack down.
+- `make test` runs both layers in order.
+
+If you prefer to inspect the functional environment manually, use `make docker-up`, run `cd functional_test && go test -v -timeout 120s ./...`, then clean up with `make docker-down`.
 
 ## Quick Start
 
@@ -73,7 +84,7 @@ go build -o caddy ./cmd/caddy
 5. **Connect from JavaScript**:
    ```javascript
    const events = new EventSource('/events?topic=my-topic');
-   
+
    events.addEventListener('message', (e) => {
        const data = JSON.parse(e.data);
        console.log('Received:', data, 'ID:', e.lastEventId);
@@ -91,25 +102,33 @@ go build -o caddy ./cmd/caddy
 
 ```caddyfile
 nuts {
-    # NATS server URL (default: nats://localhost:4222)
+    # NATS server URL (required)
     nats_url <url>
-    
+
     # JetStream stream name (required)
     stream_name <name>
-    
-    # Authentication (choose one)
+
+    # Authentication (choose exactly one; user/password must be set together)
     nats_credentials <path>      # Path to .creds file
     nats_token <token>           # Token auth
     nats_user <username>         # User/password auth
     nats_password <password>
-    
+
     # Optional settings
     topic_prefix <prefix>        # Prefix for all subscriptions
     allowed_origins <origins...> # CORS origins (default: *)
     heartbeat_interval <seconds> # Heartbeat interval (default: 30)
     reconnect_wait <seconds>     # Reconnect wait time (default: 2)
     max_reconnects <count>       # Max reconnects, -1=infinite (default: -1)
+    max_event_size <bytes>       # Max SSE event size in bytes (default: 1048576)
 }
+```
+
+#### `max_event_size`
+
+Limits the total size (in bytes) of a single SSE event frame — including the `id:`, `event:`, and `data:` lines plus the JSON-encoded payload. Any event that exceeds the limit is silently dropped and a warning is logged. The client never sees it.
+
+For example, setting `max_event_size 1000` means that if a NATS message produces an SSE frame larger than 1000 bytes once formatted, that frame is discarded. A typical overhead (id, event type, topic, timestamp) is roughly 120-150 bytes, so a 1000-byte limit leaves ~850 bytes for the raw message payload. Set to `0` to disable the limit entirely.
 ```
 
 ### JSON Configuration
@@ -124,8 +143,12 @@ nuts {
     "allowed_origins": ["https://example.com"],
     "heartbeat_interval": 30,
     "reconnect_wait": 2,
-    "max_reconnects": -1
+    "max_reconnects": -1,
+    "max_event_size": 1048576
 }
+```
+
+`max_event_size` counts the **entire formatted SSE frame**, not just the raw NATS payload. See the Caddyfile section above for details.
 ```
 
 ## JetStream Setup
@@ -209,7 +232,7 @@ events.addEventListener('connected', (e) => {
 events.addEventListener('message', (e) => {
     const { topic, payload, time } = JSON.parse(e.data);
     console.log(`[${topic}] at ${time}:`, payload);
-    
+
     // Store last event ID for reconnection replay
     if (e.lastEventId) {
         localStorage.setItem('lastEventId', e.lastEventId);
@@ -219,13 +242,29 @@ events.addEventListener('message', (e) => {
 // Handle errors and reconnect with replay
 events.onerror = (e) => {
     console.error('SSE error:', e);
-    // EventSource will auto-reconnect, but you can manually reconnect with last-id
+    // EventSource will auto-reconnect and send Last-Event-ID automatically.
+    // Custom clients should reconnect with the most recent event ID.
 };
 ```
 
-### Message Replay with `last-id`
+### Slow Clients And Replay
 
-The `last-id` query parameter allows clients to replay messages from a specific point:
+NUTS does not intentionally drop messages for an active SSE client.
+
+If a client cannot read fast enough and its per-connection queue fills, NUTS closes that SSE connection instead of discarding queued messages. A reconnecting client can then resume from the last delivered SSE `id` using either:
+
+- The browser-managed `Last-Event-ID` header
+- The explicit `?last-id=` query parameter for custom clients
+
+This means the delivery policy is effectively:
+
+- No silent per-client message loss in the live stream path
+- Slow clients must reconnect to continue
+- Replay depends on the requested sequence still being retained in JetStream
+
+### Message Replay with `last-id` or `Last-Event-ID`
+
+The `last-id` query parameter and standard `Last-Event-ID` header allow clients to replay messages from a specific point:
 
 ```javascript
 // Get the last received message ID
@@ -238,7 +277,10 @@ const events = new EventSource(`/events?topic=updates&last-id=${lastId}`);
 **Behavior:**
 - Messages with sequence numbers greater than `last-id` will be delivered
 - If the requested sequence no longer exists (expired/deleted), all available messages are delivered
+- **Replay storm caveat**: When the fallback fires, *all* retained messages for that topic are replayed. If the stream holds a large backlog, this may deliver many messages the client has already seen. Design your stream retention policy (max age, max messages) accordingly.
 - Without `last-id`, only new messages are delivered
+- Standard `EventSource` reconnects can use the `Last-Event-ID` header automatically
+- When a slow client is disconnected, reconnecting with the last delivered event ID resumes from that point instead of losing messages silently
 
 ### Message Format
 
@@ -250,7 +292,7 @@ event: message
 data: {"topic":"my-topic","payload":{"your":"data"},"time":"2024-01-01T12:00:00Z"}
 ```
 
-The `id` field contains the JetStream sequence number, which can be used with `last-id` for replay.
+The `id` field contains the JetStream sequence number, which can be used with `last-id` or `Last-Event-ID` for replay.
 
 ## Example Scenarios
 
@@ -321,7 +363,7 @@ nats stream add METRICS --subjects "metrics.>" --storage memory --max-age 1h
 | Backend | NATS.io JetStream | Custom Hub |
 | Protocol | SSE | SSE |
 | Persistence | JetStream streams | Built-in |
-| Message Replay | Yes (`last-id` param) | Yes (`Last-Event-ID` header) |
+| Message Replay | Yes (`last-id` param and `Last-Event-ID` header) | Yes (`Last-Event-ID` header) |
 | Authorization | NATS auth | JWT |
 | Clustering | NATS clustering | Mercure clustering |
 
@@ -329,7 +371,7 @@ nats stream add METRICS --subjects "metrics.>" --storage memory --max-age 1h
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.25+
 - Docker (for running NATS server)
 - [NATS CLI](https://github.com/nats-io/natscli) (optional, for manual testing)
 
@@ -340,7 +382,7 @@ nats stream add METRICS --subjects "metrics.>" --storage memory --max-age 1h
 ./scripts/setup-dev.sh
 
 # Or manually with Docker Compose
-docker compose up -d
+make docker-up
 ```
 
 ### Running Tests
@@ -367,10 +409,10 @@ They require Docker services to be running:
 make test-functional
 
 # Or step by step:
-docker-compose up -d --build
+docker compose up -d --build
 sleep 5  # Wait for services
 cd functional_test && go test -v -timeout 120s ./...
-docker-compose down -v
+docker compose down -v
 ```
 
 The BDD tests are defined in `features/sse_streaming.feature` using Gherkin syntax:
@@ -434,7 +476,7 @@ make help            # Show all available commands
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+BSD 4-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Contributing
 

@@ -5,11 +5,14 @@ package nuts
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -20,7 +23,7 @@ import (
 )
 
 func init() {
-	caddy.RegisterModule(Handler{})
+	caddy.RegisterModule(&Handler{})
 	httpcaddyfile.RegisterHandlerDirective("nuts", parseCaddyfile)
 }
 
@@ -60,14 +63,25 @@ type Handler struct {
 	// StreamName is the name of the JetStream stream to use (required)
 	StreamName string `json:"stream_name,omitempty"`
 
+	// MaxEventSize is the maximum size in bytes of a single SSE event payload.
+	// Messages exceeding this limit are dropped with a warning. 0 means no limit.
+	// Default: 1048576 (1 MB).
+	MaxEventSize int `json:"max_event_size,omitempty"`
+
 	conn   *nats.Conn
 	js     nats.JetStreamContext
 	logger *zap.Logger
 	mu     sync.RWMutex
 }
 
+type messageEventPayload struct {
+	Topic   string      `json:"topic"`
+	Payload interface{} `json:"payload"`
+	Time    string      `json:"time"`
+}
+
 // CaddyModule returns the Caddy module information.
-func (Handler) CaddyModule() caddy.ModuleInfo {
+func (*Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.nuts",
 		New: func() caddy.Module { return new(Handler) },
@@ -78,10 +92,7 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
 
-	// Set defaults
-	if h.NatsURL == "" {
-		h.NatsURL = nats.DefaultURL
-	}
+	// Normalize optional settings before the handler dials NATS.
 	if h.HeartbeatInterval <= 0 {
 		h.HeartbeatInterval = 30
 	}
@@ -94,27 +105,54 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if len(h.AllowedOrigins) == 0 {
 		h.AllowedOrigins = []string{"*"}
 	}
+	if h.MaxEventSize == 0 {
+		h.MaxEventSize = 1048576 // 1 MB
+	}
 
-	// Connect to NATS
+	// Establish the underlying NATS connection first; JetStream is created from it.
 	if err := h.connectNATS(); err != nil {
 		return fmt.Errorf("failed to connect to NATS: %v", err)
 	}
 
-	// Initialize JetStream context
-	js, err := h.conn.JetStream()
-	if err != nil {
-		return fmt.Errorf("failed to create JetStream context: %v", err)
-	}
-	h.js = js
+	// If any step after connection fails, clean up the open connection.
+	var provisionErr error
+	defer func() {
+		if provisionErr != nil {
+			_ = h.Cleanup()
+		}
+	}()
 
-	// Verify stream exists
-	_, err = h.js.StreamInfo(h.StreamName)
+	// Hold the read-lock through JetStream context creation so Cleanup on
+	// another goroutine cannot nil the connection in between.
+	h.mu.RLock()
+	conn := h.conn
+	if conn == nil {
+		h.mu.RUnlock()
+		provisionErr = fmt.Errorf("NATS connection is nil after connect")
+		return provisionErr
+	}
+
+	// Cache a JetStream context for request handling once the connection is ready.
+	js, err := conn.JetStream()
+	h.mu.RUnlock()
 	if err != nil {
-		return fmt.Errorf("JetStream stream '%s' not found. Please create the stream first. See README for instructions. Error: %v", h.StreamName, err)
+		provisionErr = fmt.Errorf("failed to create JetStream context: %v", err)
+		return provisionErr
+	}
+
+	h.mu.Lock()
+	h.js = js
+	h.mu.Unlock()
+
+	// Fail provision early if the configured stream does not exist.
+	_, err = js.StreamInfo(h.StreamName)
+	if err != nil {
+		provisionErr = fmt.Errorf("JetStream stream '%s' not found. Please create the stream first. See README for instructions. Error: %v", h.StreamName, err)
+		return provisionErr
 	}
 
 	h.logger.Info("nuts handler provisioned",
-		zap.String("nats_url", h.NatsURL),
+		zap.String("nats_url", redactURL(h.NatsURL)),
 		zap.String("stream_name", h.StreamName),
 		zap.String("topic_prefix", h.TopicPrefix),
 	)
@@ -124,6 +162,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 // connectNATS establishes a connection to the NATS server.
 func (h *Handler) connectNATS() error {
+	// These callbacks surface connection lifecycle changes in Caddy logs.
 	opts := []nats.Option{
 		nats.ReconnectWait(time.Duration(h.ReconnectWait) * time.Second),
 		nats.MaxReconnects(h.MaxReconnects),
@@ -140,7 +179,7 @@ func (h *Handler) connectNATS() error {
 		}),
 	}
 
-	// Add authentication options
+	// Apply the configured auth mode. Validate() ensures conflicting modes are rejected.
 	if h.NatsCredentials != "" {
 		opts = append(opts, nats.UserCredentials(h.NatsCredentials))
 	} else if h.NatsToken != "" {
@@ -166,10 +205,12 @@ func (h *Handler) Cleanup() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// Clear cached connection state so future requests fail cleanly after shutdown.
 	if h.conn != nil {
 		h.conn.Close()
 		h.conn = nil
 	}
+	h.js = nil
 	return nil
 }
 
@@ -181,24 +222,61 @@ func (h *Handler) Validate() error {
 	if h.StreamName == "" {
 		return fmt.Errorf("stream_name is required for JetStream support")
 	}
+
+	// Only one auth strategy is allowed, and user/password must arrive as a pair.
+	authMethods := 0
+	if h.NatsCredentials != "" {
+		authMethods++
+	}
+	if h.NatsToken != "" {
+		authMethods++
+	}
+	if h.NatsUser != "" || h.NatsPassword != "" {
+		if h.NatsUser == "" || h.NatsPassword == "" {
+			return fmt.Errorf("nats_user and nats_password must be provided together")
+		}
+		authMethods++
+	}
+	if authMethods > 1 {
+		return fmt.Errorf("only one NATS authentication method can be configured")
+	}
+
+	for _, o := range h.AllowedOrigins {
+		if o == "*" && authMethods > 0 {
+			// Browsers reject Access-Control-Allow-Origin: * with credentials.
+			// The handler echoes the real origin so it still works, but the
+			// wildcard configuration looks more permissive than intended.
+			if h.logger != nil {
+				h.logger.Warn("allowed_origins contains '*' alongside NATS auth; " +
+					"consider listing explicit origins for credential-aware CORS")
+			}
+			break
+		}
+	}
+
 	return nil
 }
 
 // ServeHTTP implements the caddyhttp.MiddlewareHandler interface.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// Handle CORS preflight
+	// Browsers issue OPTIONS preflight requests before cross-origin EventSource connections.
 	if r.Method == http.MethodOptions {
 		h.setCORSHeaders(w, r)
 		w.WriteHeader(http.StatusNoContent)
 		return nil
 	}
 
-	// Only handle GET requests for SSE
+	// SSE is GET-only; everything else either falls through or returns a normal HTTP error.
 	if r.Method != http.MethodGet {
+		if next == nil {
+			w.Header().Set("Allow", "GET, OPTIONS")
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return nil
+		}
 		return next.ServeHTTP(w, r)
 	}
 
-	// Get topics from query parameter
+	// Query parameters support multiple topics; the path form is a shorthand for one topic.
 	topics := r.URL.Query()["topic"]
 	if len(topics) == 0 {
 		// Try to get topic from path (e.g., /events/my-topic)
@@ -208,19 +286,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
+	// Reject topics that contain control characters or empty segments.
+	for _, t := range topics {
+		if !isValidTopic(t) {
+			http.Error(w, "Invalid topic name", http.StatusBadRequest)
+			return nil
+		}
+	}
+
 	if len(topics) == 0 {
 		http.Error(w, "No topics specified. Use ?topic=name or path-based topic", http.StatusBadRequest)
 		return nil
 	}
 
-	// Parse last-id parameter for message replay (validate early before starting SSE)
+	// Validate replay state before committing the response so bad cursors return plain HTTP errors.
 	lastIDStr := r.URL.Query().Get("last-id")
+	lastIDSource := "last-id"
+	if lastIDStr == "" {
+		lastIDStr = r.Header.Get("Last-Event-ID")
+		lastIDSource = "Last-Event-ID"
+	}
 	var lastID uint64
 	var hasLastID bool
 	if lastIDStr != "" {
 		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
 		if err != nil {
-			http.Error(w, "Invalid last-id parameter: must be a positive integer", http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf("Invalid %s value: must be a positive integer", lastIDSource), http.StatusBadRequest)
 			return nil
 		}
 		lastID = parsedID
@@ -234,22 +325,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
-	// Set SSE headers
-	h.setCORSHeaders(w, r)
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
-
-	// Send initial connection event
-	fmt.Fprintf(w, "event: connected\ndata: {\"topics\":%s}\n\n", toJSON(topics))
-	flusher.Flush()
-
-	// Create message channel
-	msgChan := make(chan *nats.Msg, 64)
-	defer close(msgChan)
-
-	// Subscribe to all requested topics using JetStream
+	// Build subscriptions before writing any SSE bytes so setup failures stay normal HTTP failures.
 	h.mu.RLock()
 	js := h.js
 	h.mu.RUnlock()
@@ -259,7 +335,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
+	// Subscription callbacks can outlive the request briefly, so done gates enqueue during teardown.
+	msgChan := make(chan *nats.Msg, 64)
+	done := make(chan struct{})
+	slowClient := make(chan string, 1)
+	enqueueMessage := func(msg *nats.Msg) {
+		select {
+		case <-done:
+			return
+		case msgChan <- msg:
+		default:
+			select {
+			case slowClient <- msg.Subject:
+			default:
+			}
+		}
+	}
+
 	var subscriptions []*nats.Subscription
+	var subscribedTopics []string
+	var failedTopics []string
+	cleanupSubscriptions := func() {
+		// Signal callbacks to stop enqueuing before tearing down subscriptions.
+		// Closing done first is intentional: Unsubscribe may race with a callback
+		// already in flight, and the <-done check in enqueueMessage ensures
+		// such callbacks exit immediately. Any messages already buffered in
+		// msgChan are orphaned but will be garbage-collected with the channel.
+		close(done)
+		for _, sub := range subscriptions {
+			if err := sub.Unsubscribe(); err != nil {
+				h.logger.Warn("failed to unsubscribe",
+					zap.String("topic", sub.Subject),
+					zap.Error(err))
+			}
+		}
+	}
+
 	for _, topic := range topics {
 		fullTopic := h.TopicPrefix + topic
 
@@ -269,6 +380,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			nats.AckNone(), // No ack needed for SSE streaming
 		}
 
+		// Live subscribers only need new messages; replay subscribers resume from a known sequence.
 		if hasLastID {
 			// Start from the sequence after the provided last-id
 			opts = append(opts, nats.StartSequence(lastID+1))
@@ -281,18 +393,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			opts = append(opts, nats.DeliverNew())
 		}
 
-		sub, err := js.Subscribe(fullTopic, func(msg *nats.Msg) {
-			select {
-			case msgChan <- msg:
-			default:
-				h.logger.Warn("message dropped, channel full", zap.String("topic", msg.Subject))
-			}
-		}, opts...)
+		sub, err := js.Subscribe(fullTopic, enqueueMessage, opts...)
 
 		if err != nil {
-			// If sequence not found, fallback to delivering all available messages
-			if hasLastID && (err.Error() == "nats: consumer start sequence is not available" ||
-				err.Error() == "nats: stream sequence not found") {
+			// When the requested sequence has been purged, replay all retained messages instead.
+			// Use substring match rather than exact equality so the fallback survives
+			// error-message changes across NATS server versions.
+			errMsg := err.Error()
+			if hasLastID && (strings.Contains(errMsg, "start sequence") ||
+				strings.Contains(errMsg, "sequence not found")) {
 				h.logger.Warn("requested sequence not available, falling back to all messages",
 					zap.String("topic", fullTopic),
 					zap.Uint64("requested_sequence", lastID+1),
@@ -302,41 +411,64 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 					nats.AckNone(),
 					nats.DeliverAll(),
 				}
-				sub, err = js.Subscribe(fullTopic, func(msg *nats.Msg) {
-					select {
-					case msgChan <- msg:
-					default:
-						h.logger.Warn("message dropped, channel full", zap.String("topic", msg.Subject))
-					}
-				}, fallbackOpts...)
+				sub, err = js.Subscribe(fullTopic, enqueueMessage, fallbackOpts...)
 			}
 			if err != nil {
 				h.logger.Error("failed to subscribe to topic",
 					zap.String("topic", fullTopic),
 					zap.Error(err),
 				)
+				failedTopics = append(failedTopics, topic)
 				continue
 			}
 		}
 		subscriptions = append(subscriptions, sub)
+		subscribedTopics = append(subscribedTopics, topic)
 		h.logger.Debug("subscribed to topic", zap.String("topic", fullTopic))
 	}
 
-	// Ensure cleanup of subscriptions
-	defer func() {
-		for _, sub := range subscriptions {
-			sub.Unsubscribe()
-		}
-	}()
+	if len(failedTopics) > 0 {
+		cleanupSubscriptions()
+		http.Error(w, fmt.Sprintf("Failed to subscribe to requested topics: %s", strings.Join(failedTopics, ", ")), http.StatusServiceUnavailable)
+		return nil
+	}
+
+	if len(subscriptions) == 0 {
+		cleanupSubscriptions()
+		http.Error(w, "Failed to subscribe to any requested topics", http.StatusServiceUnavailable)
+		return nil
+	}
+
+	defer cleanupSubscriptions()
+
+	// Only now is it safe to switch into streaming mode and emit the connected event.
+	h.setCORSHeaders(w, r)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+
+	// Send initial connection event.
+	if err := writeSSEChunk(w, flusher, fmt.Sprintf("event: connected\ndata: {\"topics\":%s}\n\n", toJSON(subscribedTopics))); err != nil {
+		h.logger.Debug("failed to write connected event", zap.Error(err))
+		return nil
+	}
 
 	// Create heartbeat ticker
 	heartbeat := time.NewTicker(time.Duration(h.HeartbeatInterval) * time.Second)
 	defer heartbeat.Stop()
 
-	// Stream messages to client
+	// Stream messages until the client disconnects; heartbeats keep idle connections alive.
 	ctx := r.Context()
 	for {
 		select {
+		case slowTopic := <-slowClient:
+			h.logger.Warn("disconnecting slow SSE client before dropping messages",
+				zap.String("topic", slowTopic),
+				zap.Int("buffer_size", cap(msgChan)),
+			)
+			return nil
+
 		case <-ctx.Done():
 			h.logger.Debug("client disconnected")
 			return nil
@@ -347,28 +479,59 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			}
 			// Remove topic prefix for the event name sent to client
 			eventTopic := strings.TrimPrefix(msg.Subject, h.TopicPrefix)
+			eventTime := time.Now().UTC().Format(time.RFC3339)
+			payload := messageEventPayload{
+				Topic:   eventTopic,
+				Payload: tryParseJSON(msg.Data),
+				Time:    eventTime,
+			}
+			var eventID uint64
+			hasEventID := false
 
-			// Get JetStream metadata for message ID
-			var msgID uint64
-			if meta, err := msg.Metadata(); err == nil {
-				msgID = meta.Sequence.Stream
+			// Prefer JetStream metadata so replayed messages keep their original publish timestamp.
+			meta, metaErr := msg.Metadata()
+			if metaErr != nil {
+				h.logger.Warn("failed to read JetStream metadata", zap.String("topic", msg.Subject), zap.Error(metaErr))
+			} else {
+				eventTime = meta.Timestamp.UTC().Format(time.RFC3339)
+				payload.Time = eventTime
+				eventID = meta.Sequence.Stream
+				hasEventID = true
 			}
 
-			// Send SSE event with ID for replay support
-			fmt.Fprintf(w, "id: %d\n", msgID)
-			fmt.Fprintf(w, "event: message\n")
-			fmt.Fprintf(w, "data: %s\n", toJSON(map[string]interface{}{
-				"topic":   eventTopic,
-				"payload": tryParseJSON(msg.Data),
-				"time":    time.Now().UTC().Format(time.RFC3339),
-			}))
-			fmt.Fprintf(w, "\n")
-			flusher.Flush()
+			var event strings.Builder
+			// Send SSE event with ID for replay support when JetStream metadata is available.
+			if hasEventID {
+				event.WriteString("id: ")
+				event.WriteString(strconv.FormatUint(eventID, 10))
+				event.WriteString("\n")
+			}
+			event.WriteString("event: message\n")
+			event.WriteString("data: ")
+			event.WriteString(toJSON(payload))
+			event.WriteString("\n\n")
+
+			// Guard against oversized events that could exhaust client memory.
+			if h.MaxEventSize > 0 && event.Len() > h.MaxEventSize {
+				h.logger.Warn("dropping oversized SSE event",
+					zap.String("topic", msg.Subject),
+					zap.Int("event_size", event.Len()),
+					zap.Int("max_event_size", h.MaxEventSize),
+				)
+				continue
+			}
+
+			if err := writeSSEChunk(w, flusher, event.String()); err != nil {
+				h.logger.Debug("failed to write message event", zap.String("topic", msg.Subject), zap.Error(err))
+				return nil
+			}
 
 		case <-heartbeat.C:
 			// Send heartbeat comment to keep connection alive
-			fmt.Fprintf(w, ": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339))
-			flusher.Flush()
+			if err := writeSSEChunk(w, flusher, fmt.Sprintf(": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339))); err != nil {
+				h.logger.Debug("failed to write heartbeat", zap.Error(err))
+				return nil
+			}
 		}
 	}
 }
@@ -380,6 +543,7 @@ func (h *Handler) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Echo the matched origin rather than '*' so credentialed SSE requests remain valid.
 	for _, allowed := range h.AllowedOrigins {
 		if allowed == "*" || allowed == origin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
@@ -409,10 +573,20 @@ func tryParseJSON(data []byte) interface{} {
 	return v
 }
 
+// writeSSEChunk writes one complete SSE chunk and flushes it to the client.
+func writeSSEChunk(w io.Writer, flusher http.Flusher, chunk string) error {
+	if _, err := io.WriteString(w, chunk); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		for d.NextBlock(0) {
+			// Each directive maps directly onto a handler field or tunable.
 			switch d.Val() {
 			case "nats_url":
 				if !d.NextArg() {
@@ -492,6 +666,16 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.StreamName = d.Val()
 
+			case "max_event_size":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				var size int
+				if _, err := fmt.Sscanf(d.Val(), "%d", &size); err != nil {
+					return d.Errf("invalid max_event_size: %v", err)
+				}
+				h.MaxEventSize = size
+
 			default:
 				return d.Errf("unrecognized option: %s", d.Val())
 			}
@@ -505,6 +689,42 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	var handler Handler
 	err := handler.UnmarshalCaddyfile(h.Dispenser)
 	return &handler, err
+}
+
+// isValidTopic rejects topic names that contain control characters, empty
+// segments, NATS wildcards, or NATS internal subjects.
+func isValidTopic(topic string) bool {
+	const maxTopicLen = 256
+	if topic == "" || len(topic) > maxTopicLen {
+		return false
+	}
+	// Reject NATS wildcards — server-side consumers should use TopicPrefix for broad subscriptions.
+	if strings.ContainsAny(topic, "*>") {
+		return false
+	}
+	// Reject NATS internal/system subjects (e.g. $JS, $SYS).
+	if strings.HasPrefix(topic, "$") {
+		return false
+	}
+	for _, r := range topic {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	if strings.Contains(topic, "..") {
+		return false
+	}
+	return true
+}
+
+// redactURL strips userinfo (embedded credentials / tokens) from a URL before logging.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	u.User = url.User("REDACTED")
+	return u.String()
 }
 
 // Interface guards

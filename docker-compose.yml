@@ -1,6 +1,6 @@
 services:
   nats:
-    image: nats:latest
+    image: nats:2.12-alpine
     container_name: nuts-nats
     ports:
       - "4222:4222"   # Client connections
@@ -8,6 +8,11 @@ services:
     command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
     volumes:
       - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
 
   nuts:
     build:
@@ -21,7 +26,8 @@ services:
       - STREAM_NAME=EVENTS
       - TOPIC_PREFIX=events.
     depends_on:
-      - nats-init
+      nats-init:
+        condition: service_completed_successfully
     restart: on-failure
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
@@ -31,14 +37,14 @@ services:
 
   # Init container to create the JetStream stream
   nats-init:
-    image: natsio/nats-box:latest
+    image: natsio/nats-box:0.19.0
     container_name: nuts-nats-init
     depends_on:
-      - nats
+      nats:
+        condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        sleep 3
         nats -s nats://nats:4222 stream add EVENTS \
           --subjects "events.>" \
           --storage memory \

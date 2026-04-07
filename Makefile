@@ -1,5 +1,7 @@
 .PHONY: all build test test-unit test-functional docker-up docker-down clean
 
+DOCKER_COMPOSE := $(shell if command -v docker-compose >/dev/null 2>&1; then echo docker-compose; else echo docker compose; fi)
+
 # Default target
 all: build test
 
@@ -16,14 +18,19 @@ test-unit:
 
 # Start Docker services for functional tests
 docker-up:
-	docker-compose up -d --build
-	@echo "Waiting for services to be ready..."
-	@sleep 5
-	@echo "Services are ready!"
+	@if $(DOCKER_COMPOSE) up --help 2>/dev/null | grep -q -- --wait; then \
+		echo "Starting Docker services with readiness checks..."; \
+		$(DOCKER_COMPOSE) up -d --build --wait; \
+	else \
+		echo "Starting Docker services without native readiness checks..."; \
+		$(DOCKER_COMPOSE) up -d --build; \
+		echo "Waiting for services to be ready..."; \
+		sleep 10; \
+	fi
 
 # Stop Docker services
 docker-down:
-	docker-compose down -v
+	$(DOCKER_COMPOSE) down -v
 
 # Run functional tests (requires Docker services)
 test-functional: docker-up
@@ -48,7 +55,7 @@ deps:
 # Clean build artifacts
 clean:
 	rm -f ./caddy
-	docker-compose down -v 2>/dev/null || true
+	$(DOCKER_COMPOSE) down -v 2>/dev/null || true
 
 # Format code
 fmt:
