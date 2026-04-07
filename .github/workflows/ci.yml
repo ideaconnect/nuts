@@ -22,8 +22,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run unit tests
-        run: make test-unit
+      - name: Run unit tests with coverage
+        run: go test -covermode=atomic -coverprofile=coverage.out -v -timeout 120s .
+
+      - name: Print coverage summary
+        run: go tool cover -func=coverage.out
 
       - name: Run go vet
         run: go vet ./...
@@ -36,6 +39,16 @@ jobs:
           TEST_BASE_URL: http://localhost:8080
           TEST_NATS_URL: nats://localhost:4222
         run: cd functional_test && go test -v -timeout 120s ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          flags: unittests
+          name: unit-tests
+          verbose: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Stop functional test stack
         if: always()
