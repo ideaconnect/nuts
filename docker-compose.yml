@@ -25,6 +25,8 @@ services:
       - NATS_URL=nats://nats:4222
       - STREAM_NAME=EVENTS
       - TOPIC_PREFIX=events.
+    volumes:
+      - ./example:/srv/example:ro
     depends_on:
       nats-init:
         condition: service_completed_successfully
@@ -34,6 +36,21 @@ services:
       interval: 2s
       timeout: 5s
       retries: 10
+
+  # PHP sender: publishes random numbers and letters every 250ms
+  php-sender:
+    image: php:8.3-cli-alpine
+    container_name: nuts-php-sender
+    volumes:
+      - ./example/sender.php:/app/sender.php:ro
+    environment:
+      - NATS_HOST=nats
+      - NATS_PORT=4222
+    command: ["php", "/app/sender.php"]
+    depends_on:
+      nats-init:
+        condition: service_completed_successfully
+    restart: on-failure
 
   # Init container to create the JetStream stream
   nats-init:

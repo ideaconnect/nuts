@@ -3,220 +3,235 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NUTS - NATS SSE Client Demo</title>
+    <title>NUTS - NATS SSE Demo</title>
     <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 800px;
-            margin: 50px auto;
-            padding: 20px;
             background: #f5f5f5;
+            padding: 30px;
         }
-        h1 {
-            color: #333;
+        h1 { color: #333; text-align: center; margin-bottom: 8px; }
+        .subtitle { text-align: center; color: #888; margin-bottom: 24px; font-size: 14px; }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 16px;
+            max-width: 960px;
+            margin: 0 auto;
         }
-        .container {
+        .column {
             background: white;
-            padding: 20px;
             border-radius: 8px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
         }
-        .controls {
-            margin-bottom: 20px;
-        }
-        input[type="text"] {
-            padding: 10px;
-            width: 300px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-        button {
-            padding: 10px 20px;
-            background: #007bff;
+        .column-header {
+            padding: 14px 16px;
+            font-weight: 600;
+            font-size: 15px;
             color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
-        button:hover {
-            background: #0056b3;
+        .column-header .badge {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.25);
         }
-        button:disabled {
-            background: #ccc;
-            cursor: not-allowed;
-        }
-        button.disconnect {
-            background: #dc3545;
-        }
-        button.disconnect:hover {
-            background: #c82333;
-        }
-        .status {
-            padding: 10px;
-            margin: 10px 0;
-            border-radius: 4px;
-        }
-        .status.connected {
-            background: #d4edda;
-            color: #155724;
-        }
-        .status.disconnected {
-            background: #f8d7da;
-            color: #721c24;
-        }
-        .status.connecting {
-            background: #fff3cd;
-            color: #856404;
-        }
-        #messages {
-            max-height: 400px;
+        .col-numbers .column-header { background: #007bff; }
+        .col-letters .column-header { background: #28a745; }
+        .col-both .column-header { background: #6f42c1; }
+        .entries {
+            padding: 8px;
+            min-height: 200px;
+            max-height: 520px;
             overflow-y: auto;
-            border: 1px solid #ddd;
+        }
+        .entry {
+            padding: 6px 10px;
+            margin: 3px 0;
             border-radius: 4px;
-            padding: 10px;
-            background: #fafafa;
-        }
-        .message {
-            padding: 10px;
-            margin: 5px 0;
-            background: white;
-            border-radius: 4px;
-            border-left: 4px solid #007bff;
-        }
-        .message .topic {
-            font-weight: bold;
-            color: #007bff;
-        }
-        .message .time {
-            font-size: 12px;
-            color: #999;
-        }
-        .message .payload {
-            margin-top: 5px;
             font-family: monospace;
-            background: #f5f5f5;
-            padding: 5px;
-            border-radius: 2px;
-            word-break: break-all;
+            font-size: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            animation: fadeIn 0.2s ease;
         }
-        .heartbeat {
-            font-size: 12px;
-            color: #999;
+        .col-numbers .entry { background: #e7f1ff; color: #004085; }
+        .col-letters .entry { background: #e6f4ea; color: #155724; }
+        .col-both .entry.topic-numbers { background: #e7f1ff; color: #004085; }
+        .col-both .entry.topic-letters { background: #e6f4ea; color: #155724; }
+        .entry .value { font-weight: 600; }
+        .entry .time { font-size: 11px; opacity: 0.6; }
+        .placeholder {
+            color: #bbb;
             text-align: center;
+            padding: 40px 10px;
+            font-size: 13px;
+        }
+        .status-bar {
+            max-width: 960px;
+            margin: 16px auto 0;
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+        }
+        .status-dot {
+            font-size: 12px;
+            color: #888;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .status-dot .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ccc;
+        }
+        .status-dot .dot.ok { background: #28a745; }
+        .status-dot .dot.err { background: #dc3545; }
+        .status-dot .dot.wait { background: #ffc107; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-4px); }
+            to { opacity: 1; transform: translateY(0); }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🥜 NUTS - NATS SSE Client</h1>
-        
-        <div class="controls">
-            <input type="text" id="topics" placeholder="Enter topics (comma-separated)" value="test,notifications">
-            <button id="connectBtn" onclick="connect()">Connect</button>
-            <button id="disconnectBtn" onclick="disconnect()" disabled class="disconnect">Disconnect</button>
+    <h1>🥜 NUTS Demo</h1>
+    <p class="subtitle">Real-time NATS &rarr; SSE streaming &mdash; three independent EventSource connections</p>
+
+    <div class="grid">
+        <div class="column col-numbers">
+            <div class="column-header">
+                Random Number
+                <span class="badge">topic: numbers</span>
+            </div>
+            <div class="entries" id="col-numbers">
+                <div class="placeholder">Waiting for data&hellip;</div>
+            </div>
         </div>
-        
-        <div id="status" class="status disconnected">Disconnected</div>
-        
-        <h3>Messages</h3>
-        <div id="messages">
-            <p style="color: #999; text-align: center;">No messages yet...</p>
+        <div class="column col-letters">
+            <div class="column-header">
+                Random Letter
+                <span class="badge">topic: letters</span>
+            </div>
+            <div class="entries" id="col-letters">
+                <div class="placeholder">Waiting for data&hellip;</div>
+            </div>
+        </div>
+        <div class="column col-both">
+            <div class="column-header">
+                Both
+                <span class="badge">topics: numbers + letters</span>
+            </div>
+            <div class="entries" id="col-both">
+                <div class="placeholder">Waiting for data&hellip;</div>
+            </div>
         </div>
     </div>
 
+    <div class="status-bar">
+        <div class="status-dot"><span class="dot wait" id="dot-numbers"></span> numbers</div>
+        <div class="status-dot"><span class="dot wait" id="dot-letters"></span> letters</div>
+        <div class="status-dot"><span class="dot wait" id="dot-both"></span> both</div>
+    </div>
+
     <script>
-        let eventSource = null;
-        
-        function connect() {
-            const topicsInput = document.getElementById('topics').value;
-            const topics = topicsInput.split(',').map(t => t.trim()).filter(t => t);
-            
-            if (topics.length === 0) {
-                alert('Please enter at least one topic');
-                return;
+        const MAX_ENTRIES = 30;
+        const columns = {
+            numbers: document.getElementById('col-numbers'),
+            letters: document.getElementById('col-letters'),
+            both:    document.getElementById('col-both'),
+        };
+        const dots = {
+            numbers: document.getElementById('dot-numbers'),
+            letters: document.getElementById('dot-letters'),
+            both:    document.getElementById('dot-both'),
+        };
+
+        function formatTime(iso) {
+            try {
+                const d = new Date(iso);
+                return d.toLocaleTimeString();
+            } catch { return ''; }
+        }
+
+        function escapeHtml(text) {
+            const el = document.createElement('span');
+            el.textContent = text;
+            return el.innerHTML;
+        }
+
+        function addEntry(colId, value, topic, time) {
+            const col = columns[colId];
+            const placeholder = col.querySelector('.placeholder');
+            if (placeholder) placeholder.remove();
+
+            const entry = document.createElement('div');
+            entry.className = 'entry' + (colId === 'both' ? ' topic-' + topic : '');
+            entry.innerHTML =
+                '<span class="value">' + escapeHtml(String(value)) + '</span>' +
+                '<span class="time">' + escapeHtml(formatTime(time)) + '</span>';
+            col.insertBefore(entry, col.firstChild);
+
+            while (col.children.length > MAX_ENTRIES) {
+                col.removeChild(col.lastChild);
             }
-            
-            const params = topics.map(t => `topic=${encodeURIComponent(t)}`).join('&');
-            const url = `/events?${params}`;
-            
-            setStatus('connecting', `Connecting to ${topics.join(', ')}...`);
-            
-            eventSource = new EventSource(url);
-            
-            eventSource.addEventListener('connected', function(e) {
+        }
+
+        function extractValue(data) {
+            if (data.topic === 'numbers' && data.payload != null) {
+                return data.payload.number != null ? data.payload.number : JSON.stringify(data.payload);
+            }
+            if (data.topic === 'letters' && data.payload != null) {
+                return data.payload.letter != null ? data.payload.letter : JSON.stringify(data.payload);
+            }
+            return JSON.stringify(data.payload);
+        }
+
+        function setDot(name, state) {
+            dots[name].className = 'dot ' + state;
+        }
+
+        function subscribe(url, name, handler) {
+            const es = new EventSource(url);
+            es.addEventListener('connected', function() { setDot(name, 'ok'); });
+            es.addEventListener('message', function(e) {
                 const data = JSON.parse(e.data);
-                setStatus('connected', `Connected to topics: ${data.topics.join(', ')}`);
-                document.getElementById('connectBtn').disabled = true;
-                document.getElementById('disconnectBtn').disabled = false;
+                handler(data);
             });
-            
-            eventSource.addEventListener('message', function(e) {
-                const data = JSON.parse(e.data);
-                addMessage(data);
-            });
-            
-            eventSource.onerror = function(e) {
-                if (eventSource.readyState === EventSource.CLOSED) {
-                    setStatus('disconnected', 'Connection closed');
-                    resetButtons();
+            es.onerror = function() {
+                if (es.readyState === EventSource.CLOSED) {
+                    setDot(name, 'err');
                 } else {
-                    setStatus('connecting', 'Connection error, reconnecting...');
+                    setDot(name, 'wait');
                 }
             };
+            return es;
         }
-        
-        function disconnect() {
-            if (eventSource) {
-                eventSource.close();
-                eventSource = null;
-            }
-            setStatus('disconnected', 'Disconnected');
-            resetButtons();
-        }
-        
-        function resetButtons() {
-            document.getElementById('connectBtn').disabled = false;
-            document.getElementById('disconnectBtn').disabled = true;
-        }
-        
-        function setStatus(state, text) {
-            const statusEl = document.getElementById('status');
-            statusEl.className = `status ${state}`;
-            statusEl.textContent = text;
-        }
-        
-        function addMessage(data) {
-            const messagesEl = document.getElementById('messages');
-            
-            // Remove placeholder if present
-            const placeholder = messagesEl.querySelector('p');
-            if (placeholder) {
-                placeholder.remove();
-            }
-            
-            const messageEl = document.createElement('div');
-            messageEl.className = 'message';
-            messageEl.innerHTML = `
-                <div class="topic">${escapeHtml(data.topic)}</div>
-                <div class="time">${data.time}</div>
-                <div class="payload">${escapeHtml(JSON.stringify(data.payload, null, 2))}</div>
-            `;
-            
-            messagesEl.insertBefore(messageEl, messagesEl.firstChild);
-            
-            // Limit to 100 messages
-            while (messagesEl.children.length > 100) {
-                messagesEl.removeChild(messagesEl.lastChild);
-            }
-        }
-        
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
+
+        // Column 1: numbers only
+        subscribe('/events?topic=numbers', 'numbers', function(data) {
+            addEntry('numbers', extractValue(data), data.topic, data.time);
+        });
+
+        // Column 2: letters only
+        subscribe('/events?topic=letters', 'letters', function(data) {
+            addEntry('letters', extractValue(data), data.topic, data.time);
+        });
+
+        // Column 3: both topics
+        subscribe('/events?topic=numbers&topic=letters', 'both', function(data) {
+            addEntry('both', extractValue(data), data.topic, data.time);
+        });
     </script>
 </body>
 </html>
