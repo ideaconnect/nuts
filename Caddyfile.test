@@ -24,8 +24,9 @@
 		}
 	}
 
-	root * /srv/example
-	route / {
+	route /example/* {
+		root * /srv/example
+		uri strip_prefix /example
 		file_server
 	}
 
