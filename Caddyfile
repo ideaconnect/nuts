@@ -1,0 +1,28 @@
+{
+	admin off
+	order nuts before respond
+}
+
+:8080 {
+	route /events* {
+		nuts {
+			nats_url {$NATS_URL:nats://localhost:4222}
+			stream_name {$STREAM_NAME:EVENTS}
+			topic_prefix {$TOPIC_PREFIX:events.}
+			heartbeat_interval 1
+			allowed_origins *
+		}
+	}
+
+	route /* {
+		nuts {
+			nats_url {$NATS_URL:nats://localhost:4222}
+			stream_name {$STREAM_NAME:EVENTS}
+			topic_prefix {$TOPIC_PREFIX:events.}
+			heartbeat_interval 1
+			allowed_origins *
+		}
+	}
+
+	respond /health 200
+}
