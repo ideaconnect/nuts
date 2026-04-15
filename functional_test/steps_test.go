@@ -18,12 +18,13 @@ import (
 
 // clientContext holds per-client SSE state for multi-client scenarios
 type clientContext struct {
-	sseResponse *http.Response
-	sseEvents   []sseEvent
-	allEvents   []sseEvent // accumulated across disconnect/reconnect cycles
-	mu          sync.Mutex
-	cancelFunc  context.CancelFunc
-	lastEventID string
+	sseResponse            *http.Response
+	sseEvents              []sseEvent
+	allEvents              []sseEvent // accumulated across disconnect/reconnect cycles
+	mu                     sync.Mutex
+	cancelFunc             context.CancelFunc
+	lastEventID            string
+	lastEventIDAtDisconnect string // snapshot taken at disconnect time
 }
 
 // testContext holds state for each scenario
@@ -464,6 +465,7 @@ func clientDisconnects(name string) error {
 	// Snapshot current events into allEvents before disconnecting
 	cc.mu.Lock()
 	cc.allEvents = append(cc.allEvents, cc.sseEvents...)
+	cc.lastEventIDAtDisconnect = cc.lastEventID
 	cc.mu.Unlock()
 
 	if cc.cancelFunc != nil {
@@ -522,12 +524,22 @@ func clientConnectsWithLastEventIDFromClient(name, endpoint, otherName string) e
 	if !ok {
 		return fmt.Errorf("client %q not found", otherName)
 	}
-	if other.lastEventID == "" {
+
+	// Use the snapshot taken at disconnect time so we are not affected
+	// by events the other client received after reconnecting.
+	other.mu.Lock()
+	lastID := other.lastEventIDAtDisconnect
+	if lastID == "" {
+		lastID = other.lastEventID
+	}
+	other.mu.Unlock()
+
+	if lastID == "" {
 		return fmt.Errorf("client %q has no last event ID", otherName)
 	}
 
 	cc := getOrCreateClient(name)
-	cc.lastEventID = other.lastEventID
+	cc.lastEventID = lastID
 
 	sep := "&"
 	if !strings.Contains(endpoint, "?") {

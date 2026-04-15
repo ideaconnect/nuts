@@ -1,5 +1,22 @@
-// Package nuts provides a Caddy module that bridges NATS.io Pub/Sub with
-// Server-Sent Events (SSE), similar to Mercure.rocks functionality.
+// Package nuts provides a Caddy module that bridges NATS.io JetStream
+// messages to Server-Sent Events (SSE), similar to Mercure.rocks.
+//
+// The data flow is one-directional:
+//
+//	Producer  ──▶  NATS JetStream  ──▶  NUTS (this module)  ──▶  Browser (EventSource)
+//
+// External applications publish messages to NATS subjects. NUTS subscribes
+// to those subjects through JetStream and pushes every message to connected
+// browsers as SSE events in real time. JetStream persists messages, so a
+// client that reconnects can replay everything it missed by providing its
+// last received event ID.
+//
+// Source files:
+//   - handler.go   — Module registration, Handler struct (config + runtime state)
+//   - serve.go     — HTTP/SSE request handling: the main streaming loop
+//   - provision.go — Caddy lifecycle: connect to NATS, create JetStream context, cleanup
+//   - helpers.go   — Small utility functions (JSON, topic validation, SSE writing)
+//   - caddyfile.go — Caddyfile directive parser
 package nuts
 
 import (
@@ -13,65 +30,119 @@ import (
 	"go.uber.org/zap"
 )
 
+// init runs automatically when the package is imported. It tells Caddy about
+// our module so that Caddy can create instances of it, and it registers the
+// "nuts" keyword so users can use it in their Caddyfile.
 func init() {
+	// RegisterModule makes Caddy aware of our Handler type.
 	caddy.RegisterModule(&Handler{})
+
+	// RegisterHandlerDirective tells Caddy's config parser that when it sees
+	// a "nuts" block it should call parseCaddyfile (defined in caddyfile.go)
+	// to turn the text into a Handler.
 	httpcaddyfile.RegisterHandlerDirective("nuts", parseCaddyfile)
 }
 
-// Handler implements an HTTP handler that bridges NATS.io messages
-// to Server-Sent Events for browser clients.
+// Handler implements an HTTP handler that bridges NATS.io JetStream
+// messages to Server-Sent Events (SSE) for browser clients.
+//
+// Fields tagged with `json:"..."` are user-configurable — they come
+// from the Caddyfile (via UnmarshalCaddyfile) or from Caddy's JSON API.
+// The unexported fields at the bottom are runtime state set during
+// Provision() and should never be set manually.
 type Handler struct {
-	// NatsURL is the URL to connect to NATS server (e.g., "nats://localhost:4222")
+	// ── Required ──────────────────────────────────────────────────
+
+	// NatsURL is the connection string for the NATS server.
+	// Example: "nats://localhost:4222"
 	NatsURL string `json:"nats_url,omitempty"`
 
-	// NatsCredentials is the path to NATS credentials file (optional)
-	NatsCredentials string `json:"nats_credentials,omitempty"`
-
-	// NatsToken is the authentication token for NATS (optional)
-	NatsToken string `json:"nats_token,omitempty"`
-
-	// NatsUser is the username for NATS authentication (optional)
-	NatsUser string `json:"nats_user,omitempty"`
-
-	// NatsPassword is the password for NATS authentication (optional)
-	NatsPassword string `json:"nats_password,omitempty"`
-
-	// TopicPrefix is a prefix added to all topic subscriptions
-	TopicPrefix string `json:"topic_prefix,omitempty"`
-
-	// AllowedOrigins is a list of allowed CORS origins (* for all)
-	AllowedOrigins []string `json:"allowed_origins,omitempty"`
-
-	// HeartbeatInterval is the interval for sending heartbeat comments (in seconds)
-	HeartbeatInterval int `json:"heartbeat_interval,omitempty"`
-
-	// ReconnectWait is the time to wait before reconnecting to NATS (in seconds)
-	ReconnectWait int `json:"reconnect_wait,omitempty"`
-
-	// MaxReconnects is the maximum number of reconnection attempts (-1 for infinite)
-	MaxReconnects int `json:"max_reconnects,omitempty"`
-
-	// StreamName is the name of the JetStream stream to use (required)
+	// StreamName is the JetStream stream to subscribe to (e.g., "EVENTS").
+	// The stream must already exist — NUTS does not create streams.
 	StreamName string `json:"stream_name,omitempty"`
 
-	// MaxEventSize is the maximum size in bytes of a single SSE event payload.
-	// Messages exceeding this limit are dropped with a warning. 0 means no limit.
+	// ── Authentication (pick at most one method) ─────────────────
+
+	// NatsCredentials is the filesystem path to a .creds file.
+	// Used with NATS account-based security (JWT + NKey).
+	NatsCredentials string `json:"nats_credentials,omitempty"`
+
+	// NatsToken is a simple shared-secret token for NATS authentication.
+	NatsToken string `json:"nats_token,omitempty"`
+
+	// NatsUser is the username for basic NATS authentication.
+	// Must be paired with NatsPassword.
+	NatsUser string `json:"nats_user,omitempty"`
+
+	// NatsPassword is the password for basic NATS authentication.
+	// Must be paired with NatsUser.
+	NatsPassword string `json:"nats_password,omitempty"`
+
+	// ── Optional tuning ──────────────────────────────────────────
+
+	// TopicPrefix is prepended to every topic name before subscribing.
+	// For example, prefix "events." + client topic "orders" = NATS subject "events.orders".
+	TopicPrefix string `json:"topic_prefix,omitempty"`
+
+	// AllowedOrigins lists the browser origins allowed by CORS.
+	// Use ["*"] to allow any origin (default). In production, prefer explicit domains.
+	AllowedOrigins []string `json:"allowed_origins,omitempty"`
+
+	// HeartbeatInterval is how often (in seconds) the server sends a keep-alive
+	// comment to SSE clients. Prevents proxies from killing idle connections.
+	// Default: 30.
+	HeartbeatInterval int `json:"heartbeat_interval,omitempty"`
+
+	// ReconnectWait is the delay in seconds between NATS reconnection attempts.
+	// Default: 2.
+	ReconnectWait int `json:"reconnect_wait,omitempty"`
+
+	// MaxReconnects limits total NATS reconnection attempts. -1 means unlimited.
+	// Default: -1.
+	MaxReconnects int `json:"max_reconnects,omitempty"`
+
+	// MaxEventSize caps the size (in bytes) of a single formatted SSE event.
+	// Events exceeding this are dropped with a warning log. 0 disables the limit.
 	// Default: 1048576 (1 MB).
 	MaxEventSize int `json:"max_event_size,omitempty"`
 
-	conn   *nats.Conn
-	js     nats.JetStreamContext
+	// ── Runtime state (not user-configurable) ────────────────────
+
+	// conn is the long-lived TCP connection to the NATS server.
+	// Opened during Provision(), shared across all HTTP requests.
+	conn *nats.Conn
+
+	// js is a JetStream context derived from conn. It provides
+	// Subscribe() and StreamInfo() used by ServeHTTP and Provision.
+	js nats.JetStreamContext
+
+	// logger is a structured logger scoped to this handler instance.
 	logger *zap.Logger
-	mu     sync.RWMutex
+
+	// mu protects conn and js. Request goroutines read-lock (RLock);
+	// Provision and Cleanup write-lock (Lock).
+	mu sync.RWMutex
 }
 
+// messageEventPayload is the JSON structure sent inside the "data:" field of
+// each SSE event. Browsers receive it as a string and typically JSON.parse()
+// it to access the topic, the original message body, and the timestamp.
+//
+// Example of what the browser sees on the wire:
+//
+//	id: 42
+//	event: message
+//	data: {"topic":"orders","payload":{"id":1},"time":"2024-01-01T12:00:00Z"}
 type messageEventPayload struct {
-	Topic   string      `json:"topic"`
-	Payload interface{} `json:"payload"`
-	Time    string      `json:"time"`
+	Topic   string      `json:"topic"`   // Topic name (without the prefix)
+	Payload interface{} `json:"payload"` // Original message body; parsed as JSON when valid
+	Time    string      `json:"time"`    // ISO 8601 timestamp (from JetStream metadata when available)
 }
 
-// CaddyModule returns the Caddy module information.
+// CaddyModule returns metadata that tells Caddy about this module.
+// The ID "http.handlers.nuts" places it in the HTTP handler namespace.
+// The New function is a factory — Caddy calls it to create a fresh Handler
+// instance every time the config is loaded.
 func (*Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.nuts",
@@ -79,7 +150,17 @@ func (*Handler) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Interface guards
+// Interface guards — compile-time checks that Handler implements every
+// Caddy interface it needs. If you accidentally remove a required method,
+// the compiler will fail here with a clear message instead of panicking
+// at runtime.
+//
+//   - caddy.Module:                CaddyModule() — identity & factory
+//   - caddy.Provisioner:           Provision() — setup on startup
+//   - caddy.Validator:             Validate() — config validation
+//   - caddy.CleanerUpper:          Cleanup() — teardown on shutdown
+//   - caddyhttp.MiddlewareHandler: ServeHTTP() — handle HTTP requests
+//   - caddyfile.Unmarshaler:       UnmarshalCaddyfile() — parse Caddyfile
 var (
 	_ caddy.Module                = (*Handler)(nil)
 	_ caddy.Provisioner           = (*Handler)(nil)
