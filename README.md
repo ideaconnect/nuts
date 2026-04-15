@@ -39,6 +39,81 @@ cd nuts
 go build -o caddy ./cmd/caddy
 ```
 
+### Using the Docker Image
+
+A pre-built multi-architecture image (`amd64` / `arm64`) is published to Docker Hub:
+
+```bash
+docker pull idcttech/nuts
+```
+
+The image expects a Caddyfile mounted at `/app/Caddyfile` and exposes port `8080`:
+
+```bash
+docker run -d \
+  -p 8080:8080 \
+  -v ./Caddyfile:/app/Caddyfile:ro \
+  idcttech/nuts
+```
+
+#### Docker Compose
+
+A typical production-like stack with NATS and NUTS:
+
+```yaml
+services:
+  nats:
+    image: nats:2.12-alpine
+    command: ["--jetstream", "--store_dir=/data"]
+    volumes:
+      - nats-data:/data
+
+  nats-init:
+    image: natsio/nats-box:0.19.0
+    depends_on:
+      nats:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        nats -s nats://nats:4222 stream add EVENTS \
+          --subjects "events.>" \
+          --storage file \
+          --retention limits \
+          --max-msgs 10000 \
+          --max-age 24h \
+          --discard old \
+          --defaults
+    restart: "no"
+
+  nuts:
+    image: idcttech/nuts
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./Caddyfile:/app/Caddyfile:ro
+    depends_on:
+      nats-init:
+        condition: service_completed_successfully
+
+volumes:
+  nats-data:
+```
+
+With a Caddyfile like:
+
+```caddyfile
+:8080 {
+    route /events* {
+        nuts {
+            nats_url  nats://nats:4222
+            stream_name EVENTS
+            topic_prefix events.
+        }
+    }
+}
+```
+
 ## Testing
 
 The repository has two test layers:
