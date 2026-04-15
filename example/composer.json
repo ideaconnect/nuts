@@ -1,0 +1,5 @@
+{
+    "require": {
+        "idct/php-nats-jetstream-client": "^1.0"
+    }
+}

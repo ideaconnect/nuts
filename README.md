@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="media/nuts-logo.png" alt="NUTS logo" /><br/>
+  <a href="https://nuts.idct.tech">https://nuts.idct.tech</a>
+</p>
+
 # 🥜 NUTS - NATS to SSE for Caddy
 
 A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Events (SSE), inspired by [Mercure.rocks](https://mercure.rocks).
@@ -480,4 +485,26 @@ BSD 4-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions of all kinds are welcome and appreciated! Whether you're fixing a typo, reporting a bug, suggesting a feature, or submitting a pull request — every bit helps make NUTS better.
+
+Here are some ways you can get involved:
+
+- **Report bugs** — Found something broken? [Open an issue](https://github.com/ideaconnect/nuts/issues) with steps to reproduce.
+- **Suggest features** — Have an idea for an improvement? Start a discussion or file an issue — we'd love to hear it.
+- **Submit pull requests** — Code contributions are always welcome. Feel free to pick up an open issue or propose your own change.
+- **Ask questions** — Not sure how something works? Open an issue and ask. There are no silly questions.
+- **Share feedback** — If you're using NUTS in a project, let us know how it's going. Your experience helps guide development.
+
+When submitting a pull request, please:
+
+1. Keep changes focused and minimal.
+2. Add or update tests when behavior changes.
+3. Run `make test` to verify both unit and functional tests pass.
+4. Follow the existing code style (`go fmt ./...`).
+
+---
+
+<p align="center">
+  <img src="media/idct-logo.png" alt="IDCT logo" /><br/>
+  Created by <a href="https://idct.tech">IDCT</a> Bartosz Pachołek
+</p>

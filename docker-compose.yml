@@ -39,14 +39,19 @@ services:
 
   # PHP sender: publishes random numbers and letters every 250ms
   php-sender:
-    image: php:8.3-cli-alpine
+    image: composer:2
     container_name: nuts-php-sender
+    working_dir: /app
     volumes:
-      - ./example/sender.php:/app/sender.php:ro
+      - ./example:/app
     environment:
       - NATS_HOST=nats
       - NATS_PORT=4222
-    command: ["php", "/app/sender.php"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        composer install --no-interaction --quiet
+        php /app/sender.php
     depends_on:
       nats-init:
         condition: service_completed_successfully

@@ -16,6 +16,16 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// clientContext holds per-client SSE state for multi-client scenarios
+type clientContext struct {
+	sseResponse *http.Response
+	sseEvents   []sseEvent
+	allEvents   []sseEvent // accumulated across disconnect/reconnect cycles
+	mu          sync.Mutex
+	cancelFunc  context.CancelFunc
+	lastEventID string
+}
+
 // testContext holds state for each scenario
 type testContext struct {
 	natsConn       *nats.Conn
@@ -30,6 +40,7 @@ type testContext struct {
 	cancelFunc     context.CancelFunc
 	publishedSeqs  map[int]uint64 // maps message index to JetStream sequence
 	heartbeats     []string
+	clients        map[string]*clientContext
 }
 
 type sseEvent struct {
@@ -371,6 +382,269 @@ func iShouldReceiveAHeartbeatComment() error {
 	return fmt.Errorf("no heartbeat comment received")
 }
 
+// --- Multi-client step implementations ---
+
+func readClientSSEEvents(cc *clientContext, body io.Reader) {
+	scanner := bufio.NewScanner(body)
+	var currentEvent sseEvent
+	var dataLines []string
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if line == "" {
+			if currentEvent.Event != "" || len(dataLines) > 0 {
+				currentEvent.Data = strings.Join(dataLines, "\n")
+				cc.mu.Lock()
+				cc.sseEvents = append(cc.sseEvents, currentEvent)
+				if currentEvent.ID != "" {
+					cc.lastEventID = currentEvent.ID
+				}
+				cc.mu.Unlock()
+				currentEvent = sseEvent{}
+				dataLines = nil
+			}
+			continue
+		}
+
+		if strings.HasPrefix(line, "id: ") {
+			currentEvent.ID = strings.TrimPrefix(line, "id: ")
+		} else if strings.HasPrefix(line, "event: ") {
+			currentEvent.Event = strings.TrimPrefix(line, "event: ")
+		} else if strings.HasPrefix(line, "data: ") {
+			dataLines = append(dataLines, strings.TrimPrefix(line, "data: "))
+		}
+	}
+}
+
+func getOrCreateClient(name string) *clientContext {
+	if tc.clients == nil {
+		tc.clients = make(map[string]*clientContext)
+	}
+	cc, ok := tc.clients[name]
+	if !ok {
+		cc = &clientContext{}
+		tc.clients[name] = cc
+	}
+	return cc
+}
+
+func clientIsConnectedToSSEEndpoint(name, endpoint string) error {
+	cc := getOrCreateClient(name)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cc.cancelFunc = cancel
+
+	req, err := http.NewRequestWithContext(ctx, "GET", tc.baseURL+endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	httpClient := &http.Client{Timeout: 0}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("client %q failed to connect: %w", name, err)
+	}
+	cc.sseResponse = resp
+	cc.sseEvents = nil
+
+	go readClientSSEEvents(cc, resp.Body)
+
+	time.Sleep(300 * time.Millisecond)
+	return nil
+}
+
+func clientDisconnects(name string) error {
+	cc, ok := tc.clients[name]
+	if !ok {
+		return fmt.Errorf("client %q not found", name)
+	}
+
+	// Snapshot current events into allEvents before disconnecting
+	cc.mu.Lock()
+	cc.allEvents = append(cc.allEvents, cc.sseEvents...)
+	cc.mu.Unlock()
+
+	if cc.cancelFunc != nil {
+		cc.cancelFunc()
+		cc.cancelFunc = nil
+	}
+	if cc.sseResponse != nil {
+		cc.sseResponse.Body.Close()
+		cc.sseResponse = nil
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	return nil
+}
+
+func clientReconnectsWithLastEventID(name, endpoint string) error {
+	cc, ok := tc.clients[name]
+	if !ok {
+		return fmt.Errorf("client %q not found", name)
+	}
+	if cc.lastEventID == "" {
+		return fmt.Errorf("client %q has no last event ID", name)
+	}
+
+	sep := "&"
+	if !strings.Contains(endpoint, "?") {
+		sep = "?"
+	}
+	fullEndpoint := fmt.Sprintf("%s%slast-id=%s", endpoint, sep, cc.lastEventID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cc.cancelFunc = cancel
+
+	req, err := http.NewRequestWithContext(ctx, "GET", tc.baseURL+fullEndpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	httpClient := &http.Client{Timeout: 0}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("client %q failed to reconnect: %w", name, err)
+	}
+	cc.sseResponse = resp
+	cc.sseEvents = nil
+
+	go readClientSSEEvents(cc, resp.Body)
+
+	time.Sleep(300 * time.Millisecond)
+	return nil
+}
+
+func clientConnectsWithLastEventIDFromClient(name, endpoint, otherName string) error {
+	other, ok := tc.clients[otherName]
+	if !ok {
+		return fmt.Errorf("client %q not found", otherName)
+	}
+	if other.lastEventID == "" {
+		return fmt.Errorf("client %q has no last event ID", otherName)
+	}
+
+	cc := getOrCreateClient(name)
+	cc.lastEventID = other.lastEventID
+
+	sep := "&"
+	if !strings.Contains(endpoint, "?") {
+		sep = "?"
+	}
+	fullEndpoint := fmt.Sprintf("%s%slast-id=%s", endpoint, sep, cc.lastEventID)
+
+	return clientIsConnectedToSSEEndpoint(name, fullEndpoint)
+}
+
+func countMessages(events []sseEvent) int {
+	n := 0
+	for _, e := range events {
+		if e.Event == "message" {
+			n++
+		}
+	}
+	return n
+}
+
+func clientShouldHaveReceivedNMessages(name string, expected int) error {
+	cc, ok := tc.clients[name]
+	if !ok {
+		return fmt.Errorf("client %q not found", name)
+	}
+
+	// Poll for up to 5 seconds
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		cc.mu.Lock()
+		got := countMessages(cc.sseEvents)
+		cc.mu.Unlock()
+		if got >= expected {
+			if got != expected {
+				return fmt.Errorf("client %q: expected %d messages, got %d", name, expected, got)
+			}
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	cc.mu.Lock()
+	got := countMessages(cc.sseEvents)
+	cc.mu.Unlock()
+	return fmt.Errorf("client %q: expected %d messages, got %d (timeout)", name, expected, got)
+}
+
+func clientShouldHaveReceivedNMessagesInTotal(name string, expected int) error {
+	cc, ok := tc.clients[name]
+	if !ok {
+		return fmt.Errorf("client %q not found", name)
+	}
+
+	// Poll for up to 5 seconds
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		cc.mu.Lock()
+		// allEvents has pre-disconnect events; sseEvents has post-reconnect events
+		all := append(cc.allEvents, cc.sseEvents...)
+		got := countMessages(all)
+		cc.mu.Unlock()
+		if got >= expected {
+			if got != expected {
+				return fmt.Errorf("client %q: expected %d total messages, got %d", name, expected, got)
+			}
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	cc.mu.Lock()
+	all := append(cc.allEvents, cc.sseEvents...)
+	got := countMessages(all)
+	cc.mu.Unlock()
+	return fmt.Errorf("client %q: expected %d total messages, got %d (timeout)", name, expected, got)
+}
+
+func clientShouldHaveReceivedEventContaining(name, text string) error {
+	cc, ok := tc.clients[name]
+	if !ok {
+		return fmt.Errorf("client %q not found", name)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	all := append(cc.allEvents, cc.sseEvents...)
+	for _, event := range all {
+		if strings.Contains(event.Data, text) {
+			return nil
+		}
+	}
+	return fmt.Errorf("client %q: no event contains %q", name, text)
+}
+
+func clientShouldNotHaveReceivedEventContaining(name, text string) error {
+	cc, ok := tc.clients[name]
+	if !ok {
+		return fmt.Errorf("client %q not found", name)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	all := append(cc.allEvents, cc.sseEvents...)
+	for _, event := range all {
+		if strings.Contains(event.Data, text) {
+			return fmt.Errorf("client %q: unexpected event containing %q", name, text)
+		}
+	}
+	return nil
+}
+
 func InitializeScenario(ctx *godog.ScenarioContext) {
 	tc = &testContext{
 		baseURL:       getEnvOrDefault("TEST_BASE_URL", "http://localhost:8080"),
@@ -385,16 +659,26 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 		tc.httpBody = ""
 		tc.heartbeats = nil
 		tc.publishedSeqs = make(map[int]uint64)
+		tc.clients = make(map[string]*clientContext)
 		return ctx, nil
 	})
 
 	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
-		// Cleanup
+		// Cleanup single-client state
 		if tc.cancelFunc != nil {
 			tc.cancelFunc()
 		}
 		if tc.sseResponse != nil {
 			tc.sseResponse.Body.Close()
+		}
+		// Cleanup multi-client state
+		for _, cc := range tc.clients {
+			if cc.cancelFunc != nil {
+				cc.cancelFunc()
+			}
+			if cc.sseResponse != nil {
+				cc.sseResponse.Body.Close()
+			}
 		}
 		if tc.natsConn != nil {
 			tc.natsConn.Close()
@@ -430,4 +714,14 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the response should contain "([^"]*)"$`, theResponseShouldContain)
 	ctx.Step(`^the response header "([^"]*)" should be "([^"]*)"$`, theResponseHeaderShouldBe)
 	ctx.Step(`^I should receive a heartbeat comment$`, iShouldReceiveAHeartbeatComment)
+
+	// Multi-client steps
+	ctx.Step(`^client "([^"]*)" is connected to SSE endpoint "([^"]*)"$`, clientIsConnectedToSSEEndpoint)
+	ctx.Step(`^client "([^"]*)" should have received (\d+) messages$`, clientShouldHaveReceivedNMessages)
+	ctx.Step(`^client "([^"]*)" disconnects$`, clientDisconnects)
+	ctx.Step(`^client "([^"]*)" reconnects to SSE endpoint "([^"]*)" with its last event ID$`, clientReconnectsWithLastEventID)
+	ctx.Step(`^client "([^"]*)" connects to SSE endpoint "([^"]*)" with last event ID from client "([^"]*)"$`, clientConnectsWithLastEventIDFromClient)
+	ctx.Step(`^client "([^"]*)" should have received (\d+) messages in total$`, clientShouldHaveReceivedNMessagesInTotal)
+	ctx.Step(`^client "([^"]*)" should have received an event containing '([^']*)'$`, clientShouldHaveReceivedEventContaining)
+	ctx.Step(`^client "([^"]*)" should not have received an event containing '([^']*)'$`, clientShouldNotHaveReceivedEventContaining)
 }
