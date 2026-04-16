@@ -196,6 +196,7 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				reconnect_wait 5
 				max_reconnects 10
 				max_event_size 524288
+				hub_url https://example.com/events
 				allowed_origins https://example.com https://other.com
 			}`,
 			expected: &Handler{
@@ -206,6 +207,7 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				ReconnectWait:     5,
 				MaxReconnects:     10,
 				MaxEventSize:      524288,
+				HubURL:            "https://example.com/events",
 				AllowedOrigins:    []string{"https://example.com", "https://other.com"},
 			},
 			expectError: false,
@@ -387,6 +389,9 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 			}
 			if h.MaxEventSize != tt.expected.MaxEventSize {
 				t.Errorf("MaxEventSize: expected %d, got %d", tt.expected.MaxEventSize, h.MaxEventSize)
+			}
+			if h.HubURL != tt.expected.HubURL {
+				t.Errorf("HubURL: expected %q, got %q", tt.expected.HubURL, h.HubURL)
 			}
 			if len(tt.expected.AllowedOrigins) > 0 {
 				if len(h.AllowedOrigins) != len(tt.expected.AllowedOrigins) {
@@ -1776,4 +1781,238 @@ func TestHandler_ServeHTTP_OversizedEventDropped(t *testing.T) {
 	if strings.Contains(body, strings.Repeat("X", 200)) {
 		t.Errorf("expected oversized message to be dropped, body: %s", body)
 	}
+}
+
+// ── Phase 1 feature tests: health check, hub discovery, metrics, Caddyfile ──
+
+func TestHandler_HealthCheck(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("failed to connect to NATS: %v", err)
+	}
+	defer nc.Close()
+
+	createTestStream(t, nc, "HEALTH_EVENTS", []string{"events.>"})
+
+	h := &Handler{
+		NatsURL:    ns.ClientURL(),
+		StreamName: "HEALTH_EVENTS",
+		logger:     zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("failed to connect handler: %v", err)
+	}
+	defer h.Cleanup()
+
+	jsCtx, err := h.conn.JetStream()
+	if err != nil {
+		t.Fatalf("failed to create JetStream context: %v", err)
+	}
+	h.mu.Lock()
+	h.js = jsCtx
+	h.mu.Unlock()
+
+	t.Run("healthy returns 200 with JSON status", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/events/healthz", nil)
+		rr := httptest.NewRecorder()
+
+		if err := h.ServeHTTP(rr, req, nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rr.Code)
+		}
+		if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+			t.Errorf("expected application/json, got %q", ct)
+		}
+
+		var resp map[string]string
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to parse response: %v", err)
+		}
+		if resp["status"] != "ok" {
+			t.Errorf("expected status ok, got %q", resp["status"])
+		}
+		if resp["nats"] != "connected" {
+			t.Errorf("expected nats connected, got %q", resp["nats"])
+		}
+		if resp["stream"] != "available" {
+			t.Errorf("expected stream available, got %q", resp["stream"])
+		}
+	})
+
+	t.Run("degraded when NATS disconnected returns 503", func(t *testing.T) {
+		// Create handler with nil conn (simulating disconnected state)
+		degraded := &Handler{
+			StreamName: "HEALTH_EVENTS",
+			logger:     zap.NewNop(),
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/events/healthz", nil)
+		rr := httptest.NewRecorder()
+
+		if err := degraded.ServeHTTP(rr, req, nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Errorf("expected 503, got %d", rr.Code)
+		}
+
+		var resp map[string]string
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to parse response: %v", err)
+		}
+		if resp["status"] != "degraded" {
+			t.Errorf("expected status degraded, got %q", resp["status"])
+		}
+	})
+
+	t.Run("healthz path suffix works with different base paths", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/nuts/healthz", nil)
+		rr := httptest.NewRecorder()
+
+		if err := h.ServeHTTP(rr, req, nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rr.Code)
+		}
+	})
+}
+
+func TestHandler_HubDiscovery(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("failed to connect to NATS: %v", err)
+	}
+	defer nc.Close()
+
+	createTestStream(t, nc, "HUB_EVENTS", []string{"events.>"})
+
+	t.Run("Link header present when hub_url is set", func(t *testing.T) {
+		h := &Handler{
+			NatsURL:           ns.ClientURL(),
+			StreamName:        "HUB_EVENTS",
+			TopicPrefix:       "events.",
+			HeartbeatInterval: 30,
+			ReconnectWait:     2,
+			MaxReconnects:     -1,
+			AllowedOrigins:    []string{"*"},
+			HubURL:            "https://example.com/events",
+			logger:            zap.NewNop(),
+		}
+		if err := h.connectNATS(); err != nil {
+			t.Fatalf("failed to connect handler: %v", err)
+		}
+		defer h.Cleanup()
+
+		jsCtx, _ := h.conn.JetStream()
+		h.mu.Lock()
+		h.js = jsCtx
+		h.mu.Unlock()
+
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil)
+		ctx, cancel := context.WithTimeout(req.Context(), 1*time.Second)
+		defer cancel()
+		req = req.WithContext(ctx)
+
+		rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+		done := make(chan error, 1)
+		go func() { done <- h.ServeHTTP(rr, req, nil) }()
+
+		select {
+		case <-done:
+		case <-time.After(1 * time.Second):
+			cancel()
+			<-done
+		}
+
+		link := rr.Header().Get("Link")
+		expected := `<https://example.com/events>; rel="nuts"`
+		if link != expected {
+			t.Errorf("Link header: expected %q, got %q", expected, link)
+		}
+	})
+
+	t.Run("no Link header when hub_url is empty", func(t *testing.T) {
+		h := &Handler{
+			NatsURL:           ns.ClientURL(),
+			StreamName:        "HUB_EVENTS",
+			TopicPrefix:       "events.",
+			HeartbeatInterval: 30,
+			ReconnectWait:     2,
+			MaxReconnects:     -1,
+			AllowedOrigins:    []string{"*"},
+			logger:            zap.NewNop(),
+		}
+		if err := h.connectNATS(); err != nil {
+			t.Fatalf("failed to connect handler: %v", err)
+		}
+		defer h.Cleanup()
+
+		jsCtx, _ := h.conn.JetStream()
+		h.mu.Lock()
+		h.js = jsCtx
+		h.mu.Unlock()
+
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil)
+		ctx, cancel := context.WithTimeout(req.Context(), 1*time.Second)
+		defer cancel()
+		req = req.WithContext(ctx)
+
+		rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+		done := make(chan error, 1)
+		go func() { done <- h.ServeHTTP(rr, req, nil) }()
+
+		select {
+		case <-done:
+		case <-time.After(1 * time.Second):
+			cancel()
+			<-done
+		}
+
+		if link := rr.Header().Get("Link"); link != "" {
+			t.Errorf("expected no Link header, got %q", link)
+		}
+	})
+}
+
+func TestHandler_UnmarshalCaddyfile_HubURL(t *testing.T) {
+	t.Run("hub_url parsed correctly", func(t *testing.T) {
+		caddyfileInput := `nuts {
+			nats_url nats://localhost:4222
+			stream_name EVENTS
+			hub_url https://example.com/hub
+		}`
+		d := caddyfile.NewTestDispenser(caddyfileInput)
+		h := Handler{}
+		if err := h.UnmarshalCaddyfile(d); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if h.HubURL != "https://example.com/hub" {
+			t.Errorf("HubURL: expected %q, got %q", "https://example.com/hub", h.HubURL)
+		}
+	})
+
+	t.Run("hub_url missing argument", func(t *testing.T) {
+		caddyfileInput := `nuts {
+			nats_url nats://localhost:4222
+			stream_name EVENTS
+			hub_url
+		}`
+		d := caddyfile.NewTestDispenser(caddyfileInput)
+		h := Handler{}
+		if err := h.UnmarshalCaddyfile(d); err == nil {
+			t.Error("expected error for missing hub_url argument")
+		}
+	})
 }

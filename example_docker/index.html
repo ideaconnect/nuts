@@ -202,26 +202,20 @@
         }
 
         function subscribe(url, name, handler) {
-            var es;
-            function connect() {
-                es = new EventSource(url);
-                es.addEventListener('connected', function() { setDot(name, 'ok'); });
-                es.addEventListener('message', function(e) {
-                    var data = JSON.parse(e.data);
-                    handler(data);
-                });
-                es.onerror = function() {
-                    if (es.readyState === EventSource.CLOSED) {
-                        setDot(name, 'err');
-                        // Server returned a non-200 (e.g. 503 during restart).
-                        // EventSource won't retry, so reconnect manually.
-                        setTimeout(connect, 3000);
-                    } else {
-                        setDot(name, 'wait');
-                    }
-                };
-            }
-            connect();
+            const es = new EventSource(url);
+            es.addEventListener('connected', function() { setDot(name, 'ok'); });
+            es.addEventListener('message', function(e) {
+                const data = JSON.parse(e.data);
+                handler(data);
+            });
+            es.onerror = function() {
+                if (es.readyState === EventSource.CLOSED) {
+                    setDot(name, 'err');
+                } else {
+                    setDot(name, 'wait');
+                }
+            };
+            return es;
         }
 
         // Column 1: numbers only

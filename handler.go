@@ -106,6 +106,12 @@ type Handler struct {
 	// Default: 1048576 (1 MB).
 	MaxEventSize int `json:"max_event_size,omitempty"`
 
+	// HubURL is the URL advertised in the Link header for hub discovery.
+	// When set, SSE responses include a Link: <url>; rel="nuts" header
+	// so that clients and upstream APIs can discover the event hub automatically.
+	// Leave empty to disable hub discovery (default).
+	HubURL string `json:"hub_url,omitempty"`
+
 	// ── Runtime state (not user-configurable) ────────────────────
 
 	// conn is the long-lived TCP connection to the NATS server.

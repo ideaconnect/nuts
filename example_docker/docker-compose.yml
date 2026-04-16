@@ -1,10 +1,7 @@
 services:
   nats:
     image: nats:2.12-alpine
-    container_name: nuts-nats
-    ports:
-      - "4222:4222"   # Client connections
-      - "8222:8222"   # HTTP monitoring
+    container_name: nuts-docker-nats
     command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
     volumes:
       - nats-data:/data
@@ -17,7 +14,7 @@ services:
   # Init container to create the JetStream stream
   nats-init:
     image: natsio/nats-box:0.19.0
-    container_name: nuts-nats-init
+    container_name: nuts-docker-nats-init
     depends_on:
       nats:
         condition: service_healthy
@@ -36,16 +33,13 @@ services:
     restart: "no"
 
   nuts:
-    build:
-      context: .
-      dockerfile: Dockerfile.test
-    container_name: nuts-server
+    image: idcttech/nuts
+    container_name: nuts-docker-server
     ports:
       - "8080:8080"
-    environment:
-      - NATS_URL=nats://nats:4222
-      - STREAM_NAME=EVENTS
-      - TOPIC_PREFIX=events.
+    volumes:
+      - ./Caddyfile:/app/Caddyfile:ro
+      - ./index.html:/srv/static/index.html:ro
     depends_on:
       nats-init:
         condition: service_completed_successfully
@@ -56,5 +50,28 @@ services:
       timeout: 5s
       retries: 10
 
+  # PHP sender: publishes random numbers and letters every 50ms
+  php-sender:
+    image: composer:2
+    container_name: nuts-docker-php-sender
+    working_dir: /app
+    volumes:
+      - ./composer.json:/app/composer.json:ro
+      - ./sender.php:/app/sender.php:ro
+      - php-vendor:/app/vendor
+    environment:
+      - NATS_HOST=nats
+      - NATS_PORT=4222
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        composer install --no-interaction --quiet
+        php /app/sender.php
+    depends_on:
+      nats-init:
+        condition: service_completed_successfully
+    restart: on-failure
+
 volumes:
   nats-data:
+  php-vendor:

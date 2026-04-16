@@ -1,0 +1,23 @@
+{
+	admin off
+	order nuts before respond
+}
+
+:8080 {
+	route /events* {
+		nuts {
+			nats_url nats://nats:4222
+			stream_name EVENTS
+			topic_prefix events.
+			heartbeat_interval 30
+			allowed_origins *
+		}
+	}
+
+	route / {
+		root * /srv/static
+		file_server
+	}
+
+	respond /health 200
+}

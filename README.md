@@ -19,6 +19,9 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 - **No Message Drops For Connected Clients**: When a client falls behind, NUTS disconnects that SSE session before dropping queued messages so the client can resume from the last delivered event ID
 - **Flexible Authentication**: Support for credentials file, token, or user/password auth
 - **Topic Prefixing**: Optional prefix for all NATS subscriptions
+- **Prometheus Metrics**: Built-in `nuts_*` counters and gauges (active connections, messages delivered, slow-client disconnects, replay stats)
+- **Health Check**: `/healthz` endpoint verifying NATS connectivity and stream availability
+- **Hub Discovery**: Optional `Link` header with `rel="nuts"` for automatic hub detection
 
 ## Installation
 
@@ -201,6 +204,7 @@ nuts {
     reconnect_wait <seconds>     # Reconnect wait time (default: 2)
     max_reconnects <count>       # Max reconnects, -1=infinite (default: -1)
     max_event_size <bytes>       # Max SSE event size in bytes (default: 1048576)
+    hub_url <url>                # URL for Link header hub discovery (disabled by default)
 }
 ```
 
@@ -224,11 +228,92 @@ For example, setting `max_event_size 1000` means that if a NATS message produces
     "heartbeat_interval": 30,
     "reconnect_wait": 2,
     "max_reconnects": -1,
-    "max_event_size": 1048576
+    "max_event_size": 1048576,
+    "hub_url": "https://example.com/events"
 }
 ```
 
 `max_event_size` counts the **entire formatted SSE frame**, not just the raw NATS payload. See the Caddyfile section above for details.
+```
+
+### Health Check
+
+NUTS exposes a health check on any path ending in `/healthz` within the configured route. It verifies NATS connectivity and stream availability, returning JSON:
+
+```bash
+curl -i http://localhost:8080/events/healthz
+```
+
+**Healthy (200):**
+```json
+{"status":"ok","nats":"connected","stream":"available"}
+```
+
+**Degraded (503):**
+```json
+{"status":"degraded","nats":"disconnected","stream":"unavailable"}
+```
+
+Use this endpoint as a liveness/readiness probe in Kubernetes or any load balancer health check.
+
+### Prometheus Metrics
+
+NUTS registers the following metrics via `promauto`, which appear automatically on Caddy's `/metrics` endpoint when the [admin API](https://caddyserver.com/docs/caddyfile/options#admin) or a [metrics handler](https://caddyserver.com/docs/caddyfile/directives/metrics) is enabled.
+
+To expose metrics, add a `metrics` handler to your Caddyfile:
+
+```caddyfile
+:8080 {
+    route /metrics {
+        metrics
+    }
+    route /events* {
+        nuts {
+            nats_url  nats://localhost:4222
+            stream_name EVENTS
+            topic_prefix events.
+        }
+    }
+}
+```
+
+Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `nuts_active_connections` | Gauge | Currently connected SSE clients |
+| `nuts_messages_delivered_total` | Counter | SSE message events successfully written |
+| `nuts_messages_dropped_total` | Counter | Messages dropped (exceeded `max_event_size`) |
+| `nuts_slow_client_disconnects_total` | Counter | Clients disconnected due to slow consumption |
+| `nuts_replay_requests_total` | Counter | Connections requesting message replay |
+| `nuts_replay_fallbacks_total` | Counter | Replay requests that fell back to `DeliverAll` |
+| `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
+
+### Hub Discovery
+
+When `hub_url` is configured, every SSE response includes a `Link` header:
+
+```
+Link: <https://example.com/events>; rel="nuts"
+```
+
+This lets upstream APIs advertise the event hub URL so clients can self-configure their `EventSource` connections. A client can discover the hub by inspecting the header:
+
+```javascript
+const resp = await fetch('/api/resource');
+const link = resp.headers.get('Link');
+// Parse link header to extract the hub URL, then:
+const events = new EventSource(hubUrl + '?topic=updates');
+```
+
+To enable hub discovery, add the `hub_url` directive:
+
+```caddyfile
+nuts {
+    nats_url nats://localhost:4222
+    stream_name EVENTS
+    hub_url https://example.com/events
+}
 ```
 
 ## JetStream Setup
@@ -446,6 +531,9 @@ nats stream add METRICS --subjects "metrics.>" --storage memory --max-age 1h
 | Message Replay | Yes (`last-id` param and `Last-Event-ID` header) | Yes (`Last-Event-ID` header) |
 | Authorization | NATS auth | JWT |
 | Clustering | NATS clustering | Mercure clustering |
+| Prometheus Metrics | Yes (`nuts_*`) | Yes (`/metrics`) |
+| Health Check | Yes (`/healthz`) | Yes (`/healthz`) |
+| Hub Discovery | Yes (`Link` header) | Yes (`Link` header) |
 
 ## Development
 
@@ -528,16 +616,20 @@ go fmt ./...
 
 ### Docker Compose
 
-The project includes a `docker-compose.yml` for running the full stack (NATS + nuts server):
+The root `docker-compose.yml` spins up the test environment (NATS + NUTS built from source). The `example/` and `example_docker/` directories each have their own `docker-compose.yml` for the interactive demo:
 
 ```bash
-# Start all services
+# Test environment
 docker compose up -d --build
 
-# View logs
-docker compose logs -f
+# Interactive demo (built from source)
+cd example && ./start.sh
 
-# Stop and clean up
+# Interactive demo (pre-built Docker image)
+cd example_docker && ./start.sh
+
+# View logs / stop
+docker compose logs -f
 docker compose down -v
 ```
 
@@ -553,6 +645,10 @@ make docker-down     # Stop Docker services
 make clean           # Clean build artifacts
 make help            # Show all available commands
 ```
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for the planned feature phases, including JWT authorization, subscription lifecycle events, an HTTP publish endpoint, and more.
 
 ## License
 

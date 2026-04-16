@@ -6,6 +6,7 @@
 package nuts
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -29,6 +30,13 @@ import (
 //	6. Streaming select loop — multiplex messages, heartbeats, slow-client
 //	   detection, and client disconnect.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	// Phase 0: Health check.
+	// Respond to GET requests ending in /healthz with a JSON status that
+	// verifies NATS connectivity and stream availability.
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/healthz") {
+		return h.serveHealthCheck(w)
+	}
+
 	// Phase 1: CORS preflight.
 	// Browsers issue OPTIONS preflight requests before cross-origin EventSource connections.
 	if r.Method == http.MethodOptions {
@@ -92,6 +100,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 		lastID = parsedID
 		hasLastID = true
+		metricsReplayRequests.Inc()
 	}
 
 	// Phase 5: JetStream subscription setup.
@@ -204,6 +213,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			errMsg := err.Error()
 			if hasLastID && (strings.Contains(errMsg, "start sequence") ||
 				strings.Contains(errMsg, "sequence not found")) {
+				metricsReplayFallbacks.Inc()
 				h.logger.Warn("requested sequence not available, falling back to all messages",
 					zap.String("topic", fullTopic),
 					zap.Uint64("requested_sequence", lastID+1),
@@ -216,6 +226,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				sub, err = js.Subscribe(fullTopic, enqueueMessage, fallbackOpts...)
 			}
 			if err != nil {
+				metricsSubscriptionErrors.Inc()
 				h.logger.Error("failed to subscribe to topic",
 					zap.String("topic", fullTopic),
 					zap.Error(err),
@@ -246,11 +257,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// --- Phase 6: Streaming mode ---
 	// All setup succeeded. Switch to SSE by writing the proper headers.
 	// From this point on we can only communicate via the SSE wire format.
+	metricsActiveConnections.Inc()
+	defer metricsActiveConnections.Dec()
+
 	h.setCORSHeaders(w, r)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // Tell nginx/similar not to buffer
+	if h.HubURL != "" {
+		w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"nuts\"", h.HubURL))
+	}
 
 	// Send an initial "connected" event so the client knows which topics
 	// were successfully subscribed and can render a ready state.
@@ -274,6 +291,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	for {
 		select {
 		case slowTopic := <-slowClient:
+			metricsSlowClientDisconnects.Inc()
 			h.logger.Warn("disconnecting slow SSE client before dropping messages",
 				zap.String("topic", slowTopic),
 				zap.Int("buffer_size", cap(msgChan)),
@@ -331,6 +349,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			// producer could publish huge messages; dropping them here
 			// protects browser clients from excessive memory usage.
 			if h.MaxEventSize > 0 && event.Len() > h.MaxEventSize {
+				metricsMessagesDropped.Inc()
 				h.logger.Warn("dropping oversized SSE event",
 					zap.String("topic", msg.Subject),
 					zap.Int("event_size", event.Len()),
@@ -343,6 +362,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				h.logger.Debug("failed to write message event", zap.String("topic", msg.Subject), zap.Error(err))
 				return nil
 			}
+			metricsMessagesDelivered.Inc()
 
 		case <-heartbeat.C:
 			// SSE comments (lines starting with ":") are ignored by the
@@ -376,4 +396,53 @@ func (h *Handler) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+}
+
+// serveHealthCheck responds with a JSON health status that verifies NATS
+// connectivity and stream availability. Returns 200 when healthy, 503 when
+// any check fails.
+func (h *Handler) serveHealthCheck(w http.ResponseWriter) error {
+	type healthResponse struct {
+		Status string `json:"status"`
+		NATS   string `json:"nats"`
+		Stream string `json:"stream"`
+	}
+
+	resp := healthResponse{
+		Status: "ok",
+		NATS:   "connected",
+		Stream: "available",
+	}
+	statusCode := http.StatusOK
+
+	h.mu.RLock()
+	conn := h.conn
+	js := h.js
+	h.mu.RUnlock()
+
+	// Check NATS connection.
+	if conn == nil || !conn.IsConnected() {
+		resp.Status = "degraded"
+		resp.NATS = "disconnected"
+		statusCode = http.StatusServiceUnavailable
+	}
+
+	// Check stream availability.
+	if js == nil {
+		resp.Status = "degraded"
+		resp.Stream = "unavailable"
+		statusCode = http.StatusServiceUnavailable
+	} else {
+		_, err := js.StreamInfo(h.StreamName)
+		if err != nil {
+			resp.Status = "degraded"
+			resp.Stream = "unavailable"
+			statusCode = http.StatusServiceUnavailable
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(resp)
+	return nil
 }

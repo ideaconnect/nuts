@@ -142,7 +142,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid max_event_size: %v", err)
 				}
 				h.MaxEventSize = size
-
+			case "hub_url": // URL for Link header hub discovery
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.HubURL = d.Val()
 			default:
 				return d.Errf("unrecognized option: %s", d.Val())
 			}

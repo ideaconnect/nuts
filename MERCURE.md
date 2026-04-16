@@ -72,11 +72,11 @@ Use this as a development roadmap — features marked **Planned** are candidates
 
 | Feature | Mercure | NUTS | Notes |
 |---------|---------|------|-------|
-| Hub auto-discovery (`Link` header) | ✅ `rel="mercure"` | ❌ | Clients discover the Mercure hub URL from API responses |
+| Hub auto-discovery (`Link` header) | ✅ `rel="mercure"` | ✅ `hub_url` | NUTS injects a `Link: <url>; rel="nuts"` header when `hub_url` is configured |
 | Active subscriptions API | ✅ `subscriptions` directive | ❌ | Mercure exposes subscription lifecycle events and a REST API |
 | Subscription events | ✅ | ❌ | Mercure publishes events when subscriptions are created/closed |
-| Prometheus metrics | ✅ `/metrics` | ❌ | Mercure exports OpenMetrics for monitoring |
-| Health check endpoint | ✅ `/healthz` | ❌ | NUTS relies on Caddy's own health mechanisms |
+| Prometheus metrics | ✅ `/metrics` | ✅ `nuts_*` | NUTS registers `nuts_*` counters and gauges via promauto; visible on Caddy's metrics endpoint |
+| Health check endpoint | ✅ `/healthz` | ✅ `*/healthz` | NUTS responds on any path ending in `/healthz` with NATS + stream status |
 | Web UI / demo mode | ✅ `demo` / `ui` | ❌ | Mercure includes a built-in testing UI |
 
 ## Encryption & Security
@@ -108,10 +108,9 @@ Features we should consider adding, ordered roughly by impact:
 |----------|---------|-----------|
 | High | **Subscriber JWT auth + private topics** | Most requested gap — needed to secure per-topic access without relying solely on NATS ACLs |
 | High | **HTTP POST publish endpoint** | Lets any HTTP client publish without a NATS client library; matches Mercure's simplicity |
-| Medium | **Hub discovery (`Link` header)** | Small addition — inject a `Link: <url>; rel="mercure"` header from upstream APIs |
-| Medium | **Prometheus metrics** | `/metrics` endpoint for connection count, messages delivered, slow-client disconnects |
-| Medium | **Health check endpoint** | Expose `/healthz` that verifies NATS connectivity |
 | Medium | **Active subscriptions API** | REST endpoint listing current subscribers and their topics |
+| Medium | **Subscription lifecycle events** | Publish internal NATS events when clients subscribe/unsubscribe |
+| Medium | **Cookie-based auth** | Browser EventSource can't set custom headers; cookie auth is the workaround |
 | Low | **End-to-end encryption** | Encrypt payloads so the hub cannot read them; useful for sensitive data |
 | Low | **Web UI / demo mode** | Built-in testing page for development convenience |
 | Low | **Write / dispatch timeout** | Cap maximum connection and per-message delivery durations |
