@@ -1,9 +1,45 @@
+# VCS / CI
 .git
 .github
 .gitignore
+.golangci.yml
+
+# Project meta / docs
 README.md
 LICENSE
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+ROADMAP.md
+MERCURE.md
+STRUCTURE.md
+*.md
+media/
+
+# Build tooling
 Makefile
+scripts/
+
+# Tests (not needed in runtime image; build stage pulls what it needs)
 features/
 functional_test/
-scripts/
+*_test.go
+nats_test.go
+
+# Examples
+example/
+example_docker/
+
+# Coverage / local artifacts
+coverage.*
+*.out
+*.coverprofile
+profile.cov
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Compose / dev extras
+docker-compose.yml

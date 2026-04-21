@@ -200,11 +200,39 @@ nuts {
     # Optional settings
     topic_prefix <prefix>        # Prefix for all subscriptions
     allowed_origins <origins...> # CORS origins (default: *)
+    allowed_headers <headers...> # CORS request headers (default: Cache-Control Last-Event-ID)
+    allowed_methods <methods...> # CORS methods (default: GET OPTIONS)
     heartbeat_interval <seconds> # Heartbeat interval (default: 30)
     reconnect_wait <seconds>     # Reconnect wait time (default: 2)
-    max_reconnects <count>       # Max reconnects, -1=infinite (default: -1)
-    max_event_size <bytes>       # Max SSE event size in bytes (default: 1048576)
+    max_reconnects <count>       # Max reconnects, 0=none, -1=infinite (default: -1)
+    max_event_size <bytes>       # Max SSE event size (0=default 1 MiB, <0=unlimited)
+    max_connections <count>      # Global concurrent-stream cap (default: 0 = unlimited)
+    client_buffer_size <count>   # Per-connection send buffer (default: 64)
+    health_path <path>           # Health-check endpoint (default: /healthz)
     hub_url <url>                # URL for Link header hub discovery (disabled by default)
+
+    # Optional NATS TLS
+    nats_tls_ca <path>                  # CA bundle for verifying the server
+    nats_tls_cert <path>                # Client certificate (mTLS)
+    nats_tls_key <path>                 # Client key (mTLS)
+    nats_tls_insecure_skip_verify       # Disable server verification (DEV ONLY)
+}
+```
+
+#### Path-shorthand and `route`
+
+NUTS derives the NATS subject from `?topic=` (repeatable) **or** from the
+request path when the query is absent. Forward slashes in the path are
+translated to `.` so `/orders/new` becomes the NATS subject `orders.new`
+(plus any `topic_prefix`).
+
+If you mount NUTS behind a route matcher, strip the matcher's prefix before
+the handler sees the request:
+
+```caddyfile
+route /events* {
+    uri strip_prefix /events
+    nuts { ... }
 }
 ```
 
@@ -212,7 +240,14 @@ nuts {
 
 Limits the total size (in bytes) of a single SSE event frame — including the `id:`, `event:`, and `data:` lines plus the JSON-encoded payload. Any event that exceeds the limit is silently dropped and a warning is logged. The client never sees it.
 
-For example, setting `max_event_size 1000` means that if a NATS message produces an SSE frame larger than 1000 bytes once formatted, that frame is discarded. A typical overhead (id, event type, topic, timestamp) is roughly 120-150 bytes, so a 1000-byte limit leaves ~850 bytes for the raw message payload. Set to `0` to disable the limit entirely.
+For example, setting `max_event_size 1000` means that if a NATS message produces an SSE frame larger than 1000 bytes once formatted, that frame is discarded. A typical overhead (id, event type, topic, timestamp) is roughly 120-150 bytes, so a 1000-byte limit leaves ~850 bytes for the raw message payload. Set `max_event_size 0` to fall back to the 1 MiB default, or a negative value to disable the limit entirely.
+
+#### `max_connections`
+
+Caps the number of concurrent SSE streams per NUTS instance. When the cap
+is reached, new clients receive `503 Service Unavailable` with
+`Retry-After: 5` and the `nuts_connections_rejected_total{reason="max_connections"}`
+counter is incremented. Default `0` disables the cap.
 ```
 
 ### JSON Configuration

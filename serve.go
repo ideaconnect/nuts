@@ -1,8 +1,4 @@
 // serve.go — HTTP/SSE request handling.
-//
-// This file contains the core of NUTS: the ServeHTTP method that turns
-// an incoming HTTP GET into a long-lived SSE stream backed by NATS
-// JetStream subscriptions, plus a CORS helper.
 package nuts
 
 import (
@@ -11,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -19,26 +16,13 @@ import (
 )
 
 // ServeHTTP implements the caddyhttp.MiddlewareHandler interface.
-//
-// High-level flow (each phase is annotated inline below):
-//
-//	1. OPTIONS — handle CORS preflight and return immediately.
-//	2. Method check — only GET is allowed for SSE; other methods fall through.
-//	3. Topic extraction — from ?topic= query params or the URL path.
-//	4. Last-ID / replay — parse the client’s cursor for message replay.
-//	5. JetStream subscription — subscribe to each topic; fall back on purge.
-//	6. Streaming select loop — multiplex messages, heartbeats, slow-client
-//	   detection, and client disconnect.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// Phase 0: Health check.
-	// Respond to GET requests ending in /healthz with a JSON status that
-	// verifies NATS connectivity and stream availability.
-	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/healthz") {
+	if r.Method == http.MethodGet && h.matchesHealthPath(r.URL.Path) {
 		return h.serveHealthCheck(w)
 	}
 
 	// Phase 1: CORS preflight.
-	// Browsers issue OPTIONS preflight requests before cross-origin EventSource connections.
 	if r.Method == http.MethodOptions {
 		h.setCORSHeaders(w, r)
 		w.WriteHeader(http.StatusNoContent)
@@ -46,10 +30,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	// Phase 2: Method check.
-	// SSE is GET-only; everything else either falls through or returns a normal HTTP error.
 	if r.Method != http.MethodGet {
 		if next == nil {
-			w.Header().Set("Allow", "GET, OPTIONS")
+			allow := "GET, OPTIONS"
+			if len(h.AllowedMethods) > 0 {
+				allow = strings.Join(h.AllowedMethods, ", ")
+			}
+			w.Header().Set("Allow", allow)
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return nil
 		}
@@ -57,18 +44,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	// Phase 3: Topic extraction.
-	// Query parameters support multiple topics (?topic=a&topic=b);
-	// the path form is a shorthand for a single topic (/events/my-topic).
 	topics := r.URL.Query()["topic"]
 	if len(topics) == 0 {
-		// Fall back to the URL path as a single topic name.
-		path := strings.TrimPrefix(r.URL.Path, "/")
+		// Path shorthand: convert remaining path into a dotted topic.
+		// "/orders/new" → "orders.new". Operators behind a `route /events*`
+		// matcher should put `uri strip_prefix /events` before `nuts` so the
+		// matched prefix is removed from r.URL.Path.
+		path := strings.Trim(r.URL.Path, "/")
 		if path != "" {
-			topics = []string{path}
+			topics = []string{strings.ReplaceAll(path, "/", ".")}
 		}
 	}
 
-	// Reject topics that contain control characters or empty segments.
+	// Reject topics that contain illegal characters.
 	for _, t := range topics {
 		if !isValidTopic(t) {
 			http.Error(w, "Invalid topic name", http.StatusBadRequest)
@@ -83,37 +71,41 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	// Phase 4: Last-ID / replay.
 	// Parse the client's cursor before writing any response bytes so that
-	// invalid values produce a clean 400 Bad Request instead of a broken stream.
+	// invalid values produce a clean 400 (for explicit ?last-id=) or a
+	// fall-through to DeliverNew (for the auto-set Last-Event-ID header).
 	lastIDStr := r.URL.Query().Get("last-id")
-	lastIDSource := "last-id"
+	queryProvided := lastIDStr != ""
 	if lastIDStr == "" {
 		lastIDStr = r.Header.Get("Last-Event-ID")
-		lastIDSource = "Last-Event-ID"
 	}
 	var lastID uint64
 	var hasLastID bool
 	if lastIDStr != "" {
 		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Invalid %s value: must be a positive integer", lastIDSource), http.StatusBadRequest)
-			return nil
+			if queryProvided {
+				http.Error(w, "Invalid last-id value: must be a positive integer", http.StatusBadRequest)
+				return nil
+			}
+			// Browser-supplied Last-Event-ID is unparseable. Fall back to
+			// DeliverNew so the client does not loop forever on a bad value.
+			h.logger.Warn("ignoring unparseable Last-Event-ID header; resuming with DeliverNew",
+				zap.String("value", lastIDStr),
+				zap.Error(err))
+		} else {
+			lastID = parsedID
+			hasLastID = true
+			metricsReplayRequests.Inc()
 		}
-		lastID = parsedID
-		hasLastID = true
-		metricsReplayRequests.Inc()
 	}
 
 	// Phase 5: JetStream subscription setup.
-	// Before switching to streaming mode we need two things:
-	// a) a Flusher — required to push partial writes to the client;
-	// b) active NATS subscriptions — so setup errors produce normal HTTP errors.
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return nil
 	}
 
-	// Grab the JetStream context under read-lock; Provision/Cleanup write to it.
 	h.mu.RLock()
 	js := h.js
 	h.mu.RUnlock()
@@ -123,33 +115,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
-	// --- Channel and callback setup ---
-	//
-	// msgChan:     buffered channel delivering NATS messages to the select loop.
-	// done:        closed during cleanup to tell callbacks to stop enqueuing.
-	// slowClient:  signals when msgChan is full and a message would be dropped;
-	//              the select loop disconnects the client to prevent silent loss.
-	msgChan := make(chan *nats.Msg, 64)
+	// Connection cap. Reserve the slot before opening subscriptions so we
+	// don't churn JetStream consumers for rejected requests.
+	if h.MaxConnections > 0 {
+		if !h.reserveConnSlot() {
+			metricsConnectionsRejected.WithLabelValues("max_connections").Inc()
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "Too many concurrent connections", http.StatusServiceUnavailable)
+			return nil
+		}
+		defer h.releaseConnSlot()
+	}
+
+	bufSize := h.ClientBufferSize
+	if bufSize <= 0 {
+		bufSize = defaultClientBufferSize
+	}
+	msgChan := make(chan *nats.Msg, bufSize)
 	done := make(chan struct{})
 	slowClient := make(chan string, 1)
 
-	// enqueueMessage is the callback passed to js.Subscribe(). NATS calls it
-	// on a separate goroutine for every incoming message. It tries to push the
-	// message into msgChan; if the buffer is full the client is "slow" and we
-	// signal disconnection instead of silently dropping events.
 	enqueueMessage := func(msg *nats.Msg) {
 		select {
 		case <-done:
-			// Subscription is being torn down — discard the message.
 			return
 		case msgChan <- msg:
-			// Successfully queued.
 		default:
-			// Buffer full — notify the select loop to disconnect this client.
 			select {
 			case slowClient <- msg.Subject:
 			default:
-				// Signal already pending; no need to send again.
 			}
 		}
 	}
@@ -158,11 +152,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	var subscribedTopics []string
 	var failedTopics []string
 	cleanupSubscriptions := func() {
-		// Close done FIRST so that any callback currently running in
-		// enqueueMessage sees the signal and returns instead of writing
-		// to a channel that nobody will read from. Then Unsubscribe each
-		// subscription. Buffered messages in msgChan become garbage-collected
-		// when the channel goes out of scope.
 		close(done)
 		for _, sub := range subscriptions {
 			if err := sub.Unsubscribe(); err != nil {
@@ -173,22 +162,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// Subscribe to each requested topic via JetStream.
 	for _, topic := range topics {
 		fullTopic := h.TopicPrefix + topic
 
-		// Build options for an *ephemeral* consumer (no durable name).
-		// BindStream ties the subscription to our pre-existing stream.
-		// AckNone means we never acknowledge messages — we are read-only
-		// viewers, not a processing queue.
 		opts := []nats.SubOpt{
 			nats.BindStream(h.StreamName),
 			nats.AckNone(),
 		}
-
-		// Decide where in the stream to start reading:
-		// • If the client sent a last-id, resume from the NEXT sequence.
-		// • Otherwise, only deliver messages published from now on.
 		if hasLastID {
 			opts = append(opts, nats.StartSequence(lastID+1))
 			h.logger.Debug("subscribing from sequence",
@@ -202,14 +182,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		sub, err := js.Subscribe(fullTopic, enqueueMessage, opts...)
 
 		if err != nil {
-			// The requested sequence may have been purged from the stream
-			// (e.g., by a retention policy or manual purge). In that case,
-			// fall back to replaying ALL retained messages so the client
-			// does not miss anything that is still available.
-			//
-			// We use substring matching on the error message because NATS
-			// does not expose a typed error for this, and the wording may
-			// change between server versions.
 			errMsg := err.Error()
 			if hasLastID && (strings.Contains(errMsg, "start sequence") ||
 				strings.Contains(errMsg, "sequence not found")) {
@@ -255,8 +227,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	defer cleanupSubscriptions()
 
 	// --- Phase 6: Streaming mode ---
-	// All setup succeeded. Switch to SSE by writing the proper headers.
-	// From this point on we can only communicate via the SSE wire format.
 	metricsActiveConnections.Inc()
 	defer metricsActiveConnections.Dec()
 
@@ -264,29 +234,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // Tell nginx/similar not to buffer
+	w.Header().Set("X-Accel-Buffering", "no")
 	if h.HubURL != "" {
 		w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"nuts\"", h.HubURL))
 	}
 
-	// Send an initial "connected" event so the client knows which topics
-	// were successfully subscribed and can render a ready state.
 	if err := writeSSEChunk(w, flusher, fmt.Sprintf("event: connected\ndata: {\"topics\":%s}\n\n", toJSON(subscribedTopics))); err != nil {
 		h.logger.Debug("failed to write connected event", zap.Error(err))
 		return nil
 	}
 
-	// Heartbeat ticker — fires periodically to send a keep-alive comment.
-	// Without this, reverse proxies or load balancers may close the
-	// connection after their idle timeout.
 	heartbeat := time.NewTicker(time.Duration(h.HeartbeatInterval) * time.Second)
 	defer heartbeat.Stop()
 
-	// Main select loop — multiplexes four event sources:
-	//   slowClient:  msgChan overflowed — disconnect before dropping messages.
-	//   ctx.Done():  the browser closed the connection.
-	//   msgChan:     a new NATS message is ready to forward as an SSE event.
-	//   heartbeat.C: time to send a keep-alive comment.
 	ctx := r.Context()
 	for {
 		select {
@@ -306,35 +266,40 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			if msg == nil {
 				continue
 			}
-			// Strip the TopicPrefix so the client sees the short topic name.
+
+			// Cheap pre-check: drop oversized messages BEFORE parsing JSON
+			// so a hostile producer cannot force unbounded allocations.
+			// MaxEventSize < 0 means "unlimited".
+			if h.MaxEventSize > 0 && len(msg.Data) > h.MaxEventSize {
+				metricsMessagesDropped.Inc()
+				h.logger.Warn("dropping oversized NATS payload",
+					zap.String("topic", msg.Subject),
+					zap.Int("payload_size", len(msg.Data)),
+					zap.Int("max_event_size", h.MaxEventSize),
+				)
+				continue
+			}
+
 			eventTopic := strings.TrimPrefix(msg.Subject, h.TopicPrefix)
-			eventTime := time.Now().UTC().Format(time.RFC3339)
 			payload := messageEventPayload{
 				Topic:   eventTopic,
 				Payload: tryParseJSON(msg.Data),
-				Time:    eventTime,
+				Time:    time.Now().UTC().Format(time.RFC3339),
 			}
 			var eventID uint64
 			hasEventID := false
 
-			// When available, JetStream metadata gives us two things:
-			// 1) The stream sequence number — used as the SSE event ID for replay.
-			// 2) The original publish timestamp — more accurate than time.Now().
 			meta, metaErr := msg.Metadata()
 			if metaErr != nil {
 				h.logger.Warn("failed to read JetStream metadata", zap.String("topic", msg.Subject), zap.Error(metaErr))
 			} else {
-				eventTime = meta.Timestamp.UTC().Format(time.RFC3339)
-				payload.Time = eventTime
+				payload.Time = meta.Timestamp.UTC().Format(time.RFC3339)
 				eventID = meta.Sequence.Stream
 				hasEventID = true
 			}
 
-			// Build the SSE frame. The format is:
-			//   id: <sequence>\n      (optional, enables replay)
-			//   event: message\n
-			//   data: <json>\n\n
 			var event strings.Builder
+			event.Grow(len(msg.Data) + 128)
 			if hasEventID {
 				event.WriteString("id: ")
 				event.WriteString(strconv.FormatUint(eventID, 10))
@@ -345,9 +310,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			event.WriteString(toJSON(payload))
 			event.WriteString("\n\n")
 
-			// Guard against oversized events. A malicious or misconfigured
-			// producer could publish huge messages; dropping them here
-			// protects browser clients from excessive memory usage.
+			// Final guard against oversized formatted events (JSON inflation).
 			if h.MaxEventSize > 0 && event.Len() > h.MaxEventSize {
 				metricsMessagesDropped.Inc()
 				h.logger.Warn("dropping oversized SSE event",
@@ -365,8 +328,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			metricsMessagesDelivered.Inc()
 
 		case <-heartbeat.C:
-			// SSE comments (lines starting with ":") are ignored by the
-			// browser's EventSource API but keep the TCP connection alive.
 			if err := writeSSEChunk(w, flusher, fmt.Sprintf(": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339))); err != nil {
 				h.logger.Debug("failed to write heartbeat", zap.Error(err))
 				return nil
@@ -375,32 +336,66 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 }
 
+// matchesHealthPath returns true when the request path equals HealthPath or
+// ends with HealthPath as a full path segment.
+func (h *Handler) matchesHealthPath(reqPath string) bool {
+	hp := h.HealthPath
+	if hp == "" {
+		hp = defaultHealthPath
+	}
+	if !strings.HasPrefix(hp, "/") {
+		hp = "/" + hp
+	}
+	if reqPath == hp {
+		return true
+	}
+	return strings.HasSuffix(reqPath, hp)
+}
+
+// reserveConnSlot atomically tries to reserve a connection slot.
+func (h *Handler) reserveConnSlot() bool {
+	for {
+		cur := atomic.LoadInt64(&h.connCount)
+		if int(cur) >= h.MaxConnections {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(&h.connCount, cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func (h *Handler) releaseConnSlot() {
+	atomic.AddInt64(&h.connCount, -1)
+}
+
 // setCORSHeaders sets CORS response headers when the request includes an
-// Origin header. Instead of blindly sending "Access-Control-Allow-Origin: *",
-// we echo back the specific origin that matched our AllowedOrigins list.
-// This is required because browsers reject wildcard origins on requests
-// that carry credentials (cookies, authorization headers, etc.).
+// Origin header.
 func (h *Handler) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		return // Same-origin request; CORS headers not needed.
+		return
 	}
-
-	// Walk the allow-list and echo the first match.
+	methods := "GET, OPTIONS"
+	if len(h.AllowedMethods) > 0 {
+		methods = strings.Join(h.AllowedMethods, ", ")
+	}
+	headers := "Cache-Control, Last-Event-ID"
+	if len(h.AllowedHeaders) > 0 {
+		headers = strings.Join(h.AllowedHeaders, ", ")
+	}
 	for _, allowed := range h.AllowedOrigins {
 		if allowed == "*" || allowed == origin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Cache-Control, Last-Event-ID")
+			w.Header().Set("Access-Control-Allow-Methods", methods)
+			w.Header().Set("Access-Control-Allow-Headers", headers)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			break
 		}
 	}
 }
 
-// serveHealthCheck responds with a JSON health status that verifies NATS
-// connectivity and stream availability. Returns 200 when healthy, 503 when
-// any check fails.
+// serveHealthCheck responds with a JSON health status.
 func (h *Handler) serveHealthCheck(w http.ResponseWriter) error {
 	type healthResponse struct {
 		Status string `json:"status"`
@@ -420,14 +415,12 @@ func (h *Handler) serveHealthCheck(w http.ResponseWriter) error {
 	js := h.js
 	h.mu.RUnlock()
 
-	// Check NATS connection.
 	if conn == nil || !conn.IsConnected() {
 		resp.Status = "degraded"
 		resp.NATS = "disconnected"
 		statusCode = http.StatusServiceUnavailable
 	}
 
-	// Check stream availability.
 	if js == nil {
 		resp.Status = "degraded"
 		resp.Stream = "unavailable"
@@ -443,6 +436,8 @@ func (h *Handler) serveHealthCheck(w http.ResponseWriter) error {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		h.logger.Debug("failed to encode health response", zap.Error(err))
+	}
 	return nil
 }

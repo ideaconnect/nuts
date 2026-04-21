@@ -9,9 +9,13 @@ See [MERCURE.md](MERCURE.md) for a detailed feature-by-feature comparison with M
 
 No breaking changes, immediately useful for production deployments.
 
-- [x] **Prometheus metrics** — `nuts_*` counters and gauges registered via `promauto`, visible on Caddy's `/metrics` endpoint. Tracks active connections, messages delivered/dropped, slow-client disconnects, replay requests/fallbacks, and subscription errors.
-- [x] **Health check endpoint** — Any path ending in `/healthz` within the configured route returns JSON with NATS connectivity and stream availability status (`200` healthy, `503` degraded).
+- [x] **Prometheus metrics** — `nuts_*` counters and gauges registered via `promauto`, visible on Caddy's `/metrics` endpoint. Tracks active connections, messages delivered/dropped, slow-client disconnects, replay requests/fallbacks, subscription errors, and connections rejected by `max_connections`.
+- [x] **Health check endpoint** — The `health_path` directive (default `/healthz`) returns JSON with NATS connectivity and stream availability status (`200` healthy, `503` degraded).
 - [x] **Hub discovery (`Link` header)** — Optional `hub_url` directive injects a `Link: <url>; rel="nuts"` header on SSE responses for automatic hub detection by clients.
+- [x] **NATS TLS** — `nats_tls_ca`, `nats_tls_cert`, `nats_tls_key`, `nats_tls_insecure_skip_verify` Caddyfile directives for encrypted and mutually authenticated NATS connections.
+- [x] **Connection caps** — `max_connections` global cap returns `503` with `Retry-After` and increments `nuts_connections_rejected_total{reason}`.
+- [x] **Configurable CORS** — `allowed_headers` and `allowed_methods` directives so front-ends can send custom headers (e.g. `Authorization` for Phase 2).
+- [x] **Non-root container** — the published `idcttech/nuts` image runs as uid 10001.
 
 ## Phase 2: Authorization & Access Control
 

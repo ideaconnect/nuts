@@ -65,4 +65,12 @@ var (
 		Name:      "subscription_errors_total",
 		Help:      "Total number of failed JetStream subscription attempts.",
 	})
+
+	// nuts_connections_rejected_total counts SSE connections rejected before
+	// streaming started, labelled by reason (e.g. "max_connections").
+	metricsConnectionsRejected = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "connections_rejected_total",
+		Help:      "Total number of SSE connections rejected before streaming started.",
+	}, []string{"reason"})
 )

@@ -4,6 +4,49 @@
 }
 
 :8080 {
+	# Strip the /events prefix so nuts sees only the topic portion
+	# of the path. Path-shorthand (e.g. /events/orders.new) and
+	# ?topic= both work.
+	route /events* {
+		uri strip_prefix /events
+		nuts {
+			nats_url {$NATS_URL:nats://localhost:4222}
+			stream_name {$STREAM_NAME:EVENTS}
+			topic_prefix {$TOPIC_PREFIX:events.}
+			heartbeat_interval 30
+			allowed_origins *
+		}
+	}
+
+	respond /health 200
+}
+{
+	admin off
+	order nuts before respond
+}
+
+:8080 {
+	# Strip the /events prefix so nuts sees only the topic portion
+	# of the path. Path-shorthand and ?topic= both work.
+	route /events* {
+		uri strip_prefix /events
+		nuts {
+			nats_url {$NATS_URL:nats://localhost:4222}
+			stream_name {$STREAM_NAME:EVENTS}
+			topic_prefix {$TOPIC_PREFIX:events.}
+			heartbeat_interval 30
+			allowed_origins *
+		}
+	}
+
+	respond /health 200
+}
+{
+	admin off
+	order nuts before respond
+}
+
+:8080 {
 	route /events* {
 		nuts {
 			nats_url {$NATS_URL:nats://localhost:4222}

@@ -97,12 +97,15 @@ type Handler struct {
 	// Default: 2.
 	ReconnectWait int `json:"reconnect_wait,omitempty"`
 
-	// MaxReconnects limits total NATS reconnection attempts. -1 means unlimited.
-	// Default: -1.
+	// MaxReconnects limits total NATS reconnection attempts.
+	// 0 means "no reconnects", -1 means "unlimited".
+	// When the directive is omitted from the Caddyfile the parser sets this
+	// to -1 so the default behaviour stays "retry forever".
 	MaxReconnects int `json:"max_reconnects,omitempty"`
 
 	// MaxEventSize caps the size (in bytes) of a single formatted SSE event.
-	// Events exceeding this are dropped with a warning log. 0 disables the limit.
+	// Events exceeding this are dropped with a warning log.
+	// A negative value disables the limit. 0 (or unset) uses the default.
 	// Default: 1048576 (1 MB).
 	MaxEventSize int `json:"max_event_size,omitempty"`
 
@@ -111,6 +114,47 @@ type Handler struct {
 	// so that clients and upstream APIs can discover the event hub automatically.
 	// Leave empty to disable hub discovery (default).
 	HubURL string `json:"hub_url,omitempty"`
+
+	// HealthPath is the URL path (relative to the matched route) that
+	// returns NATS / stream health as JSON. Empty disables the endpoint.
+	// Default: "/healthz".
+	HealthPath string `json:"health_path,omitempty"`
+
+	// AllowedHeaders lists HTTP headers permitted by CORS preflight responses.
+	// Default: ["Cache-Control", "Last-Event-ID"].
+	AllowedHeaders []string `json:"allowed_headers,omitempty"`
+
+	// AllowedMethods lists HTTP methods permitted by CORS preflight responses.
+	// Default: ["GET", "OPTIONS"].
+	AllowedMethods []string `json:"allowed_methods,omitempty"`
+
+	// MaxConnections caps the total number of concurrent SSE connections served
+	// by this handler instance. 0 (default) disables the cap. Connections that
+	// would exceed the cap receive HTTP 503 with a Retry-After header.
+	MaxConnections int `json:"max_connections,omitempty"`
+
+	// ClientBufferSize is the size of the per-connection NATS message buffer.
+	// When the buffer fills, the slow client is disconnected to avoid drops.
+	// Default: 64.
+	ClientBufferSize int `json:"client_buffer_size,omitempty"`
+
+	// ── NATS TLS ─────────────────────────────────────────────────
+
+	// NatsTLSCA is a path to a PEM-encoded CA bundle used to verify the
+	// NATS server certificate.
+	NatsTLSCA string `json:"nats_tls_ca,omitempty"`
+
+	// NatsTLSCert is a path to a PEM-encoded client certificate for mTLS.
+	// Must be paired with NatsTLSKey.
+	NatsTLSCert string `json:"nats_tls_cert,omitempty"`
+
+	// NatsTLSKey is a path to the PEM-encoded private key for the client
+	// certificate. Must be paired with NatsTLSCert.
+	NatsTLSKey string `json:"nats_tls_key,omitempty"`
+
+	// NatsTLSInsecureSkipVerify disables NATS server certificate verification.
+	// Use only for development against self-signed certs.
+	NatsTLSInsecureSkipVerify bool `json:"nats_tls_insecure_skip_verify,omitempty"`
 
 	// ── Runtime state (not user-configurable) ────────────────────
 
@@ -128,6 +172,15 @@ type Handler struct {
 	// mu protects conn and js. Request goroutines read-lock (RLock);
 	// Provision and Cleanup write-lock (Lock).
 	mu sync.RWMutex
+
+	// connCount is the live SSE connection counter used to enforce
+	// MaxConnections. Updated atomically.
+	connCount int64
+
+	// maxReconnectsSet is true when the Caddyfile contained an explicit
+	// max_reconnects directive. Provision() uses this to distinguish
+	// "user wrote 0" (no reconnects) from "directive omitted" (unlimited).
+	maxReconnectsSet bool
 }
 
 // messageEventPayload is the JSON structure sent inside the "data:" field of

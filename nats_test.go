@@ -916,20 +916,34 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid Last-Event-ID header", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil)
+	t.Run("invalid Last-Event-ID header falls back to DeliverNew", func(t *testing.T) {
+		// A bad Last-Event-ID header must NOT 400 — the browser would loop
+		// forever reconnecting with the same bad value. The handler should
+		// log a warning and resume as a fresh subscriber.
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil).WithContext(ctx)
 		req.Header.Set("Last-Event-ID", "invalid")
 		rr := httptest.NewRecorder()
 
-		if err := h.ServeHTTP(rr, req, nil); err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		done := make(chan error, 1)
+		go func() {
+			done <- h.ServeHTTP(rr, req, nil)
+		}()
+
+		// Give ServeHTTP time to write the connected event, then close.
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("ServeHTTP did not return after context cancel")
 		}
 
-		if rr.Code != http.StatusBadRequest {
-			t.Errorf("expected status %d, got %d", http.StatusBadRequest, rr.Code)
+		if rr.Code == http.StatusBadRequest {
+			t.Errorf("expected streaming fallback, got 400: %s", rr.Body.String())
 		}
-		if !strings.Contains(rr.Body.String(), "Invalid Last-Event-ID") {
-			t.Errorf("response should mention invalid Last-Event-ID, got: %s", rr.Body.String())
+		if !strings.Contains(rr.Body.String(), "event: connected") {
+			t.Errorf("response should contain connected event, got: %s", rr.Body.String())
 		}
 	})
 
@@ -1437,13 +1451,13 @@ func TestHandler_ServeHTTP_InvalidTopic(t *testing.T) {
 
 	js, _ := nc.JetStream()
 	h := &Handler{
-		StreamName: "EVENTS",
-		TopicPrefix: "events.",
-		AllowedOrigins: []string{"*"},
+		StreamName:        "EVENTS",
+		TopicPrefix:       "events.",
+		AllowedOrigins:    []string{"*"},
 		HeartbeatInterval: 30,
-		conn: nc,
-		js:   js,
-		logger: zap.NewNop(),
+		conn:              nc,
+		js:                js,
+		logger:            zap.NewNop(),
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/events?topic=a%00b", nil)

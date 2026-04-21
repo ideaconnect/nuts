@@ -1,16 +1,12 @@
 // provision.go — Caddy lifecycle: setup, teardown, and config validation.
-//
-// Caddy calls three methods on our Handler during its lifecycle:
-//
-//	Provision() — called once when the config is loaded. Opens the NATS
-//	              connection and verifies the JetStream stream exists.
-//	Validate()  — called after Provision to sanity-check the config.
-//	Cleanup()   — called when the config is unloaded or Caddy shuts down.
-//	              Closes the NATS connection and nils the cached state.
 package nuts
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -18,34 +14,59 @@ import (
 	"go.uber.org/zap"
 )
 
-// Provision sets up the handler. It follows four sequential steps:
-//
-//	1. Normalize defaults — fill in sane values for optional fields.
-//	2. Connect to NATS   — open a TCP connection with auth & callbacks.
-//	3. JetStream context  — create a JetStream context from the connection.
-//	4. Verify stream      — fail fast if the configured stream doesn't exist.
-//
-// If any step after 2 fails, the deferred cleanup closes the connection
-// so we don’t leak sockets.
+// defaultMaxEventSize is the SSE event size cap applied when MaxEventSize is 0.
+const defaultMaxEventSize = 1048576 // 1 MiB
+
+// defaultClientBufferSize is the per-connection NATS message buffer length
+// used when ClientBufferSize is unset.
+const defaultClientBufferSize = 64
+
+// defaultHealthPath is used when no health_path directive is configured.
+const defaultHealthPath = "/healthz"
+
+// Provision sets up the handler.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
 
+	// Step 0: validate required fields BEFORE opening any sockets so that a
+	// bad config can't leak resources.
+	if err := h.validateRequiredFields(); err != nil {
+		return err
+	}
+
 	// Step 1: Normalize optional settings before dialling NATS.
-	// Zero/negative values are replaced with production-friendly defaults.
 	if h.HeartbeatInterval <= 0 {
-		h.HeartbeatInterval = 30 // send a keep-alive comment every 30 seconds
+		h.HeartbeatInterval = 30
 	}
 	if h.ReconnectWait <= 0 {
-		h.ReconnectWait = 2 // wait 2 seconds between NATS reconnect attempts
+		h.ReconnectWait = 2
 	}
-	if h.MaxReconnects == 0 {
-		h.MaxReconnects = -1 // -1 = retry forever
+	// If the directive was not provided treat it as "unlimited" to preserve
+	// historical behaviour. A user-supplied 0 is honoured as "no reconnects".
+	if !h.maxReconnectsSet && h.MaxReconnects == 0 {
+		h.MaxReconnects = -1
 	}
 	if len(h.AllowedOrigins) == 0 {
-		h.AllowedOrigins = []string{"*"} // allow any browser origin by default
+		h.AllowedOrigins = []string{"*"}
 	}
+	if len(h.AllowedHeaders) == 0 {
+		h.AllowedHeaders = []string{"Cache-Control", "Last-Event-ID"}
+	}
+	if len(h.AllowedMethods) == 0 {
+		h.AllowedMethods = []string{"GET", "OPTIONS"}
+	}
+	// MaxEventSize semantics:
+	//   0  → use defaultMaxEventSize
+	//   <0 → unlimited (sentinel preserved as-is)
+	//   >0 → user-defined limit
 	if h.MaxEventSize == 0 {
-		h.MaxEventSize = 1048576 // 1 MB — protects clients from huge events
+		h.MaxEventSize = defaultMaxEventSize
+	}
+	if h.ClientBufferSize <= 0 {
+		h.ClientBufferSize = defaultClientBufferSize
+	}
+	if h.HealthPath == "" {
+		h.HealthPath = defaultHealthPath
 	}
 
 	// Step 2: Open the NATS connection.
@@ -53,9 +74,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("failed to connect to NATS: %v", err)
 	}
 
-	// If steps 3 or 4 fail, we must close the connection we just opened.
-	// The provisionErr variable is checked in the deferred function: if it
-	// is non-nil, Cleanup() runs to release the socket.
 	var provisionErr error
 	defer func() {
 		if provisionErr != nil {
@@ -64,8 +82,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}()
 
 	// Step 3: Create a JetStream context.
-	// We hold a read-lock on mu so that a concurrent Cleanup() call cannot
-	// nil the connection between our check and the JetStream() call.
 	h.mu.RLock()
 	conn := h.conn
 	if conn == nil {
@@ -73,9 +89,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		provisionErr = fmt.Errorf("NATS connection is nil after connect")
 		return provisionErr
 	}
-
-	// Cache a JetStream context — all request goroutines will use this to
-	// create subscriptions in ServeHTTP.
 	js, err := conn.JetStream()
 	h.mu.RUnlock()
 	if err != nil {
@@ -88,8 +101,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.mu.Unlock()
 
 	// Step 4: Verify that the configured stream actually exists.
-	// Starting subscriptions against a non-existent stream would fail per
-	// request; catching it here gives the operator a clear startup error.
 	_, err = js.StreamInfo(h.StreamName)
 	if err != nil {
 		provisionErr = fmt.Errorf("JetStream stream '%s' not found. Please create the stream first. See README for instructions. Error: %v", h.StreamName, err)
@@ -106,46 +117,40 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 }
 
 // connectNATS opens a long-lived TCP connection to the NATS server.
-//
-// It configures three lifecycle callbacks that surface connection state
-// changes in Caddy’s log output, and applies whichever authentication
-// mode the user configured (credentials file, token, or user/password).
 func (h *Handler) connectNATS() error {
 	opts := []nats.Option{
 		nats.ReconnectWait(time.Duration(h.ReconnectWait) * time.Second),
 		nats.MaxReconnects(h.MaxReconnects),
 
-		// DisconnectErrHandler fires when the connection drops unexpectedly.
-		// Logging the error helps operators diagnose network issues.
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			if err != nil {
 				h.logger.Warn("disconnected from NATS", zap.Error(err))
 			}
 		}),
-
-		// ReconnectHandler fires after a successful automatic reconnect.
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			h.logger.Info("reconnected to NATS", zap.String("url", nc.ConnectedUrl()))
 		}),
-
-		// ClosedHandler fires when the connection is permanently closed,
-		// either by us calling conn.Close() or after max reconnects.
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			h.logger.Info("NATS connection closed")
 		}),
 	}
 
-	// Apply the configured auth mode. Only one is allowed — Validate()
-	// rejects configs that specify more than one.
+	// Apply auth (Validate ensures only one mode is configured).
 	if h.NatsCredentials != "" {
-		// .creds file — contains a JWT and a private NKey.
 		opts = append(opts, nats.UserCredentials(h.NatsCredentials))
 	} else if h.NatsToken != "" {
-		// Shared-secret token authentication.
 		opts = append(opts, nats.Token(h.NatsToken))
 	} else if h.NatsUser != "" && h.NatsPassword != "" {
-		// Basic username/password authentication.
 		opts = append(opts, nats.UserInfo(h.NatsUser, h.NatsPassword))
+	}
+
+	// Apply TLS configuration if any TLS field is set.
+	if h.NatsTLSCA != "" || h.NatsTLSCert != "" || h.NatsTLSKey != "" || h.NatsTLSInsecureSkipVerify {
+		tlsCfg, err := h.buildTLSConfig()
+		if err != nil {
+			return err
+		}
+		opts = append(opts, nats.Secure(tlsCfg))
 	}
 
 	conn, err := nats.Connect(h.NatsURL, opts...)
@@ -153,24 +158,47 @@ func (h *Handler) connectNATS() error {
 		return err
 	}
 
-	// Store the connection under the write-lock so that ServeHTTP (which
-	// reads under RLock) and Cleanup (which writes under Lock) stay safe.
 	h.mu.Lock()
 	h.conn = conn
 	h.mu.Unlock()
 	return nil
 }
 
-// Cleanup is called by Caddy when the config is unloaded or Caddy shuts
-// down. It closes the NATS connection and nils the cached state so that
-// any in-flight request goroutines that still hold a reference will see
-// nil and fail cleanly rather than using a stale connection.
+// buildTLSConfig assembles a *tls.Config from the configured TLS file paths.
+func (h *Handler) buildTLSConfig() (*tls.Config, error) {
+	cfg := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: h.NatsTLSInsecureSkipVerify, //nolint:gosec // operator opt-in
+	}
+
+	if h.NatsTLSCA != "" {
+		pem, err := os.ReadFile(h.NatsTLSCA)
+		if err != nil {
+			return nil, fmt.Errorf("read nats_tls_ca: %v", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("nats_tls_ca: no certificates found in %s", h.NatsTLSCA)
+		}
+		cfg.RootCAs = pool
+	}
+
+	if h.NatsTLSCert != "" && h.NatsTLSKey != "" {
+		cert, err := tls.LoadX509KeyPair(h.NatsTLSCert, h.NatsTLSKey)
+		if err != nil {
+			return nil, fmt.Errorf("load nats_tls_cert/key: %v", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+
+	return cfg, nil
+}
+
+// Cleanup is called by Caddy when the config is unloaded or Caddy shuts down.
 func (h *Handler) Cleanup() error {
-	// Write-lock because we are mutating conn and js.
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Clear cached connection state so future reads fail cleanly.
 	if h.conn != nil {
 		h.conn.Close()
 		h.conn = nil
@@ -179,10 +207,9 @@ func (h *Handler) Cleanup() error {
 	return nil
 }
 
-// Validate is called by Caddy after Provision to sanity-check the config.
-// It ensures required fields are present, at most one auth method is set,
-// and warns about CORS misconfigurations.
-func (h *Handler) Validate() error {
+// validateRequiredFields checks the presence of fields that are required
+// before any side effect (opening a NATS connection) can be performed.
+func (h *Handler) validateRequiredFields() error {
 	if h.NatsURL == "" {
 		return fmt.Errorf("nats_url is required")
 	}
@@ -190,9 +217,7 @@ func (h *Handler) Validate() error {
 		return fmt.Errorf("stream_name is required for JetStream support")
 	}
 
-	// Count how many auth methods were configured. We allow at most one
-	// because the NATS client library applies them in order and having
-	// multiple would be confusing / ambiguous.
+	// Auth method check: at most one.
 	authMethods := 0
 	if h.NatsCredentials != "" {
 		authMethods++
@@ -210,19 +235,43 @@ func (h *Handler) Validate() error {
 		return fmt.Errorf("only one NATS authentication method can be configured")
 	}
 
-	// Warn if allowed_origins contains "*" alongside NATS auth. Browsers
-	// reject Access-Control-Allow-Origin: * when the request carries
-	// credentials. Our handler echoes the real origin (see setCORSHeaders)
-	// so it still works at runtime, but the wildcard config looks more
-	// permissive than intended and may confuse security reviewers.
-	for _, o := range h.AllowedOrigins {
-		if o == "*" && authMethods > 0 {
-			if h.logger != nil {
-				h.logger.Warn("allowed_origins contains '*' alongside NATS auth; " +
-					"consider listing explicit origins for credential-aware CORS")
+	// TLS pairing: cert and key must come together.
+	if (h.NatsTLSCert == "") != (h.NatsTLSKey == "") {
+		return fmt.Errorf("nats_tls_cert and nats_tls_key must be provided together")
+	}
+
+	return nil
+}
+
+// Validate is called by Caddy after Provision to sanity-check the config and
+// surface warnings.
+func (h *Handler) Validate() error {
+	if err := h.validateRequiredFields(); err != nil {
+		return err
+	}
+
+	authConfigured := h.NatsCredentials != "" || h.NatsToken != "" || (h.NatsUser != "" && h.NatsPassword != "")
+	if authConfigured {
+		for _, o := range h.AllowedOrigins {
+			if o == "*" {
+				if h.logger != nil {
+					h.logger.Warn("allowed_origins contains '*' alongside NATS auth; " +
+						"consider listing explicit origins for credential-aware CORS")
+				}
+				break
 			}
-			break
 		}
+	}
+
+	if h.logger != nil && (h.NatsToken != "" || (h.NatsUser != "" && h.NatsPassword != "")) {
+		if strings.HasPrefix(h.NatsURL, "nats://") {
+			h.logger.Warn("NATS credentials sent over plaintext nats:// URL; consider tls:// or nats_tls_* directives",
+				zap.String("nats_url", redactURL(h.NatsURL)))
+		}
+	}
+
+	if h.logger != nil && h.NatsTLSInsecureSkipVerify {
+		h.logger.Warn("nats_tls_insecure_skip_verify is enabled — server certificate is not verified")
 	}
 
 	return nil

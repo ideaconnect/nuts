@@ -97,7 +97,7 @@ Use this as a development roadmap — features marked **Planned** are candidates
 | JSON configuration | ✅ | ✅ | Both support Caddy's JSON config |
 | Cluster / HA mode | ✅ (commercial) | ⚡ via NATS cluster | Mercure offers a licensed HA version; NUTS inherits HA from NATS clustering |
 | Multiple transport backends | ✅ Bolt, local, etc. | ❌ JetStream only | Mercure supports pluggable transports |
-| Docker image | ✅ official | ⚡ build-your-own | NUTS provides a Dockerfile but no pre-built image |
+| Docker image | ✅ official | ✅ `idcttech/nuts` | Multi-arch (amd64, arm64) image published to Docker Hub |
 | Protocol version compat | ✅ `protocol_version_compatibility` | N/A | Mercure maintains backward compatibility with older protocol versions |
 
 ## Development Roadmap
