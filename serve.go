@@ -17,19 +17,19 @@ import (
 
 // ServeHTTP implements the caddyhttp.MiddlewareHandler interface.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// Phase 0: Health check.
+	// Health check.
 	if r.Method == http.MethodGet && h.matchesHealthPath(r.URL.Path) {
 		return h.serveHealthCheck(w)
 	}
 
-	// Phase 1: CORS preflight.
+	// CORS preflight.
 	if r.Method == http.MethodOptions {
 		h.setCORSHeaders(w, r)
 		w.WriteHeader(http.StatusNoContent)
 		return nil
 	}
 
-	// Phase 2: Method check.
+	// Method check.
 	if r.Method != http.MethodGet {
 		if next == nil {
 			allow := "GET, OPTIONS"
@@ -43,7 +43,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return next.ServeHTTP(w, r)
 	}
 
-	// Phase 3: Topic extraction.
+	// Topic extraction.
 	topics := r.URL.Query()["topic"]
 	if len(topics) == 0 {
 		// Path shorthand: convert remaining path into a dotted topic.
@@ -69,7 +69,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
-	// Phase 4: Last-ID / replay.
+	// Last-ID / replay.
 	// Parse the client's cursor before writing any response bytes so that
 	// invalid values produce a clean 400 (for explicit ?last-id=) or a
 	// fall-through to DeliverNew (for the auto-set Last-Event-ID header).
@@ -99,7 +99,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// Phase 5: JetStream subscription setup.
+	// JetStream subscription setup.
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
@@ -285,7 +285,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	defer cleanupSubscriptions()
 
-	// --- Phase 6: Streaming mode ---
+	// --- Streaming mode ---
 	metricsActiveConnections.Inc()
 	defer metricsActiveConnections.Dec()
 

@@ -1804,7 +1804,7 @@ func TestHandler_ServeHTTP_OversizedEventDropped(t *testing.T) {
 	}
 }
 
-// ── Phase 1 feature tests: health check, hub discovery, metrics, Caddyfile ──
+// ── Feature tests: health check, hub discovery, metrics, Caddyfile ──
 
 func TestHandler_HealthCheck(t *testing.T) {
 	ns := startJetStreamServer(t)

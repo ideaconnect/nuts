@@ -61,7 +61,7 @@ Prometheus counters and gauges registered via `promauto`. Exposes `nuts_active_c
 
 Core unit and integration tests. Uses an embedded NATS server with JetStream to test validation, Caddyfile parsing, topic filtering, SSE streaming, replay, slow-client disconnect, oversized-event dropping, and cleanup.
 
-### phaseb_test.go
+### hardening_test.go
 
 Focused tests for security hardening and related correctness items: configurable CORS headers/methods, oversized-raw-payload drop, `max_connections` rejection + metric increment, cleartext-auth and insecure-TLS warnings, TLS cert/key pairing, `MaxReconnects=0` vs default, integer-directive junk-suffix rejection, custom `health_path`, negative `MaxEventSize` disabling the limit, `replay_max_messages` capping a fallback stream, `replay_window` switching the fallback to `StartTime`, pre-flight config rejection, and `Cleanup()` waking in-flight SSE handlers.
 

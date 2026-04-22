@@ -1,5 +1,4 @@
-// Tests covering Phase B security hardening and remaining Phase A items
-// that needed dedicated coverage (A1, A6, A7, A8, A10).
+// Security-hardening and config-correctness tests for the NUTS handler.
 package nuts
 
 import (
@@ -38,7 +37,7 @@ func counterValue(c *prometheus.CounterVec, labels ...string) float64 {
 	return pb.GetCounter().GetValue()
 }
 
-// ── B3: configurable CORS headers ─────────────────────────────────────────
+// ── Configurable CORS headers ─────────────────────────────────────────────
 
 func TestHandler_CORS_CustomAllowedHeaders(t *testing.T) {
 	h := &Handler{
@@ -168,7 +167,7 @@ func TestHandler_CORS_ExplicitWinsOverWildcard(t *testing.T) {
 	}
 }
 
-// ── B4: oversized raw payload dropped before JSON parse ──────────────────
+// ── Oversized raw payload dropped before JSON parse ──────────────────────
 
 func TestHandler_MaxEventSize_DropsOversizedRawPayload(t *testing.T) {
 	ns := startJetStreamServer(t)
@@ -237,7 +236,7 @@ func TestHandler_MaxEventSize_DropsOversizedRawPayload(t *testing.T) {
 	}
 }
 
-// ── B5: max_connections cap ───────────────────────────────────────────────
+// ── max_connections cap ───────────────────────────────────────────────────
 
 func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
 	ns := startJetStreamServer(t)
@@ -319,7 +318,7 @@ func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
 	}
 }
 
-// ── B6: warnings for cleartext auth + insecure TLS ────────────────────────
+// ── Warnings for cleartext auth + insecure TLS ────────────────────────────
 
 func TestHandler_Validate_WarnsCleartextAuth(t *testing.T) {
 	core, obs := observer.New(zap.WarnLevel)
@@ -362,7 +361,7 @@ func hasLogContaining(obs *observer.ObservedLogs, needle string) bool {
 	return false
 }
 
-// ── B2: TLS field validation ──────────────────────────────────────────────
+// ── TLS field validation ──────────────────────────────────────────────────
 
 func TestHandler_Validate_TLSCertKeyPairing(t *testing.T) {
 	h := &Handler{
@@ -377,7 +376,7 @@ func TestHandler_Validate_TLSCertKeyPairing(t *testing.T) {
 	}
 }
 
-// ── A1: MaxReconnects=0 honored when user wrote it ────────────────────────
+// ── MaxReconnects=0 honored when user wrote it ────────────────────────────
 
 func TestHandler_MaxReconnectsZero_HonoredFromCaddyfile(t *testing.T) {
 	input := `nuts {
@@ -451,7 +450,7 @@ func TestHandler_MaxReconnects_DefaultFromJSON(t *testing.T) {
 	}
 }
 
-// ── A6: integer directives reject junk suffix ────────────────────────────
+// ── Integer directives reject junk suffix ────────────────────────────────
 
 func TestHandler_UnmarshalCaddyfile_RejectsNonNumericInt(t *testing.T) {
 	cases := []string{
@@ -475,7 +474,7 @@ func TestHandler_UnmarshalCaddyfile_RejectsNonNumericInt(t *testing.T) {
 	}
 }
 
-// ── A7: health_path custom + suffix match ─────────────────────────────────
+// ── health_path custom + suffix match ─────────────────────────────────────
 
 func TestHandler_HealthPath_CustomSuffix(t *testing.T) {
 	ns := startJetStreamServer(t)
@@ -531,7 +530,7 @@ func TestHandler_HealthPath_CustomSuffix(t *testing.T) {
 	}
 }
 
-// ── A7b: health_path segment-boundary match ──────────────────────────────
+// ── health_path segment-boundary match ──────────────────────────────────
 
 func TestHandler_MatchesHealthPath_SegmentBoundary(t *testing.T) {
 	tests := []struct {
@@ -560,7 +559,7 @@ func TestHandler_MatchesHealthPath_SegmentBoundary(t *testing.T) {
 	}
 }
 
-// ── A8: MaxEventSize < 0 disables the limit ──────────────────────────────
+// ── MaxEventSize < 0 disables the limit ──────────────────────────────────
 
 func TestHandler_MaxEventSize_NegativeDisablesLimit(t *testing.T) {
 	ns := startJetStreamServer(t)
@@ -751,7 +750,7 @@ func TestHandler_ReplayWindow_UsesStartTime(t *testing.T) {
 	}
 }
 
-// ── A10: Provision() fails BEFORE opening NATS when required fields absent ──
+// ── Provision() fails BEFORE opening NATS when required fields absent ────
 
 func TestHandler_Provision_RejectsBeforeDialing(t *testing.T) {
 	// Point at a guaranteed-closed port so any actual dial attempt would fail
