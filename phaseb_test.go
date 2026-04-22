@@ -804,20 +804,13 @@ func TestHandler_Cleanup_WakesInFlightHandlers(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/events?topic=shutdown", nil)
 	req = req.WithContext(context.Background())
 
-	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	rr := newSafeRecorder()
 	done := make(chan error, 1)
 	go func() { done <- h.ServeHTTP(rr, req, nil) }()
 
 	// Wait until the SSE "connected" event has been written so we know the
 	// handler is inside the streaming loop and not still in setup.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if strings.Contains(rr.Body.String(), "event: connected") {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !strings.Contains(rr.Body.String(), "event: connected") {
+	if !waitForSSEBody(rr, "event: connected", 2*time.Second) {
 		t.Fatal("handler never reached the streaming loop")
 	}
 

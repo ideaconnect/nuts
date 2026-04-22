@@ -1,22 +1,48 @@
-// Package nuts provides a Caddy module that bridges NATS.io JetStream
-// messages to Server-Sent Events (SSE), similar to Mercure.rocks.
+// Package nuts implements an HTTP middleware for Caddy that exposes a
+// JetStream stream to browser clients as a Server-Sent Events (SSE) feed.
 //
-// The data flow is one-directional:
+// The module registers itself with Caddy as http.handlers.nuts and as the
+// "nuts" Caddyfile directive. A single long-lived NATS connection is opened
+// in Provision() and shared across every request handled by the module
+// instance; per-request subscriptions are ephemeral JetStream consumers that
+// are torn down when the SSE connection closes.
 //
-//	Producer  ──▶  NATS JetStream  ──▶  NUTS (this module)  ──▶  Browser (EventSource)
+// Data flow is one-directional — NUTS does not publish:
 //
-// External applications publish messages to NATS subjects. NUTS subscribes
-// to those subjects through JetStream and pushes every message to connected
-// browsers as SSE events in real time. JetStream persists messages, so a
-// client that reconnects can replay everything it missed by providing its
-// last received event ID.
+//	Producer ──▶ NATS JetStream ──▶ NUTS (this module) ──▶ Browser (EventSource)
+//
+// External producers write to NATS subjects directly. Every request to the
+// handler opens an ephemeral JetStream consumer scoped to the configured
+// stream and the topics extracted from ?topic= (repeatable) or from the
+// request path as a shorthand ("/a/b" → topic "a.b"). Incoming messages are
+// wrapped as JSON ({topic, payload, time}) and written to the client as SSE
+// events with the JetStream sequence number as the SSE id. Clients reconnect
+// with either the browser-managed Last-Event-ID header or an explicit
+// ?last-id= query parameter to resume from a specific sequence; if that
+// sequence has already been purged from the stream NUTS falls back to a
+// full-retention replay (bounded by replay_max_messages / replay_window when
+// configured).
 //
 // Source files:
-//   - handler.go   — Module registration, Handler struct (config + runtime state)
-//   - serve.go     — HTTP/SSE request handling: the main streaming loop
-//   - provision.go — Caddy lifecycle: connect to NATS, create JetStream context, cleanup
-//   - helpers.go   — Small utility functions (JSON, topic validation, SSE writing)
-//   - caddyfile.go — Caddyfile directive parser
+//   - handler.go   — Package godoc, Handler struct (config + runtime state),
+//                    module registration, Caddy interface guards.
+//   - provision.go — Provision/Validate/Cleanup: defaults, NATS dial,
+//                    JetStream context, stream existence check, TLS config,
+//                    teardown.
+//   - serve.go     — ServeHTTP and its helpers: health endpoint, CORS
+//                    preflight, topic extraction and validation, last-id
+//                    parsing, connection-slot reservation, JetStream
+//                    subscription (with purged-sequence fallback), the SSE
+//                    streaming select loop, slow-client disconnect, and
+//                    heartbeat.
+//   - caddyfile.go — Caddyfile directive parser (UnmarshalCaddyfile).
+//   - helpers.go   — Small utilities: JSON marshalling, topic validation,
+//                    SSE frame writer, URL credential redaction.
+//   - metrics.go   — Prometheus counters and gauges registered via promauto
+//                    (nuts_* namespace).
+//
+// See cmd/caddy/main.go for the build entry point that compiles Caddy with
+// this module baked in.
 package nuts
 
 import (

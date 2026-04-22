@@ -630,19 +630,18 @@ nats stream add METRICS --subjects "metrics.>" --storage memory --max-age 1h
 }
 ```
 
-## Comparison with Mercure
+## Relationship to Mercure
 
-| Feature | NUTS | Mercure |
-|---------|------|---------|
-| Backend | NATS.io JetStream | Custom Hub |
-| Protocol | SSE | SSE |
-| Persistence | JetStream streams | Built-in |
-| Message Replay | Yes (`last-id` param and `Last-Event-ID` header) | Yes (`Last-Event-ID` header) |
-| Authorization | NATS auth | JWT |
-| Clustering | NATS clustering | Mercure clustering |
-| Prometheus Metrics | Yes (`nuts_*`) | Yes (`/metrics`) |
-| Health Check | Yes (`/healthz`) | Yes (`/healthz`) |
-| Hub Discovery | Yes (`Link` header) | Yes (`Link` header) |
+NUTS is inspired by [Mercure.rocks](https://mercure.rocks) — we share the idea of a
+Caddy-native SSE hub with `Last-Event-ID` replay and `Link`-header hub discovery,
+and we're grateful for the groundwork Mercure laid in that space.
+
+NUTS is a separate project with different goals: it's a read-only bridge that
+delegates persistence, clustering, and authentication to NATS JetStream rather
+than implementing its own transport. If your stack already uses NATS, NUTS
+plugs into it; if not, Mercure is a well-established alternative worth
+evaluating on its own terms. See [MERCURE.md](MERCURE.md) for a short note on
+the inspiration.
 
 ## Development
 

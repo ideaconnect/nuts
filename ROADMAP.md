@@ -3,7 +3,8 @@
 This document outlines planned features for NUTS, organized into phases.
 Completed items are checked off; the rest are candidates for future work.
 
-See [MERCURE.md](MERCURE.md) for a detailed feature-by-feature comparison with Mercure.
+See [MERCURE.md](MERCURE.md) for a short note on NUTS's relationship to
+Mercure.rocks, which inspired parts of the design.
 
 ## Phase 1: Observability & Operations ✅
 
@@ -49,4 +50,4 @@ Lower priority, can be tackled independently.
 
 - **End-to-end encryption** — Low demand relative to implementation effort.
 - **Web UI / demo mode** — The `example/` and `example_docker/` directories serve this purpose.
-- **IETF protocol specification** — NUTS is not aiming for Mercure protocol compatibility.
+- **Protocol-level client interoperability** — NUTS speaks plain SSE with `Last-Event-ID`; clients built for other SSE hubs may need minor adjustments (e.g. the optional `?last-id=` query form, `nuts_*` metric names, `rel="nuts"` on the `Link` header) rather than drop-in compatibility.
