@@ -108,6 +108,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	h.mu.RLock()
 	js := h.js
+	shutdown := h.shutdown
 	h.mu.RUnlock()
 
 	if js == nil {
@@ -141,9 +142,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			return
 		case msgChan <- msg:
 		default:
+			// msgChan is full — this client is slow. The consumer loop
+			// reads slowClient at the top of its select and disconnects
+			// as soon as it sees a signal; the client then reconnects and
+			// JetStream replays anything we did not forward. We must not
+			// silently discard the signal: a lost signal would leave the
+			// client connected with a full buffer, seeing no progress and
+			// no disconnect. Block (typically microseconds) until either
+			// the signal is accepted or the handler tears down and closes
+			// done, so every overflow ends in a disconnect, never a
+			// silent stall.
 			select {
 			case slowClient <- msg.Subject:
-			default:
+			case <-done:
 			}
 		}
 	}
@@ -151,6 +162,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	var subscriptions []*nats.Subscription
 	var subscribedTopics []string
 	var failedTopics []string
+	replayFellBack := false
 	cleanupSubscriptions := func() {
 		close(done)
 		for _, sub := range subscriptions {
@@ -162,50 +174,97 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	for _, topic := range topics {
-		fullTopic := h.TopicPrefix + topic
+	// Pre-check the stream's retained range so we can detect "requested
+	// sequence is below the purged frontier" before Subscribe() silently
+	// starts us at FirstSeq and replays everything. This is the common
+	// replay-storm trigger in modern NATS — StartSequence(N) where N <
+	// FirstSeq does not error.
+	var streamFirstSeq uint64
+	if hasLastID {
+		if info, infoErr := js.StreamInfo(h.StreamName); infoErr == nil {
+			streamFirstSeq = info.State.FirstSeq
+		} else {
+			h.logger.Debug("failed to read StreamInfo for fallback pre-check",
+				zap.Error(infoErr))
+		}
+	}
 
+	buildFallbackOpts := func(fullTopic string, requested uint64, reason string) []nats.SubOpt {
+		metricsReplayFallbacks.Inc()
+		replayFellBack = true
 		opts := []nats.SubOpt{
 			nats.BindStream(h.StreamName),
 			nats.AckNone(),
 		}
-		if hasLastID {
-			opts = append(opts, nats.StartSequence(lastID+1))
+		if h.ReplayWindow > 0 {
+			start := time.Now().Add(-time.Duration(h.ReplayWindow) * time.Second)
+			opts = append(opts, nats.StartTime(start))
+			h.logger.Warn("replay fallback: using time-bounded window",
+				zap.String("topic", fullTopic),
+				zap.Uint64("requested_sequence", requested),
+				zap.String("reason", reason),
+				zap.Int("replay_window_seconds", h.ReplayWindow),
+			)
+		} else {
+			opts = append(opts, nats.DeliverAll())
+			h.logger.Warn("replay fallback: delivering all retained messages",
+				zap.String("topic", fullTopic),
+				zap.Uint64("requested_sequence", requested),
+				zap.String("reason", reason),
+			)
+		}
+		return opts
+	}
+
+	for _, topic := range topics {
+		fullTopic := h.TopicPrefix + topic
+
+		var opts []nats.SubOpt
+		belowRetention := hasLastID && streamFirstSeq > 0 && lastID+1 < streamFirstSeq
+
+		switch {
+		case belowRetention:
+			opts = buildFallbackOpts(fullTopic, lastID+1, "sequence below retention")
+		case hasLastID:
+			opts = []nats.SubOpt{
+				nats.BindStream(h.StreamName),
+				nats.AckNone(),
+				nats.StartSequence(lastID + 1),
+			}
 			h.logger.Debug("subscribing from sequence",
 				zap.String("topic", fullTopic),
 				zap.Uint64("start_sequence", lastID+1),
 			)
-		} else {
-			opts = append(opts, nats.DeliverNew())
+		default:
+			opts = []nats.SubOpt{
+				nats.BindStream(h.StreamName),
+				nats.AckNone(),
+				nats.DeliverNew(),
+			}
 		}
 
 		sub, err := js.Subscribe(fullTopic, enqueueMessage, opts...)
 
-		if err != nil {
+		// Belt-and-suspenders: preserved error-string fallback for the rare
+		// case where Subscribe rejects StartSequence instead of silently
+		// adjusting. No-op on modern NATS but harmless.
+		if err != nil && !belowRetention {
 			errMsg := err.Error()
 			if hasLastID && (strings.Contains(errMsg, "start sequence") ||
 				strings.Contains(errMsg, "sequence not found")) {
-				metricsReplayFallbacks.Inc()
-				h.logger.Warn("requested sequence not available, falling back to all messages",
-					zap.String("topic", fullTopic),
-					zap.Uint64("requested_sequence", lastID+1),
-				)
-				fallbackOpts := []nats.SubOpt{
-					nats.BindStream(h.StreamName),
-					nats.AckNone(),
-					nats.DeliverAll(),
-				}
-				sub, err = js.Subscribe(fullTopic, enqueueMessage, fallbackOpts...)
+				sub, err = js.Subscribe(fullTopic, enqueueMessage,
+					buildFallbackOpts(fullTopic, lastID+1, "subscribe error")...)
 			}
-			if err != nil {
-				metricsSubscriptionErrors.Inc()
-				h.logger.Error("failed to subscribe to topic",
-					zap.String("topic", fullTopic),
-					zap.Error(err),
-				)
-				failedTopics = append(failedTopics, topic)
-				continue
-			}
+		}
+
+		if err != nil {
+			metricsSubscriptionErrors.Inc()
+			h.logger.Error("failed to subscribe to topic",
+				zap.String("topic", fullTopic),
+				zap.Error(err),
+			)
+			failedTopics = append(failedTopics, topic)
+			continue
 		}
 		subscriptions = append(subscriptions, sub)
 		subscribedTopics = append(subscribedTopics, topic)
@@ -247,9 +306,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	heartbeat := time.NewTicker(time.Duration(h.HeartbeatInterval) * time.Second)
 	defer heartbeat.Stop()
 
+	// replayDelivered counts messages delivered on a fallback subscription.
+	// It is only consulted when replayFellBack && ReplayMaxMessages > 0.
+	replayDelivered := 0
+
 	ctx := r.Context()
 	for {
 		select {
+		case <-shutdown:
+			h.logger.Debug("handler shutting down; closing SSE stream")
+			return nil
+
 		case slowTopic := <-slowClient:
 			metricsSlowClientDisconnects.Inc()
 			h.logger.Warn("disconnecting slow SSE client before dropping messages",
@@ -327,6 +394,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			}
 			metricsMessagesDelivered.Inc()
 
+			if replayFellBack && h.ReplayMaxMessages > 0 {
+				replayDelivered++
+				if replayDelivered >= h.ReplayMaxMessages {
+					metricsReplayCapReached.Inc()
+					h.logger.Warn("closing SSE stream: replay_max_messages reached",
+						zap.Int("replay_max_messages", h.ReplayMaxMessages),
+					)
+					return nil
+				}
+			}
+
 		case <-heartbeat.C:
 			if err := writeSSEChunk(w, flusher, fmt.Sprintf(": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339))); err != nil {
 				h.logger.Debug("failed to write heartbeat", zap.Error(err))
@@ -337,7 +415,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 }
 
 // matchesHealthPath returns true when the request path equals HealthPath or
-// ends with HealthPath as a full path segment.
+// ends with HealthPath as a full path segment. Because HealthPath is
+// normalised to start with '/', a plain HasSuffix check already enforces
+// the segment boundary — "/eventshealthz" does not HasSuffix "/healthz".
 func (h *Handler) matchesHealthPath(reqPath string) bool {
 	hp := h.HealthPath
 	if hp == "" {
@@ -371,6 +451,16 @@ func (h *Handler) releaseConnSlot() {
 
 // setCORSHeaders sets CORS response headers when the request includes an
 // Origin header.
+//
+// Access-Control-Allow-Credentials is only advertised when the request Origin
+// is explicitly allow-listed. Setting it alongside a wildcard match would let
+// any browser-visited origin attach cookies or Authorization headers to an
+// SSE subscription, defeating the point of opt-in CORS. Operators who need
+// credentialed flows must list explicit origins in allowed_origins.
+//
+// Vary: Origin is added whenever the response reflects the request origin so
+// that shared caches don't serve headers keyed to one origin to a different
+// origin.
 func (h *Handler) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -384,14 +474,25 @@ func (h *Handler) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	if len(h.AllowedHeaders) > 0 {
 		headers = strings.Join(h.AllowedHeaders, ", ")
 	}
+	var wildcard, explicit bool
 	for _, allowed := range h.AllowedOrigins {
-		if allowed == "*" || allowed == origin {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", methods)
-			w.Header().Set("Access-Control-Allow-Headers", headers)
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		if allowed == origin {
+			explicit = true
 			break
 		}
+		if allowed == "*" {
+			wildcard = true
+		}
+	}
+	if !explicit && !wildcard {
+		return
+	}
+	w.Header().Add("Vary", "Origin")
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Access-Control-Allow-Methods", methods)
+	w.Header().Set("Access-Control-Allow-Headers", headers)
+	if explicit {
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
 }
 

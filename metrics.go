@@ -73,4 +73,12 @@ var (
 		Name:      "connections_rejected_total",
 		Help:      "Total number of SSE connections rejected before streaming started.",
 	}, []string{"reason"})
+
+	// nuts_replay_cap_reached_total counts SSE connections that were closed
+	// because the DeliverAll fallback delivered replay_max_messages events.
+	metricsReplayCapReached = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "replay_cap_reached_total",
+		Help:      "Total number of SSE connections closed after replay_max_messages was reached.",
+	})
 )

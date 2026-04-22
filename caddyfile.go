@@ -142,8 +142,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if err != nil {
 					return err
 				}
-				h.MaxReconnects = v
-				h.maxReconnectsSet = true
+				h.MaxReconnects = &v
 
 			case "max_event_size":
 				v, err := parseInt("max_event_size")
@@ -171,6 +170,26 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("client_buffer_size must be > 0")
 				}
 				h.ClientBufferSize = v
+
+			case "replay_max_messages":
+				v, err := parseInt("replay_max_messages")
+				if err != nil {
+					return err
+				}
+				if v < 0 {
+					return d.Errf("replay_max_messages must be >= 0")
+				}
+				h.ReplayMaxMessages = v
+
+			case "replay_window":
+				v, err := parseInt("replay_window")
+				if err != nil {
+					return err
+				}
+				if v < 0 {
+					return d.Errf("replay_window must be >= 0")
+				}
+				h.ReplayWindow = v
 
 			case "health_path":
 				if !d.NextArg() {

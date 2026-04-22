@@ -10,18 +10,18 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 ## Features
 
 - **Real-time Updates**: Stream NATS messages to web browsers via SSE/EventSource
-- **JetStream Persistence**: Messages are persisted in NATS JetStream for replay
-- **Message Replay**: Clients can reconnect and replay messages from a specific ID using `?last-id=` or the standard `Last-Event-ID` header. If the requested sequence is no longer available in JetStream retention, NUTS falls back to replaying all retained messages for that topic.
+- **[JetStream Persistence](#jetstream-setup)**: Messages are persisted in NATS JetStream for replay
+- **[Message Replay](#message-replay-with-last-id-or-last-event-id)**: Clients can reconnect and replay messages from a specific ID using `?last-id=` or the standard `Last-Event-ID` header. If the requested sequence is no longer available in JetStream retention, NUTS falls back to replaying all retained messages for that topic.
 - **Multiple Topics**: Subscribe to multiple NATS subjects simultaneously
 - **Automatic Reconnection**: Built-in NATS reconnection handling
-- **CORS Support**: Configurable cross-origin resource sharing
+- **[CORS Support](#cors-and-allowed_origins)**: Configurable cross-origin resource sharing
 - **Heartbeat**: Keep-alive mechanism to prevent connection timeouts
-- **No Message Drops For Connected Clients**: When a client falls behind, NUTS disconnects that SSE session before dropping queued messages so the client can resume from the last delivered event ID
-- **Flexible Authentication**: Support for credentials file, token, or user/password auth
+- **[No Message Drops For Connected Clients](#slow-clients-and-replay)**: When a client falls behind, NUTS disconnects that SSE session before dropping queued messages so the client can resume from the last delivered event ID
+- **[Flexible Authentication](#with-nats-authentication)**: Support for credentials file, token, or user/password auth
 - **Topic Prefixing**: Optional prefix for all NATS subscriptions
-- **Prometheus Metrics**: Built-in `nuts_*` counters and gauges (active connections, messages delivered, slow-client disconnects, replay stats)
-- **Health Check**: `/healthz` endpoint verifying NATS connectivity and stream availability
-- **Hub Discovery**: Optional `Link` header with `rel="nuts"` for automatic hub detection
+- **[Prometheus Metrics](#prometheus-metrics)**: Built-in `nuts_*` counters and gauges (active connections, messages delivered, slow-client disconnects, replay stats)
+- **[Health Check](#health-check)**: `/healthz` endpoint verifying NATS connectivity and stream availability
+- **[Hub Discovery](#hub-discovery)**: Optional `Link` header with `rel="nuts"` for automatic hub detection
 
 ## Installation
 
@@ -47,8 +47,10 @@ go build -o caddy ./cmd/caddy
 A pre-built multi-architecture image (`amd64` / `arm64`) is published to Docker Hub:
 
 ```bash
-docker pull idcttech/nuts
+docker pull idcttech/nuts:latest
 ```
+
+> **Pin in production.** `:latest` is updated on every default-branch push, so pulling it twice on the same host can yield different binaries. Once a versioned release is cut, pin to the concrete tag — `idcttech/nuts:<version>` — so rollouts are reproducible and rollbacks are possible.
 
 The image expects a Caddyfile mounted at `/app/Caddyfile` and exposes port `8080`:
 
@@ -56,7 +58,7 @@ The image expects a Caddyfile mounted at `/app/Caddyfile` and exposes port `8080
 docker run -d \
   -p 8080:8080 \
   -v ./Caddyfile:/app/Caddyfile:ro \
-  idcttech/nuts
+  idcttech/nuts:latest
 ```
 
 #### Docker Compose
@@ -90,7 +92,7 @@ services:
     restart: "no"
 
   nuts:
-    image: idcttech/nuts
+    image: idcttech/nuts:latest  # pin to a concrete version in production
     ports:
       - "8080:8080"
     volumes:
@@ -108,6 +110,7 @@ With a Caddyfile like:
 ```caddyfile
 :8080 {
     route /events* {
+        uri strip_prefix /events
         nuts {
             nats_url  nats://nats:4222
             stream_name EVENTS
@@ -117,21 +120,42 @@ With a Caddyfile like:
 }
 ```
 
-## Testing
+#### Environment variables
 
-The repository has two test layers:
+The `Caddyfile` and `Caddyfile.test` at the repository root use Caddy's
+`{$NAME:default}` substitution for the three variables below so the same
+file works in the test harness, locally, and in a container. The
+`docker-compose.yml` at the repository root and the one under `example/`
+populate them via the `environment:` block on the `nuts` service; the
+compose file under `example_docker/` points at the published Docker
+image and leaves the values as their defaults.
 
-- `make test-unit` runs the self-contained Go tests in the root package using an embedded NATS server.
-- `make test-functional` starts the Docker-backed NATS and Caddy test stack, runs the Godog functional suite, then tears the stack down.
-- `make test` runs both layers in order.
+| Variable | Default (if unset) | Caddyfile directive |
+|---|---|---|
+| `NATS_URL` | `nats://localhost:4222` | `nats_url` |
+| `STREAM_NAME` | `EVENTS` | `stream_name` |
+| `TOPIC_PREFIX` | `events.` | `topic_prefix` |
 
-If you prefer to inspect the functional environment manually, use `make docker-up`, run `cd functional_test && go test -v -timeout 120s ./...`, then clean up with `make docker-down`.
+Equivalent Caddyfile snippet:
+
+```caddyfile
+nuts {
+    nats_url     {$NATS_URL:nats://localhost:4222}
+    stream_name  {$STREAM_NAME:EVENTS}
+    topic_prefix {$TOPIC_PREFIX:events.}
+}
+```
+
+Only these three are consumed by the shipped Caddyfile. To expose other
+directives (`allowed_origins`, `max_connections`, etc.) through the
+environment, add matching `{$NAME:default}` placeholders yourself — NUTS
+itself does not read environment variables directly.
 
 ## Quick Start
 
 1. **Start NATS server with JetStream enabled**:
    ```bash
-   docker run -p 4222:4222 nats:latest -js
+   docker run -p 4222:4222 nats:2.12-alpine -js
    ```
 
 2. **Create a JetStream stream** (using NATS CLI):
@@ -150,6 +174,7 @@ If you prefer to inspect the functional environment manually, use `make docker-u
    ```caddyfile
    :8080 {
        route /events* {
+           uri strip_prefix /events
            nuts {
                nats_url nats://localhost:4222
                stream_name EVENTS
@@ -158,6 +183,12 @@ If you prefer to inspect the functional environment manually, use `make docker-u
        }
    }
    ```
+
+   `uri strip_prefix /events` ensures the path-shorthand example below
+   (`new EventSource('/events/my-topic')`) sees `/my-topic` inside the
+   handler; without it the handler would subscribe to
+   `events.events.my-topic`. See
+   [Path-shorthand and `route`](#path-shorthand-and-route) for details.
 
 4. **Run Caddy**:
    ```bash
@@ -208,6 +239,8 @@ nuts {
     max_event_size <bytes>       # Max SSE event size (0=default 1 MiB, <0=unlimited)
     max_connections <count>      # Global concurrent-stream cap (default: 0 = unlimited)
     client_buffer_size <count>   # Per-connection send buffer (default: 64)
+    replay_max_messages <count>  # Cap replay-fallback messages per connection (default: 0 = unlimited)
+    replay_window <seconds>      # Time-bound replay fallback to the last N seconds (default: 0 = all retained)
     health_path <path>           # Health-check endpoint (default: /healthz)
     hub_url <url>                # URL for Link header hub discovery (disabled by default)
 
@@ -248,27 +281,65 @@ Caps the number of concurrent SSE streams per NUTS instance. When the cap
 is reached, new clients receive `503 Service Unavailable` with
 `Retry-After: 5` and the `nuts_connections_rejected_total{reason="max_connections"}`
 counter is incremented. Default `0` disables the cap.
+
+**Sizing memory.** The buffered-message footprint is bounded by
+`max_connections × client_buffer_size × max_event_size`. With defaults
+(`client_buffer_size 64`, `max_event_size 1048576`) each connection can hold
+up to 64 MiB of queued payloads, so `max_connections 1000` implies a ~64 GiB
+worst-case ceiling before slow-client disconnects kick in. Lower
+`client_buffer_size` or `max_event_size` if that ceiling is unacceptable;
+`max_event_size -1` (unlimited) removes the per-event bound entirely and
+makes the ceiling unbounded.
+
+#### `replay_max_messages` and `replay_window`
+
+Both guard against replay storms — when a client reconnects with a
+`last-id` (or `Last-Event-ID`) that points below the stream's retained
+range, NUTS would normally deliver *every* retained message for that
+topic before catching up to the live stream. On a stream with a long
+retention this can be tens of thousands of events.
+
+- `replay_max_messages <count>` closes the SSE connection after the
+  configured number of events have been delivered on a fallback
+  subscription. The client reconnects with a fresher `Last-Event-ID` and
+  continues normally. The `nuts_replay_cap_reached_total` counter is
+  incremented each time the cap fires.
+- `replay_window <seconds>` replaces the `DeliverAll` fallback with a
+  `StartTime(now - window)` subscription, so only events from the last
+  `N` seconds are replayed. Useful when the business value of stale
+  messages decays with age.
+
+Both default to `0` (unlimited / all retained) to preserve the original
+behaviour. They can be combined: `replay_window` bounds the time range,
+`replay_max_messages` bounds the count within that range.
+
+#### CORS and `allowed_origins`
+
+NUTS never emits a literal `Access-Control-Allow-Origin: *`; it echoes the
+request `Origin` header whenever the incoming origin is allow-listed. A
+`Vary: Origin` header is added so shared caches don't leak one origin's
+response to another.
+
+`Access-Control-Allow-Credentials: true` is only advertised when the request
+`Origin` is explicitly listed in `allowed_origins`. If `allowed_origins`
+contains `*`, the request is accepted but credentials are **not** advertised —
+browsers will reject any credentialed `EventSource` (i.e. `withCredentials:
+true`, cookies, or `Authorization` headers). To support credentialed CORS,
+replace `*` with the explicit origins that should be trusted:
+
+Pick **one** of the two forms below (a second `allowed_origins` directive
+inside the same `nuts { }` block overwrites the first):
+
+Wildcard — anonymous CORS only, no cookies / `Authorization` headers:
+
+```caddyfile
+allowed_origins *
 ```
 
-### JSON Configuration
+Explicit — credentials allowed for these origins:
 
-```json
-{
-    "handler": "nuts",
-    "nats_url": "nats://localhost:4222",
-    "stream_name": "EVENTS",
-    "nats_credentials": "/path/to/creds.creds",
-    "topic_prefix": "events.",
-    "allowed_origins": ["https://example.com"],
-    "heartbeat_interval": 30,
-    "reconnect_wait": 2,
-    "max_reconnects": -1,
-    "max_event_size": 1048576,
-    "hub_url": "https://example.com/events"
-}
-```
-
-`max_event_size` counts the **entire formatted SSE frame**, not just the raw NATS payload. See the Caddyfile section above for details.
+```caddyfile
+allowed_origins https://app.example.com https://admin.example.com
 ```
 
 ### Health Check
@@ -303,6 +374,7 @@ To expose metrics, add a `metrics` handler to your Caddyfile:
         metrics
     }
     route /events* {
+        uri strip_prefix /events
         nuts {
             nats_url  nats://localhost:4222
             stream_name EVENTS
@@ -323,6 +395,8 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
 | `nuts_replay_fallbacks_total` | Counter | Replay requests that fell back to `DeliverAll` |
 | `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
+| `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` labels the cause (e.g. `max_connections`). |
+| `nuts_replay_cap_reached_total` | Counter | SSE connections closed after `replay_max_messages` was reached during a replay fallback |
 
 ### Hub Discovery
 
@@ -477,7 +551,7 @@ const events = new EventSource(`/events?topic=updates&last-id=${lastId}`);
 **Behavior:**
 - Messages with sequence numbers greater than `last-id` will be delivered
 - If the requested sequence no longer exists (expired/deleted), all available messages are delivered
-- **Replay storm caveat**: When the fallback fires, *all* retained messages for that topic are replayed. If the stream holds a large backlog, this may deliver many messages the client has already seen. Design your stream retention policy (max age, max messages) accordingly.
+- **Replay storm caveat**: When the fallback fires, *all* retained messages for that topic are replayed by default. If the stream holds a large backlog, this may deliver many messages the client has already seen. Design your stream retention policy (max age, max messages) accordingly — or cap the fallback with the `replay_max_messages` or `replay_window` directives (see [Configuration](#configuration)).
 - Without `last-id`, only new messages are delivered
 - Standard `EventSource` reconnects can use the `Last-Event-ID` header automatically
 - When a slow client is disconnected, reconnecting with the last delivered event ID resumes from that point instead of losing messages silently

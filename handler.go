@@ -98,10 +98,12 @@ type Handler struct {
 	ReconnectWait int `json:"reconnect_wait,omitempty"`
 
 	// MaxReconnects limits total NATS reconnection attempts.
-	// 0 means "no reconnects", -1 means "unlimited".
-	// When the directive is omitted from the Caddyfile the parser sets this
-	// to -1 so the default behaviour stays "retry forever".
-	MaxReconnects int `json:"max_reconnects,omitempty"`
+	// 0 means "no reconnects", -1 means "unlimited". Nil (omitted from
+	// Caddyfile or JSON) defaults to unlimited so the historical "retry
+	// forever" behaviour is preserved. The pointer type lets JSON config
+	// express an explicit "max_reconnects": 0 — a plain int would collide
+	// with Go's zero value and get silently rewritten to the default.
+	MaxReconnects *int `json:"max_reconnects,omitempty"`
 
 	// MaxEventSize caps the size (in bytes) of a single formatted SSE event.
 	// Events exceeding this are dropped with a warning log.
@@ -137,6 +139,20 @@ type Handler struct {
 	// When the buffer fills, the slow client is disconnected to avoid drops.
 	// Default: 64.
 	ClientBufferSize int `json:"client_buffer_size,omitempty"`
+
+	// ReplayMaxMessages caps how many messages a single client can receive
+	// during a DeliverAll fallback (triggered when the requested sequence
+	// has been purged from the stream). 0 (default) disables the cap. When
+	// the cap is reached the SSE connection is closed cleanly; the client
+	// may reconnect with a fresher Last-Event-ID.
+	ReplayMaxMessages int `json:"replay_max_messages,omitempty"`
+
+	// ReplayWindow caps how far back in time a DeliverAll fallback reaches.
+	// Value is in seconds. When > 0 the fallback subscribes with
+	// StartTime(now - ReplayWindow) instead of DeliverAll, so the client
+	// only sees recent retained messages. 0 (default) preserves the
+	// "replay everything retained" behaviour.
+	ReplayWindow int `json:"replay_window,omitempty"`
 
 	// ── NATS TLS ─────────────────────────────────────────────────
 
@@ -177,10 +193,13 @@ type Handler struct {
 	// MaxConnections. Updated atomically.
 	connCount int64
 
-	// maxReconnectsSet is true when the Caddyfile contained an explicit
-	// max_reconnects directive. Provision() uses this to distinguish
-	// "user wrote 0" (no reconnects) from "directive omitted" (unlimited).
-	maxReconnectsSet bool
+	// shutdown is closed by Cleanup() to wake in-flight SSE handlers
+	// immediately instead of letting them linger until the next heartbeat
+	// tick or NATS-side error. Created in Provision(), closed and nilled
+	// in Cleanup(). Protected by mu. When nil (e.g. tests that bypass
+	// Provision), the serve loop's select case is a never-firing nil
+	// channel — harmless.
+	shutdown chan struct{}
 }
 
 // messageEventPayload is the JSON structure sent inside the "data:" field of

@@ -4,9 +4,11 @@ package nuts
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +21,9 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
+
+// intPtr is a small helper for constructing *int fields in struct literals.
+func intPtr(v int) *int { return &v }
 
 // counterValue returns the current value of a labelled counter or 0 if absent.
 func counterValue(c *prometheus.CounterVec, labels ...string) float64 {
@@ -59,6 +64,107 @@ func TestHandler_CORS_CustomAllowedHeaders(t *testing.T) {
 	}
 	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
 		t.Errorf("Access-Control-Allow-Origin: got %q", got)
+	}
+}
+
+// TestHandler_CORS_WildcardOmitsCredentials asserts that a wildcard
+// allowed_origins never advertises Access-Control-Allow-Credentials, and
+// that Vary: Origin is set so caches don't serve one origin's response to
+// another.
+func TestHandler_CORS_WildcardOmitsCredentials(t *testing.T) {
+	h := &Handler{
+		AllowedOrigins: []string{"*"},
+		logger:         zap.NewNop(),
+	}
+
+	req := httptest.NewRequest(http.MethodOptions, "/events?topic=x", nil)
+	req.Header.Set("Origin", "https://evil.example.com")
+	rr := httptest.NewRecorder()
+
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://evil.example.com" {
+		t.Errorf("Access-Control-Allow-Origin: got %q, want echoed origin", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Errorf("Access-Control-Allow-Credentials: got %q, want empty for wildcard match", got)
+	}
+	if got := rr.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+		t.Errorf("Vary: got %q, want to contain 'Origin'", got)
+	}
+}
+
+// TestHandler_CORS_ExplicitOriginSetsCredentials asserts that an explicit
+// allow-list entry produces credentialed CORS responses.
+func TestHandler_CORS_ExplicitOriginSetsCredentials(t *testing.T) {
+	h := &Handler{
+		AllowedOrigins: []string{"https://app.example.com", "https://admin.example.com"},
+		logger:         zap.NewNop(),
+	}
+
+	req := httptest.NewRequest(http.MethodOptions, "/events?topic=x", nil)
+	req.Header.Set("Origin", "https://admin.example.com")
+	rr := httptest.NewRecorder()
+
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://admin.example.com" {
+		t.Errorf("Access-Control-Allow-Origin: got %q", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("Access-Control-Allow-Credentials: got %q, want 'true' for explicit origin", got)
+	}
+	if got := rr.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+		t.Errorf("Vary: got %q, want to contain 'Origin'", got)
+	}
+}
+
+// TestHandler_CORS_UnlistedOrigin asserts that an unknown origin receives
+// no CORS headers.
+func TestHandler_CORS_UnlistedOrigin(t *testing.T) {
+	h := &Handler{
+		AllowedOrigins: []string{"https://app.example.com"},
+		logger:         zap.NewNop(),
+	}
+
+	req := httptest.NewRequest(http.MethodOptions, "/events?topic=x", nil)
+	req.Header.Set("Origin", "https://evil.example.com")
+	rr := httptest.NewRecorder()
+
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Access-Control-Allow-Origin: got %q, want empty for unlisted origin", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Errorf("Access-Control-Allow-Credentials: got %q, want empty", got)
+	}
+}
+
+// TestHandler_CORS_ExplicitWinsOverWildcard asserts that an explicit origin
+// listed alongside "*" still gets credentialed CORS.
+func TestHandler_CORS_ExplicitWinsOverWildcard(t *testing.T) {
+	h := &Handler{
+		AllowedOrigins: []string{"*", "https://app.example.com"},
+		logger:         zap.NewNop(),
+	}
+
+	req := httptest.NewRequest(http.MethodOptions, "/events?topic=x", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rr := httptest.NewRecorder()
+
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("Access-Control-Allow-Credentials: got %q, want 'true' when explicit origin matches", got)
 	}
 }
 
@@ -284,11 +390,11 @@ func TestHandler_MaxReconnectsZero_HonoredFromCaddyfile(t *testing.T) {
 	if err := h.UnmarshalCaddyfile(d); err != nil {
 		t.Fatalf("UnmarshalCaddyfile: %v", err)
 	}
-	if !h.maxReconnectsSet {
-		t.Errorf("maxReconnectsSet should be true after explicit directive")
+	if h.MaxReconnects == nil {
+		t.Fatalf("MaxReconnects should be set after explicit directive")
 	}
-	if h.MaxReconnects != 0 {
-		t.Errorf("MaxReconnects should be 0 after explicit directive, got %d", h.MaxReconnects)
+	if *h.MaxReconnects != 0 {
+		t.Errorf("MaxReconnects should be 0 after explicit directive, got %d", *h.MaxReconnects)
 	}
 }
 
@@ -302,8 +408,46 @@ func TestHandler_MaxReconnectsDefault_WhenOmitted(t *testing.T) {
 	if err := h.UnmarshalCaddyfile(d); err != nil {
 		t.Fatalf("UnmarshalCaddyfile: %v", err)
 	}
-	if h.maxReconnectsSet {
-		t.Errorf("maxReconnectsSet should be false when directive omitted")
+	if h.MaxReconnects != nil {
+		t.Errorf("MaxReconnects should be nil when directive omitted, got %d", *h.MaxReconnects)
+	}
+}
+
+// TestHandler_MaxReconnectsZero_HonoredFromJSON guards against regressions of
+// the JSON/Caddyfile asymmetry: an explicit 0 in JSON must survive Provision's
+// defaulting instead of being silently rewritten to -1.
+func TestHandler_MaxReconnectsZero_HonoredFromJSON(t *testing.T) {
+	raw := []byte(`{
+        "nats_url": "nats://localhost:4222",
+        "stream_name": "EVENTS",
+        "max_reconnects": 0
+    }`)
+	var h Handler
+	if err := json.Unmarshal(raw, &h); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if h.MaxReconnects == nil {
+		t.Fatalf("MaxReconnects should be set after explicit JSON field")
+	}
+	if *h.MaxReconnects != 0 {
+		t.Errorf("MaxReconnects should be 0 after explicit JSON field, got %d", *h.MaxReconnects)
+	}
+}
+
+// TestHandler_MaxReconnects_DefaultFromJSON proves that omitting the JSON
+// field yields the "unlimited" default after Provision, matching Caddyfile
+// behaviour.
+func TestHandler_MaxReconnects_DefaultFromJSON(t *testing.T) {
+	raw := []byte(`{
+        "nats_url": "nats://localhost:4222",
+        "stream_name": "EVENTS"
+    }`)
+	var h Handler
+	if err := json.Unmarshal(raw, &h); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if h.MaxReconnects != nil {
+		t.Errorf("MaxReconnects should be nil when JSON field omitted, got %d", *h.MaxReconnects)
 	}
 }
 
@@ -387,6 +531,35 @@ func TestHandler_HealthPath_CustomSuffix(t *testing.T) {
 	}
 }
 
+// ── A7b: health_path segment-boundary match ──────────────────────────────
+
+func TestHandler_MatchesHealthPath_SegmentBoundary(t *testing.T) {
+	tests := []struct {
+		name       string
+		healthPath string
+		reqPath    string
+		want       bool
+	}{
+		{"exact default", "", "/healthz", true},
+		{"exact custom", "/status", "/status", true},
+		{"prefix boundary default", "", "/events/healthz", true},
+		{"prefix boundary custom", "/status", "/api/v1/status", true},
+		{"glued suffix default", "", "/eventshealthz", false},
+		{"glued suffix custom", "/status", "/apistatus", false},
+		{"unrelated path", "", "/events/orders.new", false},
+		{"partial segment in middle", "/status", "/statusful/thing", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{HealthPath: tc.healthPath}
+			if got := h.matchesHealthPath(tc.reqPath); got != tc.want {
+				t.Errorf("matchesHealthPath(%q) with HealthPath=%q: got %v, want %v",
+					tc.reqPath, tc.healthPath, got, tc.want)
+			}
+		})
+	}
+}
+
 // ── A8: MaxEventSize < 0 disables the limit ──────────────────────────────
 
 func TestHandler_MaxEventSize_NegativeDisablesLimit(t *testing.T) {
@@ -439,6 +612,145 @@ func TestHandler_MaxEventSize_NegativeDisablesLimit(t *testing.T) {
 	}
 }
 
+// ── #10: replay cap ──────────────────────────────────────────────────────
+
+// TestHandler_ReplayMaxMessages_CapsFallback verifies that when the client
+// reconnects with a last-id below the stream's retained range (replay storm
+// scenario), ReplayMaxMessages closes the SSE stream after N events.
+func TestHandler_ReplayMaxMessages_CapsFallback(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	jsPub, _ := nc.JetStream()
+	// Publish 10 messages then purge the first 5 so FirstSeq == 6.
+	for i := 0; i < 10; i++ {
+		if _, err := jsPub.Publish("events.cap", []byte(`{"i":`+strconv.Itoa(i)+`}`)); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+	if err := jsPub.PurgeStream("EVENTS", &nats.StreamPurgeRequest{Sequence: 6}); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30,
+		MaxEventSize:      -1,
+		AllowedOrigins:    []string{"*"},
+		ReplayMaxMessages: 2,
+		logger:            zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+	defer h.Cleanup()
+	js, _ := h.conn.JetStream()
+	h.mu.Lock()
+	h.js = js
+	h.mu.Unlock()
+
+	// Client reconnects at sequence 1 — below retention (FirstSeq=6).
+	// Without the cap the client would receive messages 6..10 (5 events).
+	// With ReplayMaxMessages=2 the stream must close after 2 events.
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=cap&last-id=1", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 3*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	done := make(chan error, 1)
+	go func() { done <- h.ServeHTTP(rr, req, nil) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		cancel()
+		<-done
+	}
+
+	body := rr.Body.String()
+	delivered := strings.Count(body, "event: message")
+	if delivered != 2 {
+		t.Errorf("expected exactly 2 message events under replay_max_messages=2, got %d\nbody: %s", delivered, body)
+	}
+}
+
+// TestHandler_ReplayWindow_UsesStartTime verifies that ReplayWindow replaces
+// DeliverAll with a time-bounded StartTime subscription when the requested
+// last-id is below the stream's retention frontier, so events older than
+// the window are not replayed.
+func TestHandler_ReplayWindow_UsesStartTime(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	jsPub, _ := nc.JetStream()
+	// Old message, wait past the replay window, then new message.
+	if _, err := jsPub.Publish("events.win", []byte(`{"age":"old"}`)); err != nil {
+		t.Fatalf("publish old: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+	if _, err := jsPub.Publish("events.win", []byte(`{"age":"new"}`)); err != nil {
+		t.Fatalf("publish new: %v", err)
+	}
+	// Purge the first message so FirstSeq advances past the requested
+	// last-id=0, forcing the fallback path where ReplayWindow applies.
+	if err := jsPub.PurgeStream("EVENTS", &nats.StreamPurgeRequest{Sequence: 2}); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30,
+		MaxEventSize:      -1,
+		AllowedOrigins:    []string{"*"},
+		ReplayWindow:      1, // only the last 1 second is replayed
+		logger:            zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+	defer h.Cleanup()
+	js, _ := h.conn.JetStream()
+	h.mu.Lock()
+	h.js = js
+	h.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=win&last-id=0", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 1500*time.Millisecond)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	done := make(chan error, 1)
+	go func() { done <- h.ServeHTTP(rr, req, nil) }()
+	<-done
+
+	body := rr.Body.String()
+	if strings.Contains(body, `"old"`) {
+		t.Errorf("message older than replay_window leaked into body:\n%s", body)
+	}
+	if !strings.Contains(body, `"new"`) {
+		t.Errorf("recent message should be replayed under replay_window:\n%s", body)
+	}
+}
+
 // ── A10: Provision() fails BEFORE opening NATS when required fields absent ──
 
 func TestHandler_Provision_RejectsBeforeDialing(t *testing.T) {
@@ -453,6 +765,79 @@ func TestHandler_Provision_RejectsBeforeDialing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "nats_url") {
 		t.Errorf("expected error to mention nats_url, got %v", err)
+	}
+}
+
+// TestHandler_Cleanup_WakesInFlightHandlers verifies that Cleanup() closes
+// the handler-scoped shutdown channel, causing any active SSE goroutine to
+// return promptly instead of waiting until the next heartbeat tick (30s by
+// default) notices the connection has been torn down.
+func TestHandler_Cleanup_WakesInFlightHandlers(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30, // deliberately long — shutdown must win, not heartbeat
+		MaxEventSize:      -1,
+		AllowedOrigins:    []string{"*"},
+		logger:            zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+	js, _ := h.conn.JetStream()
+	h.mu.Lock()
+	h.js = js
+	h.shutdown = make(chan struct{})
+	h.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=shutdown", nil)
+	req = req.WithContext(context.Background())
+
+	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	done := make(chan error, 1)
+	go func() { done <- h.ServeHTTP(rr, req, nil) }()
+
+	// Wait until the SSE "connected" event has been written so we know the
+	// handler is inside the streaming loop and not still in setup.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(rr.Body.String(), "event: connected") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(rr.Body.String(), "event: connected") {
+		t.Fatal("handler never reached the streaming loop")
+	}
+
+	// Cleanup must wake the handler in well under heartbeat_interval.
+	cleanupStart := time.Now()
+	if err := h.Cleanup(); err != nil {
+		t.Fatalf("Cleanup returned error: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		elapsed := time.Since(cleanupStart)
+		if err != nil {
+			t.Fatalf("ServeHTTP returned error after Cleanup: %v", err)
+		}
+		if elapsed > 500*time.Millisecond {
+			t.Errorf("ServeHTTP took %v to return after Cleanup; expected < 500ms", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ServeHTTP did not return within 3s after Cleanup — shutdown signal not observed")
 	}
 }
 

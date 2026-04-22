@@ -1,37 +1,37 @@
 {
-    admin off
-    order nuts before respond
+	admin off
+	order nuts before respond
 }
 
 :8080 {
-    handle /health {
-        respond 200
-    }
+	handle /health {
+		respond 200
+	}
 
-    handle /events* {
-        uri strip_prefix /events
-        nuts {
-            nats_url {$NATS_URL:nats://localhost:4222}
-            stream_name {$STREAM_NAME:EVENTS}
-            topic_prefix {$TOPIC_PREFIX:events.}
-            heartbeat_interval 1
-            allowed_origins *
-        }
-    }
+	handle /events* {
+		uri strip_prefix /events
+		nuts {
+			nats_url {$NATS_URL:nats://localhost:4222}
+			stream_name {$STREAM_NAME:EVENTS}
+			topic_prefix {$TOPIC_PREFIX:events.}
+			heartbeat_interval 1
+			allowed_origins *
+		}
+	}
 
-    handle /example* {
-        root * /srv/example
-        uri strip_prefix /example
-        file_server browse
-    }
+	handle /example* {
+		root * /srv/example
+		uri strip_prefix /example
+		file_server browse
+	}
 
-    handle {
-        nuts {
-            nats_url {$NATS_URL:nats://localhost:4222}
-            stream_name {$STREAM_NAME:EVENTS}
-            topic_prefix {$TOPIC_PREFIX:events.}
-            heartbeat_interval 1
-            allowed_origins *
-        }
-    }
+	handle {
+		nuts {
+			nats_url {$NATS_URL:nats://localhost:4222}
+			stream_name {$STREAM_NAME:EVENTS}
+			topic_prefix {$TOPIC_PREFIX:events.}
+			heartbeat_interval 1
+			allowed_origins *
+		}
+	}
 }

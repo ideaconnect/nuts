@@ -33,7 +33,7 @@ services:
     restart: "no"
 
   nuts:
-    image: idcttech/nuts
+    image: idcttech/nuts:latest
     container_name: nuts-docker-server
     ports:
       - "8080:8080"

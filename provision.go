@@ -41,10 +41,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.ReconnectWait <= 0 {
 		h.ReconnectWait = 2
 	}
-	// If the directive was not provided treat it as "unlimited" to preserve
-	// historical behaviour. A user-supplied 0 is honoured as "no reconnects".
-	if !h.maxReconnectsSet && h.MaxReconnects == 0 {
-		h.MaxReconnects = -1
+	// MaxReconnects nil (directive omitted in Caddyfile or absent from JSON)
+	// defaults to -1 (unlimited). An explicit 0 from either source is honoured
+	// as "no reconnects".
+	if h.MaxReconnects == nil {
+		defaultMaxReconnects := -1
+		h.MaxReconnects = &defaultMaxReconnects
 	}
 	if len(h.AllowedOrigins) == 0 {
 		h.AllowedOrigins = []string{"*"}
@@ -68,6 +70,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.HealthPath == "" {
 		h.HealthPath = defaultHealthPath
 	}
+
+	// Create the shutdown signal before opening any sockets so that if
+	// connectNATS fails the deferred Cleanup() still has a channel to close.
+	h.mu.Lock()
+	h.shutdown = make(chan struct{})
+	h.mu.Unlock()
 
 	// Step 2: Open the NATS connection.
 	if err := h.connectNATS(); err != nil {
@@ -118,9 +126,15 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 // connectNATS opens a long-lived TCP connection to the NATS server.
 func (h *Handler) connectNATS() error {
+	// Provision normalises this to a non-nil pointer. We re-check here so
+	// tests can call connectNATS() directly without going through Provision.
+	maxReconnects := -1
+	if h.MaxReconnects != nil {
+		maxReconnects = *h.MaxReconnects
+	}
 	opts := []nats.Option{
 		nats.ReconnectWait(time.Duration(h.ReconnectWait) * time.Second),
-		nats.MaxReconnects(h.MaxReconnects),
+		nats.MaxReconnects(maxReconnects),
 
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			if err != nil {
@@ -199,6 +213,14 @@ func (h *Handler) Cleanup() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// Signal in-flight SSE handlers first so they return promptly instead of
+	// discovering the teardown via a heartbeat-write error or a NATS-side
+	// subscription close. Idempotent: nil-ing after close prevents a panic
+	// if Cleanup is called more than once.
+	if h.shutdown != nil {
+		close(h.shutdown)
+		h.shutdown = nil
+	}
 	if h.conn != nil {
 		h.conn.Close()
 		h.conn = nil
@@ -250,16 +272,14 @@ func (h *Handler) Validate() error {
 		return err
 	}
 
-	authConfigured := h.NatsCredentials != "" || h.NatsToken != "" || (h.NatsUser != "" && h.NatsPassword != "")
-	if authConfigured {
-		for _, o := range h.AllowedOrigins {
-			if o == "*" {
-				if h.logger != nil {
-					h.logger.Warn("allowed_origins contains '*' alongside NATS auth; " +
-						"consider listing explicit origins for credential-aware CORS")
-				}
-				break
+	for _, o := range h.AllowedOrigins {
+		if o == "*" {
+			if h.logger != nil {
+				h.logger.Warn("allowed_origins contains '*': Access-Control-Allow-Credentials " +
+					"is not advertised for wildcard-matched origins. If clients need credentialed " +
+					"CORS (cookies, Authorization headers), list explicit origins instead.")
 			}
+			break
 		}
 	}
 

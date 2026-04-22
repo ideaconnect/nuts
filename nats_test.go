@@ -205,7 +205,7 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				TopicPrefix:       "events.",
 				HeartbeatInterval: 15,
 				ReconnectWait:     5,
-				MaxReconnects:     10,
+				MaxReconnects:     intPtr(10),
 				MaxEventSize:      524288,
 				HubURL:            "https://example.com/events",
 				AllowedOrigins:    []string{"https://example.com", "https://other.com"},
@@ -372,8 +372,13 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 			if h.ReconnectWait != tt.expected.ReconnectWait {
 				t.Errorf("ReconnectWait: expected %d, got %d", tt.expected.ReconnectWait, h.ReconnectWait)
 			}
-			if h.MaxReconnects != tt.expected.MaxReconnects {
-				t.Errorf("MaxReconnects: expected %d, got %d", tt.expected.MaxReconnects, h.MaxReconnects)
+			switch {
+			case tt.expected.MaxReconnects == nil && h.MaxReconnects != nil:
+				t.Errorf("MaxReconnects: expected nil, got %d", *h.MaxReconnects)
+			case tt.expected.MaxReconnects != nil && h.MaxReconnects == nil:
+				t.Errorf("MaxReconnects: expected %d, got nil", *tt.expected.MaxReconnects)
+			case tt.expected.MaxReconnects != nil && h.MaxReconnects != nil && *tt.expected.MaxReconnects != *h.MaxReconnects:
+				t.Errorf("MaxReconnects: expected %d, got %d", *tt.expected.MaxReconnects, *h.MaxReconnects)
 			}
 			if h.NatsToken != tt.expected.NatsToken {
 				t.Errorf("NatsToken: expected %q, got %q", tt.expected.NatsToken, h.NatsToken)
@@ -492,6 +497,8 @@ func TestHandler_UnmarshalCaddyfile_MissingArgs(t *testing.T) {
 		{name: "missing reconnect_wait arg", directive: "reconnect_wait"},
 		{name: "missing max_reconnects arg", directive: "max_reconnects"},
 		{name: "missing max_event_size arg", directive: "max_event_size"},
+		{name: "missing replay_max_messages arg", directive: "replay_max_messages"},
+		{name: "missing replay_window arg", directive: "replay_window"},
 	}
 
 	for _, tt := range tests {
@@ -540,8 +547,8 @@ func TestHandler_Provision(t *testing.T) {
 		if h.ReconnectWait != 2 {
 			t.Errorf("expected default reconnect wait 2, got %d", h.ReconnectWait)
 		}
-		if h.MaxReconnects != -1 {
-			t.Errorf("expected default max reconnects -1, got %d", h.MaxReconnects)
+		if h.MaxReconnects == nil || *h.MaxReconnects != -1 {
+			t.Errorf("expected default max reconnects -1, got %v", h.MaxReconnects)
 		}
 		if h.MaxEventSize != 1048576 {
 			t.Errorf("expected default max event size 1048576, got %d", h.MaxEventSize)
@@ -640,7 +647,7 @@ func TestHandler_connectNATS_ReconnectLifecycle(t *testing.T) {
 	h := &Handler{
 		NatsURL:        "nats://127.0.0.1:" + strconv.Itoa(port),
 		ReconnectWait:  1,
-		MaxReconnects:  10,
+		MaxReconnects:  intPtr(10),
 		AllowedOrigins: []string{"*"},
 		logger:         zap.New(observedCore),
 	}
@@ -738,7 +745,7 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
 		logger:            zap.NewNop(),
 	}
@@ -968,7 +975,7 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 			NatsURL:        ns.ClientURL(),
 			StreamName:     "TEST_EVENTS",
 			ReconnectWait:  2,
-			MaxReconnects:  -1,
+			MaxReconnects:  intPtr(-1),
 			AllowedOrigins: []string{"*"},
 			logger:         zap.NewNop(),
 		}
@@ -995,7 +1002,7 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 			TopicPrefix:       "missing.",
 			HeartbeatInterval: 30,
 			ReconnectWait:     2,
-			MaxReconnects:     -1,
+			MaxReconnects:     intPtr(-1),
 			AllowedOrigins:    []string{"*"},
 			logger:            zap.NewNop(),
 			js:                h.js,
@@ -1023,7 +1030,7 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 			TopicPrefix:       "",
 			HeartbeatInterval: 30,
 			ReconnectWait:     2,
-			MaxReconnects:     -1,
+			MaxReconnects:     intPtr(-1),
 			AllowedOrigins:    []string{"*"},
 			logger:            zap.NewNop(),
 			js:                h.js,
@@ -1142,7 +1149,7 @@ func TestHandler_StreamNotFound(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
 		logger:            zap.NewNop(),
 	}
@@ -1277,7 +1284,7 @@ func TestHandler_Cleanup(t *testing.T) {
 		NatsURL:        ns.ClientURL(),
 		StreamName:     "TEST",
 		ReconnectWait:  1,
-		MaxReconnects:  3,
+		MaxReconnects:  intPtr(3),
 		AllowedOrigins: []string{"*"},
 		logger:         zap.NewNop(),
 	}
@@ -1491,7 +1498,7 @@ func TestHandler_ServeHTTP_ConnectedWriteFailure(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
 		logger:            zap.NewNop(),
 	}
@@ -1545,7 +1552,7 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
 		logger:            zap.NewNop(),
 	}
@@ -1658,7 +1665,7 @@ func TestHandler_ServeHTTP_DisconnectsSlowClientBeforeDropping(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
 		logger:            zap.NewNop(),
 	}
@@ -1732,7 +1739,7 @@ func TestHandler_ServeHTTP_OversizedEventDropped(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
 		MaxEventSize:      100, // very small limit
 		logger:            zap.NewNop(),
@@ -1919,7 +1926,7 @@ func TestHandler_HubDiscovery(t *testing.T) {
 			TopicPrefix:       "events.",
 			HeartbeatInterval: 30,
 			ReconnectWait:     2,
-			MaxReconnects:     -1,
+			MaxReconnects:     intPtr(-1),
 			AllowedOrigins:    []string{"*"},
 			HubURL:            "https://example.com/events",
 			logger:            zap.NewNop(),
@@ -1964,7 +1971,7 @@ func TestHandler_HubDiscovery(t *testing.T) {
 			TopicPrefix:       "events.",
 			HeartbeatInterval: 30,
 			ReconnectWait:     2,
-			MaxReconnects:     -1,
+			MaxReconnects:     intPtr(-1),
 			AllowedOrigins:    []string{"*"},
 			logger:            zap.NewNop(),
 		}
