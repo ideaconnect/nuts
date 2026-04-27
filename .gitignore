@@ -18,6 +18,9 @@ coverage.*
 *.coverprofile
 profile.cov
 
+# Release artifacts
+dist/
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 

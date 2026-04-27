@@ -1,8 +1,9 @@
-.PHONY: all build test test-unit test-performance test-functional test-functional-dev test-functional-stress test-functional-matrix docker-up wait-functional-stack docker-down docker-logs clean
+.PHONY: all build test test-unit test-performance test-functional test-functional-dev test-functional-stress test-functional-matrix release-check docker-up wait-functional-stack docker-down docker-logs clean
 
 DOCKER_COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo docker compose; elif docker-compose version >/dev/null 2>&1; then echo docker-compose; fi)
 FUNCTIONAL_TEST_STRESS_COUNT ?= 3
 NATS_COMPAT_IMAGES ?= nats:2.9-alpine nats:2.12-alpine
+GORELEASER_IMAGE ?= goreleaser/goreleaser:v2.8.2
 
 # Default target
 all: build test
@@ -22,6 +23,10 @@ test-unit:
 test-performance:
 	go test -run '^TestPerformance_' -timeout 180s .
 	go test -run '^$$' -bench 'Benchmark(FormatMessageEvent|TryParseJSON|IsValidTopic|CommonSubjectFilter|MultiTopicRequestedMessageHandler)' -benchmem .
+
+# Validate GoReleaser config without requiring a local GoReleaser install.
+release-check:
+	docker run --rm -v "$(CURDIR):/workspace" -w /workspace $(GORELEASER_IMAGE) check
 
 # Start Docker services for functional tests
 docker-up:
@@ -147,6 +152,7 @@ help:
 	@echo "  test-functional  - Run functional/BDD tests with Docker"
 	@echo "  test-functional-stress - Run functional/BDD tests repeatedly with Docker"
 	@echo "  test-functional-matrix - Run functional/BDD tests against old and current NATS images"
+	@echo "  release-check    - Validate GoReleaser config in a container"
 	@echo "  docker-up        - Start Docker services"
 	@echo "  docker-down      - Stop Docker services"
 	@echo "  docker-logs      - Print functional test Docker service logs"

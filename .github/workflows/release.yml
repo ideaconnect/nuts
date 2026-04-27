@@ -31,6 +31,9 @@ jobs:
           version: '~> v2'
           args: check
 
+      - name: Install Syft for GoReleaser SBOMs
+        uses: anchore/sbom-action/download-syft@v0
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:

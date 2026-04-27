@@ -83,13 +83,13 @@ This plan turns the current quality review into an execution checklist. It is in
 
 ## P1: CI, Release, And Supply Chain
 
-- [ ] P1: Add a containerized local `make release-check` so GoReleaser validation does not depend on a developer-installed binary.
-- [ ] P1: Add a GoReleaser snapshot dry run in CI for pull requests that touch release configuration.
-- [ ] P1: Add Docker image vulnerability scanning for pull requests and release builds.
-- [ ] P1: Add SBOM generation for release artifacts and Docker images.
-- [ ] P1: Consider signing release artifacts and container images.
-- [ ] P1: Add Dependabot or Renovate for Go modules, Docker images, and GitHub Actions.
-- [ ] P1: Pin action versions by major today, and consider pinning by SHA if stricter supply-chain policy is desired.
+- [x] P1: Add a containerized local `make release-check` so GoReleaser validation does not depend on a developer-installed binary.
+- [x] P1: Add a GoReleaser snapshot dry run in CI for pull requests that touch release configuration.
+- [x] P1: Add Docker image vulnerability scanning for pull requests and release builds.
+- [x] P1: Add SBOM generation for release artifacts and Docker images.
+- [x] P1: Consider signing release artifacts and container images.
+- [x] P1: Add Dependabot or Renovate for Go modules, Docker images, and GitHub Actions.
+- [x] P1: Pin action versions by major today, and consider pinning by SHA if stricter supply-chain policy is desired.
 
 ## P2: Documentation And Developer Experience
 

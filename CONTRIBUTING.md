@@ -60,8 +60,11 @@ Follow the conventional form:
 
 ## Releasing
 
-Tags of the form `vX.Y.Z` trigger the Docker image publish workflow. Update
-[CHANGELOG.md](CHANGELOG.md) in the same commit that creates the tag.
+Tags of the form `vX.Y.Z` trigger the Docker image publish workflow and the
+GoReleaser GitHub release workflow. Update [CHANGELOG.md](CHANGELOG.md) in the
+same commit that creates the tag, and run `make release-check` before tagging.
+See [RELEASE.md](RELEASE.md) for the release gates, SBOMs, vulnerability scans,
+and signing policy.
 
 ## Reporting issues
 

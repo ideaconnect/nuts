@@ -30,19 +30,22 @@ archives:
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     format_overrides:
       - goos: windows
-        format: zip
+        formats: zip
     files:
       - LICENSE
       - README.md
       - CHANGELOG.md
       - Caddyfile
 
+sboms:
+  - artifacts: archive
+
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
 snapshot:
-  name_template: "{{ .Tag }}-next"
+  version_template: "{{ .Tag }}-next"
 
 changelog:
   use: github

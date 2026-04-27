@@ -41,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operations assets: Prometheus alert rules, a Grafana dashboard example, and
   a runbook for NATS outages, missing streams, replay storms, slow consumers,
   and CORS misconfiguration.
+- Release and supply-chain hardening: containerized GoReleaser validation,
+  PR snapshot dry runs for release config changes, Docker vulnerability scans,
+  release/archive and image SBOM generation, Cosign signing for tagged Docker
+  images, Dependabot configuration, and release policy documentation.
 - `CONTRIBUTING.md`, `SECURITY.md`, and this `CHANGELOG.md`.
 - Docker image now runs as non-root user `nuts` (uid 10001).
 
