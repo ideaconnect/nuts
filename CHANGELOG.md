@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PR snapshot dry runs for release config changes, Docker vulnerability scans,
   release/archive and image SBOM generation, Cosign signing for tagged Docker
   images, Dependabot configuration, and release policy documentation.
+- Documentation and developer-experience additions: architecture and replay
+  diagrams, a complete configuration matrix, troubleshooting guide, production
+  deployment examples, a CI-aligned contribution checklist, and operator release
+  note guidance.
 - `CONTRIBUTING.md`, `SECURITY.md`, and this `CHANGELOG.md`.
 - Docker image now runs as non-root user `nuts` (uid 10001).
 

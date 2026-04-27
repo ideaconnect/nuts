@@ -44,7 +44,7 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.64
+          version: v2.11.4
 
       - name: Run unit tests with coverage
         run: go test -covermode=atomic -coverprofile=coverage.out -v -timeout 120s .

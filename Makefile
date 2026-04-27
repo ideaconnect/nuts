@@ -4,6 +4,7 @@ DOCKER_COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo d
 FUNCTIONAL_TEST_STRESS_COUNT ?= 3
 NATS_COMPAT_IMAGES ?= nats:2.9-alpine nats:2.12-alpine
 GORELEASER_IMAGE ?= goreleaser/goreleaser:v2.8.2
+GOLANGCI_LINT_IMAGE ?= golangci/golangci-lint:v2.11.4
 
 # Default target
 all: build test
@@ -138,9 +139,9 @@ clean:
 fmt:
 	go fmt ./...
 
-# Lint code
+# Lint code using the same major/minor tool version as CI.
 lint:
-	golangci-lint run
+	docker run --rm -v "$(CURDIR):/app" -w /app $(GOLANGCI_LINT_IMAGE) golangci-lint run
 
 # Show help
 help:

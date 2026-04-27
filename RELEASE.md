@@ -70,3 +70,49 @@ Dependabot is configured for Go modules, the production Dockerfile, and GitHub
 Actions. GitHub Actions are intentionally pinned by major version where those
 actions publish stable major tags; stricter environments can pin by commit SHA
 and let Dependabot propose SHA updates.
+
+## Operator Release Notes Checklist
+
+Release notes should be written for operators first. Include the items below
+whenever they changed, even if the code change looks small.
+
+- **Caddy:** minimum supported Caddy version, new Caddyfile directives, changed
+  route-ordering expectations, probe path changes, and any required `caddy fmt`
+  or `caddy adapt` behavior.
+- **Go:** minimum Go toolchain version, build flag changes, race-test policy,
+  and any known cross-compilation or container-build impact.
+- **NATS:** minimum NATS server version assumptions, JetStream consumer behavior,
+  stream subject requirements, auth/TLS changes, and compatibility notes for
+  older NATS versions.
+- **Replay:** changes to `last-id`, `Last-Event-ID`, fallback replay, retention
+  assumptions, `replay_max_messages`, or `replay_window` semantics.
+- **Security:** subscriber-auth boundaries, CORS credential behavior, NATS
+  credential handling, TLS guidance, and any new deployment hardening steps.
+- **Operations:** new or renamed metrics, structured log fields, alert rules,
+  dashboard panels, readiness/liveness behavior, and runbook changes.
+- **Artifacts:** Docker tags, archive checksums, SBOM availability, vulnerability
+  scan status, and image-signing verification instructions.
+
+Suggested release-note shape:
+
+```markdown
+## Operator Impact
+
+- Upgrade urgency:
+- Config changes:
+- Deployment checks:
+- Rollback notes:
+
+## Compatibility
+
+- Caddy:
+- Go:
+- NATS:
+- Replay behavior:
+
+## Verification
+
+- Tests:
+- Docker image:
+- GoReleaser / SBOM / signing:
+```

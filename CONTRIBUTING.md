@@ -7,7 +7,7 @@ get a development environment running and the expectations for contributions.
 
 Requirements:
 
-- Go 1.25+
+- Go 1.26.2+
 - Docker and Docker Compose (for the functional/BDD suite)
 - `xcaddy` if you want to build a custom Caddy binary with additional modules
 
@@ -36,13 +36,40 @@ make test-functional
 ## Coding guidelines
 
 - Run `gofmt -s -w .` and `go vet ./...` before committing.
-- Run `golangci-lint run` locally once it is wired up in CI (see `.golangci.yml`).
+- Run `make lint` locally; it uses the pinned golangci-lint container that
+  matches CI (see `.golangci.yml`).
 - Keep exported symbols documented. New Caddyfile directives must be documented
   in [README.md](README.md) and the handler struct fields in
   [handler.go](handler.go).
 - Prefer small, focused PRs. One logical change per PR.
 - Include unit tests for new behavior. If the change affects the HTTP surface,
   also add a Godog scenario under [features/](features/).
+
+## Contribution checklist
+
+Use this checklist before opening a PR. It mirrors the main CI gates; run the
+subset that matches the change when a full local pass would be unreasonable.
+
+- [ ] `gofmt -l .` returns no files.
+- [ ] `go test -timeout 120s .` passes.
+- [ ] `go test -run '^$' ./...` passes.
+- [ ] `go test -race -timeout 180s .` passes, or the PR explains why the
+  focused CI race policy is sufficient for the change.
+- [ ] `go vet ./...` passes.
+- [ ] `make lint` passes locally, matching the GitHub Actions lint version.
+- [ ] `go run golang.org/x/vuln/cmd/govulncheck@latest ./...` reports no
+  reachable vulnerabilities.
+- [ ] `make test-functional` passes for HTTP, CORS, replay, and Docker/NATS
+  behavior changes.
+- [ ] `make test-functional-matrix` passes for NATS compatibility changes.
+- [ ] `make test-performance` passes for formatter, buffering, replay, or
+  concurrency changes.
+- [ ] Production Docker image changes build and pass
+  `caddy adapt --config /app/Caddyfile` inside the image.
+- [ ] Release tooling changes pass `make release-check` and a GoReleaser
+  snapshot dry run.
+- [ ] Documentation, changelog, and examples are updated for new directives,
+  operational behavior, or upgrade-impacting changes.
 
 ## Commit messages
 

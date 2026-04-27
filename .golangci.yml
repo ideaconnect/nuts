@@ -1,41 +1,50 @@
+version: "2"
+
 run:
   timeout: 5m
   tests: true
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - errcheck
     - govet
     - ineffassign
     - staticcheck
     - unused
-    - gosimple
-    - gofmt
-    - goimports
     - misspell
     - revive
     - gocritic
-
-linters-settings:
-  revive:
+  settings:
+    revive:
+      rules:
+        - name: var-naming
+        - name: exported
+          disabled: true
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - singleCaseSwitch
+  exclusions:
+    generated: lax
+    paths:
+      - ^example/
+      - ^example_docker/
+      - ^functional_test/
     rules:
-      - name: var-naming
-      - name: exported
-        disabled: true
-  gocritic:
-    disabled-checks:
-      - ifElseChain
-      - singleCaseSwitch
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+          - revive
 
-issues:
-  exclude-dirs:
-    - example
-    - example_docker
-    - functional_test
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gocritic
-        - revive
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - ^example/
+      - ^example_docker/
+      - ^functional_test/

@@ -93,12 +93,12 @@ This plan turns the current quality review into an execution checklist. It is in
 
 ## P2: Documentation And Developer Experience
 
-- [ ] P2: Add an architecture diagram showing Caddy, NUTS, NATS JetStream, producers, subscribers, and replay flow.
-- [ ] P2: Add a configuration matrix that lists every directive, default, valid values, JSON field name, and operational notes.
-- [ ] P2: Add a troubleshooting guide for common browser/EventSource and CORS issues.
-- [ ] P2: Add copy-paste examples for production Compose, Kubernetes, and reverse-proxy-protected deployments.
-- [ ] P2: Add a contribution checklist that mirrors the CI gates.
-- [ ] P2: Add release notes guidance for operators upgrading Caddy, Go, NATS, or replay behavior.
+- [x] P2: Add an architecture diagram showing Caddy, NUTS, NATS JetStream, producers, subscribers, and replay flow.
+- [x] P2: Add a configuration matrix that lists every directive, default, valid values, JSON field name, and operational notes.
+- [x] P2: Add a troubleshooting guide for common browser/EventSource and CORS issues.
+- [x] P2: Add copy-paste examples for production Compose, Kubernetes, and reverse-proxy-protected deployments.
+- [x] P2: Add a contribution checklist that mirrors the CI gates.
+- [x] P2: Add release notes guidance for operators upgrading Caddy, Go, NATS, or replay behavior.
 
 ## P2: Product Polish
 
@@ -110,21 +110,21 @@ This plan turns the current quality review into an execution checklist. It is in
 
 ## 10/10 Exit Criteria
 
-- [ ] All P0 items are complete.
-- [ ] High-value P1 items are complete or explicitly rejected with documented rationale.
-- [ ] `gofmt -l .` returns no files.
-- [ ] `go test -timeout 120s .` passes.
-- [ ] `go test -run '^$' ./...` passes.
-- [ ] `go test -race -timeout 180s .` passes or an intentionally focused race-test policy is documented.
-- [ ] `go vet ./...` passes.
-- [ ] `golangci-lint run` passes in CI and in the documented local path.
-- [ ] `govulncheck ./...` reports no reachable vulnerabilities.
-- [ ] `make test-functional` passes repeatedly without flakes.
-- [ ] Docker production image builds and `caddy adapt --config /app/Caddyfile` passes inside the image.
-- [ ] GoReleaser `check` and a snapshot dry run pass.
-- [ ] Functional tests cover both old and current NATS server behavior for multi-topic subscriptions.
-- [ ] Load/stress tests meet documented latency, memory, and concurrency budgets.
-- [ ] Docs explain subscriber authentication boundaries, replay bounds, operational alerts, and deployment hardening.
+- [x] All P0 items are complete.
+- [x] High-value P1 items are complete or explicitly rejected with documented rationale.
+- [x] `gofmt -l .` returns no files.
+- [x] `go test -timeout 120s .` passes.
+- [x] `go test -run '^$' ./...` passes.
+- [x] `go test -race -timeout 180s .` passes or an intentionally focused race-test policy is documented.
+- [x] `go vet ./...` passes.
+- [x] `golangci-lint run` passes in CI and in the documented local path.
+- [x] `govulncheck ./...` reports no reachable vulnerabilities.
+- [x] `make test-functional` passes repeatedly without flakes.
+- [x] Docker production image builds and `caddy adapt --config /app/Caddyfile` passes inside the image.
+- [x] GoReleaser `check` and a snapshot dry run pass.
+- [x] Functional tests cover both old and current NATS server behavior for multi-topic subscriptions.
+- [x] Load/stress tests meet documented latency, memory, and concurrency budgets.
+- [x] Docs explain subscriber authentication boundaries, replay bounds, operational alerts, and deployment hardening.
 
 ## Suggested Execution Order
 

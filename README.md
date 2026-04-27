@@ -20,8 +20,22 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 - **[NATS Authentication](#with-nats-authentication)**: Credentials file, token, or user/password auth for the NUTS-to-NATS connection
 - **Topic Prefixing**: Optional prefix for all NATS subscriptions
 - **[Prometheus Metrics](#prometheus-metrics)**: Built-in `nuts_*` counters and gauges (active connections, messages delivered, slow-client disconnects, replay stats)
-- **[Health Check](#health-check)**: `/healthz` endpoint verifying NATS connectivity and stream availability
+- **[Liveness And Readiness Checks](#liveness-and-readiness-checks)**: `/livez`, `/readyz`, and legacy `/healthz` probe endpoints
 - **[Hub Discovery](#hub-discovery)**: Optional `Link` header with `rel="nuts"` for automatic hub detection
+
+## Documentation Map
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) explains the Caddy, NUTS, NATS JetStream,
+  subscriber, producer, and replay flow.
+- [CONFIGURATION.md](CONFIGURATION.md) is the directive matrix with defaults,
+  JSON field names, valid values, and operational notes.
+- [DEPLOYMENT.md](DEPLOYMENT.md) has copy-paste Compose, Kubernetes, and
+  reverse-proxy-protected deployment examples.
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) covers common EventSource, CORS,
+  replay, Docker, and functional-test issues.
+- [OPERATIONS.md](OPERATIONS.md), [PERFORMANCE.md](PERFORMANCE.md), and
+  [RELEASE.md](RELEASE.md) cover production operations, performance budgets,
+  and release/supply-chain policy.
 
 ## Installation
 
@@ -223,6 +237,9 @@ itself does not read environment variables directly.
 
 ## Configuration
 
+For the complete directive matrix, including JSON field names, defaults,
+validation rules, and production notes, see [CONFIGURATION.md](CONFIGURATION.md).
+
 ### Caddyfile Syntax
 
 ```caddyfile
@@ -252,7 +269,7 @@ nuts {
     client_buffer_size <count>   # Per-connection send buffer (0=default 64)
     replay_max_messages <count>  # Cap replay-fallback messages per connection (default: 0 = unlimited)
     replay_window <seconds>      # Time-bound replay fallback to the last N seconds (default: 0 = all retained)
-    health_path <path>           # Health-check endpoint (empty/default: /healthz)
+    health_path <path>           # Legacy readiness endpoint (empty/default: /healthz)
     live_path <path>             # Process liveness endpoint (empty/default: /livez)
     ready_path <path>            # NATS/stream readiness endpoint (empty/default: /readyz)
     hub_url <url>                # URL for Link header hub discovery (disabled by default)
@@ -862,7 +879,7 @@ make test-functional
 
 # Or step by step:
 docker compose up -d --build
-sleep 5  # Wait for services
+make wait-functional-stack
 cd functional_test && go test -v -timeout 120s ./...
 docker compose down -v
 ```
@@ -896,6 +913,9 @@ CGO_ENABLED=1 go build -race -o caddy ./cmd/caddy
 
 # Format code
 go fmt ./...
+
+# Run the pinned linter container
+make lint
 ```
 
 ### Docker Compose

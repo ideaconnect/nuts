@@ -71,6 +71,18 @@ BDD functional tests driven by [Godog](https://github.com/cucumber/godog). Scena
 
 ---
 
+## Documentation And Operations Files
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) - system and replay diagrams plus ownership boundaries.
+- [CONFIGURATION.md](CONFIGURATION.md) - complete Caddyfile/JSON directive matrix with defaults, valid values, and operational notes.
+- [DEPLOYMENT.md](DEPLOYMENT.md) - production Compose, Kubernetes, and reverse-proxy-protected deployment examples.
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - browser/EventSource, CORS, replay, Docker, and functional-test troubleshooting.
+- [OPERATIONS.md](OPERATIONS.md) - probes, metrics, structured log fields, and incident runbooks.
+- [PERFORMANCE.md](PERFORMANCE.md) - load-test coverage and production performance budgets.
+- [RELEASE.md](RELEASE.md) - release validation, SBOMs, vulnerability scans, signing, and operator release-note guidance.
+
+---
+
 ## Message Flow
 
 ### Publishing (sending messages into the system)
