@@ -31,12 +31,12 @@ This plan turns the current quality review into an execution checklist. It is in
 
 ## P1: Request-Handling Refactor
 
-- [ ] P1: Split `ServeHTTP` into smaller units: health/preflight handling, request parsing, replay cursor parsing, subscription planning, subscription execution, SSE event formatting, and the stream loop.
-- [ ] P1: Introduce a small request/stream plan type that captures topics, full subjects, replay mode, start sequence, and fallback strategy.
-- [ ] P1: Unit-test subscription planning without needing a live NATS server.
-- [ ] P1: Unit-test SSE event formatting directly, including JSON payloads, raw string payloads, metadata timestamps, and max-size rejection.
-- [ ] P1: Replace brittle error-string checks for NATS start-sequence failures with typed/structured detection if the NATS client exposes one.
-- [ ] P1: Keep comments focused on non-obvious behavior after the split; remove comments that merely narrate straightforward code.
+- [x] P1: Split `ServeHTTP` into smaller units: health/preflight handling, request parsing, replay cursor parsing, subscription planning, subscription execution, SSE event formatting, and the stream loop.
+- [x] P1: Introduce a small request/stream plan type that captures topics, full subjects, replay mode, start sequence, and fallback strategy.
+- [x] P1: Unit-test subscription planning without needing a live NATS server.
+- [x] P1: Unit-test SSE event formatting directly, including JSON payloads, raw string payloads, metadata timestamps, and max-size rejection.
+- [x] P1: Replace brittle error-string checks for NATS start-sequence failures with typed/structured detection if the NATS client exposes one.
+- [x] P1: Keep comments focused on non-obvious behavior after the split; remove comments that merely narrate straightforward code.
 
 ## P1: Functional Test Reliability
 

@@ -1678,8 +1678,9 @@ func TestIsReplayStartSequenceError(t *testing.T) {
 	}{
 		{name: "nil", hasLastID: true},
 		{name: "no last id", err: errors.New("start sequence 42 is no longer available"), want: false},
-		{name: "start sequence", err: errors.New("start sequence 42 is no longer available"), hasLastID: true, want: true},
-		{name: "sequence not found", err: errors.New("sequence not found"), hasLastID: true, want: true},
+		{name: "sequence not found api error", err: &nats.APIError{ErrorCode: jsErrCodeSequenceNotFound, Description: "sequence 42 not found"}, hasLastID: true, want: true},
+		{name: "consumer sequence mismatch", err: &nats.ErrConsumerSequenceMismatch{StreamResumeSequence: 42, ConsumerSequence: 1, LastConsumerSequence: 2}, hasLastID: true, want: true},
+		{name: "plain sequence string", err: errors.New("sequence not found"), hasLastID: true, want: false},
 		{name: "unrelated", err: errors.New("stream not found"), hasLastID: true, want: false},
 	}
 

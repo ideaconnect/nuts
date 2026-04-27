@@ -3,6 +3,7 @@ package nuts
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -15,121 +16,118 @@ import (
 	"go.uber.org/zap"
 )
 
-const maxReplayCursor = ^uint64(0)
+const (
+	maxReplayCursor = ^uint64(0)
+
+	// nats.go v1.37 exposes APIError but not this server error-code constant.
+	jsErrCodeSequenceNotFound nats.ErrorCode = 10043
+)
+
+type replayMode string
+
+const (
+	replayModeDeliverNew          replayMode = "deliver_new"
+	replayModeStartSequence       replayMode = "start_sequence"
+	replayModeFallbackDeliverAll  replayMode = "fallback_deliver_all"
+	replayModeFallbackStartTime   replayMode = "fallback_start_time"
+	dropReasonRawPayload          string     = "raw_payload"
+	dropReasonFormattedSSEMessage string     = "formatted_sse_message"
+)
+
+func (m replayMode) isFallback() bool {
+	return m == replayModeFallbackDeliverAll || m == replayModeFallbackStartTime
+}
+
+type replayPlan struct {
+	HasLastID      bool
+	Mode           replayMode
+	StartSequence  uint64
+	FallbackReason string
+}
+
+type streamPlan struct {
+	Topics            []string
+	FullSubjects      []string
+	RequestedSubjects map[string]struct{}
+	Replay            replayPlan
+	FailedTopics      []string
+}
+
+func (p streamPlan) subjectLabel() string {
+	return strings.Join(p.FullSubjects, ",")
+}
+
+type streamInfoSnapshot struct {
+	FirstSeq uint64
+	Subjects []string
+}
+
+type streamRuntime struct {
+	conn     *nats.Conn
+	js       nats.JetStreamContext
+	shutdown <-chan struct{}
+}
+
+type streamRequestError struct {
+	status  int
+	message string
+}
+
+func (e *streamRequestError) write(w http.ResponseWriter) {
+	http.Error(w, e.message, e.status)
+}
+
+type subscriptionResult struct {
+	Subscriptions  []*nats.Subscription
+	FailedTopics   []string
+	ReplayFellBack bool
+}
+
+type formattedMessageEvent struct {
+	Frame       string
+	Subject     string
+	Dropped     bool
+	DropReason  string
+	DropSize    int
+	MetadataErr error
+}
 
 func isReplayStartSequenceError(err error, hasLastID bool) bool {
 	if err == nil || !hasLastID {
 		return false
 	}
-	errMsg := err.Error()
-	return strings.Contains(errMsg, "start sequence") || strings.Contains(errMsg, "sequence not found")
+	var apiErr *nats.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode == jsErrCodeSequenceNotFound {
+		return true
+	}
+	var sequenceMismatch *nats.ErrConsumerSequenceMismatch
+	return errors.As(err, &sequenceMismatch)
 }
 
 // ServeHTTP implements the caddyhttp.MiddlewareHandler interface.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// Health check.
-	if r.Method == http.MethodGet && h.matchesHealthPath(r.URL.Path) {
-		return h.serveHealthCheck(w)
+	if handled, err := h.handleControlRequest(w, r, next); handled {
+		return err
 	}
 
-	// CORS preflight.
-	if r.Method == http.MethodOptions {
-		h.setCORSHeaders(w, r)
-		w.WriteHeader(http.StatusNoContent)
+	plan, requestErr := h.parseStreamRequest(r)
+	if requestErr != nil {
+		requestErr.write(w)
 		return nil
 	}
 
-	// Method check.
-	if r.Method != http.MethodGet {
-		if next == nil {
-			w.Header().Set("Allow", allowedMethodsHeader(h.AllowedMethods))
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return nil
-		}
-		return next.ServeHTTP(w, r)
-	}
-
-	// Topic extraction.
-	topics := r.URL.Query()["topic"]
-	if len(topics) == 0 {
-		// Path shorthand: convert remaining path into a dotted topic.
-		// "/orders/new" → "orders.new". Operators behind a `route /events*`
-		// matcher should put `uri strip_prefix /events` before `nuts` so the
-		// matched prefix is removed from r.URL.Path.
-		path := strings.Trim(r.URL.Path, "/")
-		if path != "" {
-			topics = []string{strings.ReplaceAll(path, "/", ".")}
-		}
-	}
-
-	// Reject topics that contain illegal characters.
-	for _, t := range topics {
-		if !isValidTopic(t) {
-			http.Error(w, "Invalid topic name", http.StatusBadRequest)
-			return nil
-		}
-	}
-
-	if len(topics) == 0 {
-		http.Error(w, "No topics specified. Use ?topic=name or path-based topic", http.StatusBadRequest)
-		return nil
-	}
-
-	// Last-ID / replay.
-	// Parse the client's cursor before writing any response bytes so that
-	// invalid values produce a clean 400 (for explicit ?last-id=) or a
-	// fall-through to DeliverNew (for the auto-set Last-Event-ID header).
-	lastIDStr := r.URL.Query().Get("last-id")
-	queryProvided := lastIDStr != ""
-	if lastIDStr == "" {
-		lastIDStr = r.Header.Get("Last-Event-ID")
-	}
-	var nextSequence uint64
-	var hasLastID bool
-	if lastIDStr != "" {
-		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
-		if err != nil || parsedID == maxReplayCursor {
-			if queryProvided {
-				http.Error(w, "Invalid last-id value: must be an unsigned integer below the maximum cursor value", http.StatusBadRequest)
-				return nil
-			}
-			// Browser-supplied Last-Event-ID is unparseable. Fall back to
-			// DeliverNew so the client does not loop forever on a bad value.
-			fields := []zap.Field{zap.String("value", lastIDStr)}
-			if err != nil {
-				fields = append(fields, zap.Error(err))
-			} else {
-				fields = append(fields, zap.String("reason", "cursor would overflow"))
-			}
-			h.logger.Warn("ignoring unparseable Last-Event-ID header; resuming with DeliverNew",
-				fields...)
-		} else {
-			nextSequence = parsedID + 1
-			hasLastID = true
-			metricsReplayRequests.Inc()
-		}
-	}
-
-	// JetStream subscription setup.
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return nil
 	}
 
-	h.mu.RLock()
-	conn := h.conn
-	js := h.js
-	shutdown := h.shutdown
-	h.mu.RUnlock()
-
-	if js == nil {
+	runtime := h.currentStreamRuntime()
+	if runtime.js == nil {
 		http.Error(w, "JetStream not available", http.StatusServiceUnavailable)
 		return nil
 	}
 
-	// Connection cap. Reserve the slot before opening subscriptions so we
-	// don't churn JetStream consumers for rejected requests.
 	if h.MaxConnections > 0 {
 		if !h.reserveConnSlot() {
 			metricsConnectionsRejected.WithLabelValues("max_connections").Inc()
@@ -140,6 +138,123 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		defer h.releaseConnSlot()
 	}
 
+	msgChan, slowClient, done, enqueueMessage := h.newMessageQueue()
+	snapshot := h.readStreamSnapshot(runtime.js, plan)
+	plan = h.planSubscription(plan, snapshot)
+	enqueueRequestedMessage := plan.requestedMessageHandler(enqueueMessage)
+
+	result := h.executeSubscriptionPlan(runtime.js, runtime.conn, plan, enqueueMessage, enqueueRequestedMessage)
+	if len(result.FailedTopics) > 0 {
+		h.cleanupStream(done, result.Subscriptions)
+		http.Error(w, fmt.Sprintf("Failed to subscribe to requested topics: %s", strings.Join(result.FailedTopics, ", ")), http.StatusServiceUnavailable)
+		return nil
+	}
+	if len(result.Subscriptions) == 0 {
+		h.cleanupStream(done, nil)
+		http.Error(w, "Failed to subscribe to any requested topics", http.StatusServiceUnavailable)
+		return nil
+	}
+	defer h.cleanupStream(done, result.Subscriptions)
+
+	return h.serveStream(w, flusher, r, plan, msgChan, slowClient, runtime.shutdown, result.ReplayFellBack)
+}
+
+func (h *Handler) handleControlRequest(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) (bool, error) {
+	if r.Method == http.MethodGet && h.matchesHealthPath(r.URL.Path) {
+		return true, h.serveHealthCheck(w)
+	}
+
+	if r.Method == http.MethodOptions {
+		h.setCORSHeaders(w, r)
+		w.WriteHeader(http.StatusNoContent)
+		return true, nil
+	}
+
+	if r.Method != http.MethodGet {
+		if next == nil {
+			w.Header().Set("Allow", allowedMethodsHeader(h.AllowedMethods))
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return true, nil
+		}
+		return true, next.ServeHTTP(w, r)
+	}
+	return false, nil
+}
+
+func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamRequestError) {
+	topics := r.URL.Query()["topic"]
+	if len(topics) == 0 {
+		path := strings.Trim(r.URL.Path, "/")
+		if path != "" {
+			topics = []string{strings.ReplaceAll(path, "/", ".")}
+		}
+	}
+
+	// Reject topics that contain illegal characters.
+	for _, t := range topics {
+		if !isValidTopic(t) {
+			return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Invalid topic name"}
+		}
+	}
+
+	if len(topics) == 0 {
+		return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "No topics specified. Use ?topic=name or path-based topic"}
+	}
+
+	plan := streamPlan{
+		RequestedSubjects: make(map[string]struct{}, len(topics)),
+		Replay:            replayPlan{Mode: replayModeDeliverNew},
+	}
+	for _, topic := range topics {
+		fullSubject := h.TopicPrefix + topic
+		if _, exists := plan.RequestedSubjects[fullSubject]; exists {
+			continue
+		}
+		plan.RequestedSubjects[fullSubject] = struct{}{}
+		plan.Topics = append(plan.Topics, topic)
+		plan.FullSubjects = append(plan.FullSubjects, fullSubject)
+	}
+
+	lastIDStr := r.URL.Query().Get("last-id")
+	queryProvided := lastIDStr != ""
+	if lastIDStr == "" {
+		lastIDStr = r.Header.Get("Last-Event-ID")
+	}
+	if lastIDStr != "" {
+		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
+		if err != nil || parsedID == maxReplayCursor {
+			if queryProvided {
+				return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Invalid last-id value: must be an unsigned integer below the maximum cursor value"}
+			}
+			fields := []zap.Field{zap.String("value", lastIDStr)}
+			if err != nil {
+				fields = append(fields, zap.Error(err))
+			} else {
+				fields = append(fields, zap.String("reason", "cursor would overflow"))
+			}
+			if h.logger != nil {
+				h.logger.Warn("ignoring unparseable Last-Event-ID header; resuming with DeliverNew", fields...)
+			}
+		} else {
+			plan.Replay = replayPlan{
+				HasLastID:     true,
+				Mode:          replayModeStartSequence,
+				StartSequence: parsedID + 1,
+			}
+			metricsReplayRequests.Inc()
+		}
+	}
+	return plan, nil
+}
+
+func (h *Handler) currentStreamRuntime() streamRuntime {
+	h.mu.RLock()
+	runtime := streamRuntime{conn: h.conn, js: h.js, shutdown: h.shutdown}
+	h.mu.RUnlock()
+	return runtime
+}
+
+func (h *Handler) newMessageQueue() (chan *nats.Msg, chan string, chan struct{}, nats.MsgHandler) {
 	bufSize := h.ClientBufferSize
 	if bufSize <= 0 {
 		bufSize = defaultClientBufferSize
@@ -170,181 +285,148 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			}
 		}
 	}
+	return msgChan, slowClient, done, enqueueMessage
+}
 
-	var subscriptions []*nats.Subscription
-	var subscribedTopics []string
-	var failedTopics []string
-	replayFellBack := false
-	requestedSubjects := make(map[string]struct{}, len(topics))
-	var fullTopics []string
-	for _, topic := range topics {
-		fullTopic := h.TopicPrefix + topic
-		if _, exists := requestedSubjects[fullTopic]; exists {
-			continue
-		}
-		requestedSubjects[fullTopic] = struct{}{}
-		fullTopics = append(fullTopics, fullTopic)
-		subscribedTopics = append(subscribedTopics, topic)
-	}
-	cleanupSubscriptions := func() {
-		close(done)
-		for _, sub := range subscriptions {
-			if err := sub.Unsubscribe(); err != nil {
-				h.logger.Warn("failed to unsubscribe",
-					zap.String("topic", sub.Subject),
-					zap.Error(err))
-			}
-		}
-	}
-	enqueueRequestedMessage := func(msg *nats.Msg) {
-		if _, ok := requestedSubjects[msg.Subject]; !ok {
+func (p streamPlan) requestedMessageHandler(enqueueMessage nats.MsgHandler) nats.MsgHandler {
+	return func(msg *nats.Msg) {
+		if _, ok := p.RequestedSubjects[msg.Subject]; !ok {
 			return
 		}
 		enqueueMessage(msg)
 	}
+}
 
-	// Pre-check the stream's retained range so we can detect "requested
-	// sequence is below the purged frontier" before Subscribe() silently
-	// starts us at FirstSeq and replays everything. This is the common
-	// replay-storm trigger in modern NATS — StartSequence(N) where N <
-	// FirstSeq does not error.
-	var streamFirstSeq uint64
-	var streamSubjects []string
-	if hasLastID || len(fullTopics) > 1 {
+func (h *Handler) readStreamSnapshot(js nats.JetStreamContext, plan streamPlan) streamInfoSnapshot {
+	if plan.Replay.HasLastID || len(plan.FullSubjects) > 1 {
 		if info, infoErr := js.StreamInfo(h.StreamName); infoErr == nil {
-			streamFirstSeq = info.State.FirstSeq
-			streamSubjects = info.Config.Subjects
+			return streamInfoSnapshot{FirstSeq: info.State.FirstSeq, Subjects: info.Config.Subjects}
 		} else {
 			h.logger.Debug("failed to read StreamInfo for request pre-check",
 				zap.Error(infoErr))
 		}
 	}
-	if len(fullTopics) > 1 && len(streamSubjects) > 0 {
-		for idx, fullTopic := range fullTopics {
-			if !subjectAllowedByStream(fullTopic, streamSubjects) {
-				failedTopics = append(failedTopics, subscribedTopics[idx])
+	return streamInfoSnapshot{}
+}
+
+func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot) streamPlan {
+	if len(plan.FullSubjects) > 1 && len(snapshot.Subjects) > 0 {
+		for idx, fullSubject := range plan.FullSubjects {
+			if !subjectAllowedByStream(fullSubject, snapshot.Subjects) {
+				plan.FailedTopics = append(plan.FailedTopics, plan.Topics[idx])
 			}
 		}
-		if len(failedTopics) > 0 {
-			cleanupSubscriptions()
-			http.Error(w, fmt.Sprintf("Failed to subscribe to requested topics: %s", strings.Join(failedTopics, ", ")), http.StatusServiceUnavailable)
-			return nil
-		}
 	}
-
-	buildFallbackOpts := func(subjectLabel string, requested uint64, reason string) []nats.SubOpt {
-		metricsReplayFallbacks.Inc()
-		replayFellBack = true
-		opts := []nats.SubOpt{
-			nats.BindStream(h.StreamName),
-			nats.AckNone(),
-		}
-		if h.ReplayWindow > 0 {
-			start := time.Now().Add(-time.Duration(h.ReplayWindow) * time.Second)
-			opts = append(opts, nats.StartTime(start))
-			h.logger.Warn("replay fallback: using time-bounded window",
-				zap.String("topic", subjectLabel),
-				zap.Uint64("requested_sequence", requested),
-				zap.String("reason", reason),
-				zap.Int("replay_window_seconds", h.ReplayWindow),
-			)
-		} else {
-			opts = append(opts, nats.DeliverAll())
-			h.logger.Warn("replay fallback: delivering all retained messages",
-				zap.String("topic", subjectLabel),
-				zap.Uint64("requested_sequence", requested),
-				zap.String("reason", reason),
-			)
-		}
-		return opts
+	if len(plan.FailedTopics) > 0 {
+		return plan
 	}
-	buildSubscriptionOpts := func(subjectLabel string) ([]nats.SubOpt, bool) {
-		var opts []nats.SubOpt
-		belowRetention := hasLastID && streamFirstSeq > 0 && nextSequence < streamFirstSeq
-
-		switch {
-		case belowRetention:
-			opts = buildFallbackOpts(subjectLabel, nextSequence, "sequence below retention")
-		case hasLastID:
-			opts = []nats.SubOpt{
-				nats.BindStream(h.StreamName),
-				nats.AckNone(),
-				nats.StartSequence(nextSequence),
-			}
-			h.logger.Debug("subscribing from sequence",
-				zap.String("topic", subjectLabel),
-				zap.Uint64("start_sequence", nextSequence),
-			)
-		default:
-			opts = []nats.SubOpt{
-				nats.BindStream(h.StreamName),
-				nats.AckNone(),
-				nats.DeliverNew(),
-			}
-		}
-		return opts, belowRetention
+	if plan.Replay.HasLastID && snapshot.FirstSeq > 0 && plan.Replay.StartSequence < snapshot.FirstSeq {
+		plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence below retention")
 	}
+	return plan
+}
 
-	if len(fullTopics) == 1 {
-		fullTopic := fullTopics[0]
-		opts, belowRetention := buildSubscriptionOpts(fullTopic)
-		sub, err := js.Subscribe(fullTopic, enqueueMessage, opts...)
-
-		// Belt-and-suspenders: preserved error-string fallback for the rare
-		// case where Subscribe rejects StartSequence instead of silently
-		// adjusting. No-op on modern NATS but harmless.
-		if err != nil && !belowRetention && isReplayStartSequenceError(err, hasLastID) {
-			sub, err = js.Subscribe(fullTopic, enqueueMessage,
-				buildFallbackOpts(fullTopic, nextSequence, "subscribe-time start sequence error")...)
-		}
-
-		if err != nil {
-			metricsSubscriptionErrors.Inc()
-			h.logger.Error("failed to subscribe to topic",
-				zap.String("topic", fullTopic),
-				zap.Error(err),
-			)
-			failedTopics = append(failedTopics, subscribedTopics[0])
-		} else {
-			subscriptions = append(subscriptions, sub)
-			h.logger.Debug("subscribed to topic", zap.String("topic", fullTopic))
-		}
+func (h *Handler) fallbackReplayPlan(replay replayPlan, reason string) replayPlan {
+	replay.FallbackReason = reason
+	if h.ReplayWindow > 0 {
+		replay.Mode = replayModeFallbackStartTime
 	} else {
-		subjectLabel := strings.Join(fullTopics, ",")
-		opts, belowRetention := buildSubscriptionOpts(subjectLabel)
-		sub, err := h.subscribeToMultipleTopics(js, conn, fullTopics, opts, enqueueRequestedMessage)
-		if err != nil && !belowRetention && isReplayStartSequenceError(err, hasLastID) {
-			sub, err = h.subscribeToMultipleTopics(js, conn, fullTopics,
-				buildFallbackOpts(subjectLabel, nextSequence, "subscribe-time start sequence error"), enqueueRequestedMessage)
-		}
-		if err != nil {
-			metricsSubscriptionErrors.Inc()
-			h.logger.Error("failed to subscribe to topics",
-				zap.Strings("topics", fullTopics),
+		replay.Mode = replayModeFallbackDeliverAll
+	}
+	return replay
+}
+
+func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
+	opts := []nats.SubOpt{nats.BindStream(h.StreamName), nats.AckNone()}
+	switch plan.Replay.Mode {
+	case replayModeStartSequence:
+		opts = append(opts, nats.StartSequence(plan.Replay.StartSequence))
+		h.logger.Debug("subscribing from sequence",
+			zap.String("topic", plan.subjectLabel()),
+			zap.Uint64("start_sequence", plan.Replay.StartSequence),
+		)
+	case replayModeFallbackStartTime:
+		metricsReplayFallbacks.Inc()
+		start := time.Now().Add(-time.Duration(h.ReplayWindow) * time.Second)
+		opts = append(opts, nats.StartTime(start))
+		h.logger.Warn("replay fallback: using time-bounded window",
+			zap.String("topic", plan.subjectLabel()),
+			zap.Uint64("requested_sequence", plan.Replay.StartSequence),
+			zap.String("reason", plan.Replay.FallbackReason),
+			zap.Int("replay_window_seconds", h.ReplayWindow),
+		)
+	case replayModeFallbackDeliverAll:
+		metricsReplayFallbacks.Inc()
+		opts = append(opts, nats.DeliverAll())
+		h.logger.Warn("replay fallback: delivering all retained messages",
+			zap.String("topic", plan.subjectLabel()),
+			zap.Uint64("requested_sequence", plan.Replay.StartSequence),
+			zap.String("reason", plan.Replay.FallbackReason),
+		)
+	default:
+		opts = append(opts, nats.DeliverNew())
+	}
+	return opts
+}
+
+func (h *Handler) executeSubscriptionPlan(js nats.JetStreamContext, conn *nats.Conn, plan streamPlan, enqueueMessage, enqueueRequestedMessage nats.MsgHandler) subscriptionResult {
+	if len(plan.FailedTopics) > 0 {
+		return subscriptionResult{FailedTopics: append([]string{}, plan.FailedTopics...)}
+	}
+
+	activePlan := plan
+	sub, err := h.subscribeWithPlan(js, conn, activePlan, enqueueMessage, enqueueRequestedMessage)
+	if err != nil && !activePlan.Replay.Mode.isFallback() && isReplayStartSequenceError(err, activePlan.Replay.HasLastID) {
+		activePlan.Replay = h.fallbackReplayPlan(activePlan.Replay, "subscribe-time start sequence error")
+		sub, err = h.subscribeWithPlan(js, conn, activePlan, enqueueMessage, enqueueRequestedMessage)
+	}
+	if err != nil {
+		metricsSubscriptionErrors.Inc()
+		if len(activePlan.FullSubjects) == 1 {
+			h.logger.Error("failed to subscribe to topic",
+				zap.String("topic", activePlan.FullSubjects[0]),
 				zap.Error(err),
 			)
-			failedTopics = append(failedTopics, subscribedTopics...)
-		} else {
-			subscriptions = append(subscriptions, sub)
-			h.logger.Debug("subscribed to topics", zap.Strings("topics", fullTopics))
+			return subscriptionResult{FailedTopics: []string{activePlan.Topics[0]}}
+		}
+		h.logger.Error("failed to subscribe to topics",
+			zap.Strings("topics", activePlan.FullSubjects),
+			zap.Error(err),
+		)
+		return subscriptionResult{FailedTopics: append([]string{}, activePlan.Topics...)}
+	}
+
+	if len(activePlan.FullSubjects) == 1 {
+		h.logger.Debug("subscribed to topic", zap.String("topic", activePlan.FullSubjects[0]))
+	} else {
+		h.logger.Debug("subscribed to topics", zap.Strings("topics", activePlan.FullSubjects))
+	}
+	return subscriptionResult{
+		Subscriptions:  []*nats.Subscription{sub},
+		ReplayFellBack: activePlan.Replay.Mode.isFallback(),
+	}
+}
+
+func (h *Handler) subscribeWithPlan(js nats.JetStreamContext, conn *nats.Conn, plan streamPlan, enqueueMessage, enqueueRequestedMessage nats.MsgHandler) (*nats.Subscription, error) {
+	opts := h.subscriptionOptions(plan)
+	if len(plan.FullSubjects) == 1 {
+		return js.Subscribe(plan.FullSubjects[0], enqueueMessage, opts...)
+	}
+	return h.subscribeToMultipleTopics(js, conn, plan.FullSubjects, opts, enqueueRequestedMessage)
+}
+
+func (h *Handler) cleanupStream(done chan struct{}, subscriptions []*nats.Subscription) {
+	close(done)
+	for _, sub := range subscriptions {
+		if err := sub.Unsubscribe(); err != nil {
+			h.logger.Warn("failed to unsubscribe",
+				zap.String("topic", sub.Subject),
+				zap.Error(err))
 		}
 	}
+}
 
-	if len(failedTopics) > 0 {
-		cleanupSubscriptions()
-		http.Error(w, fmt.Sprintf("Failed to subscribe to requested topics: %s", strings.Join(failedTopics, ", ")), http.StatusServiceUnavailable)
-		return nil
-	}
-
-	if len(subscriptions) == 0 {
-		cleanupSubscriptions()
-		http.Error(w, "Failed to subscribe to any requested topics", http.StatusServiceUnavailable)
-		return nil
-	}
-
-	defer cleanupSubscriptions()
-
-	// --- Streaming mode ---
+func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *http.Request, plan streamPlan, msgChan <-chan *nats.Msg, slowClient <-chan string, shutdown <-chan struct{}, replayFellBack bool) error {
 	metricsActiveConnections.Inc()
 	defer metricsActiveConnections.Dec()
 
@@ -357,7 +439,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"nuts\"", h.HubURL))
 	}
 
-	if err := writeSSEChunk(w, flusher, fmt.Sprintf("event: connected\ndata: {\"topics\":%s}\n\n", toJSON(subscribedTopics))); err != nil {
+	if err := writeSSEChunk(w, flusher, formatConnectedEvent(plan.Topics)); err != nil {
 		h.logger.Debug("failed to write connected event", zap.Error(err))
 		return nil
 	}
@@ -365,8 +447,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	heartbeat := time.NewTicker(time.Duration(h.HeartbeatInterval) * time.Second)
 	defer heartbeat.Stop()
 
-	// replayDelivered counts messages delivered on a fallback subscription.
-	// It is only consulted when replayFellBack && ReplayMaxMessages > 0.
 	replayDelivered := 0
 
 	ctx := r.Context()
@@ -393,61 +473,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				continue
 			}
 
-			// Cheap pre-check: drop oversized messages BEFORE parsing JSON
-			// so a hostile producer cannot force unbounded allocations.
-			// MaxEventSize < 0 means "unlimited".
-			if h.MaxEventSize > 0 && len(msg.Data) > h.MaxEventSize {
-				metricsMessagesDropped.Inc()
-				h.logger.Warn("dropping oversized NATS payload",
-					zap.String("topic", msg.Subject),
-					zap.Int("payload_size", len(msg.Data)),
-					zap.Int("max_event_size", h.MaxEventSize),
-				)
+			formatted := h.formatMessageEvent(msg, time.Now())
+			if formatted.MetadataErr != nil {
+				h.logger.Warn("failed to read JetStream metadata", zap.String("topic", formatted.Subject), zap.Error(formatted.MetadataErr))
+			}
+			if formatted.Dropped {
+				h.recordDroppedMessage(formatted)
 				continue
 			}
 
-			eventTopic := strings.TrimPrefix(msg.Subject, h.TopicPrefix)
-			payload := messageEventPayload{
-				Topic:   eventTopic,
-				Payload: tryParseJSON(msg.Data),
-				Time:    time.Now().UTC().Format(time.RFC3339),
-			}
-			var eventID uint64
-			hasEventID := false
-
-			meta, metaErr := msg.Metadata()
-			if metaErr != nil {
-				h.logger.Warn("failed to read JetStream metadata", zap.String("topic", msg.Subject), zap.Error(metaErr))
-			} else {
-				payload.Time = meta.Timestamp.UTC().Format(time.RFC3339)
-				eventID = meta.Sequence.Stream
-				hasEventID = true
-			}
-
-			var event strings.Builder
-			event.Grow(len(msg.Data) + 128)
-			if hasEventID {
-				event.WriteString("id: ")
-				event.WriteString(strconv.FormatUint(eventID, 10))
-				event.WriteString("\n")
-			}
-			event.WriteString("event: message\n")
-			event.WriteString("data: ")
-			event.WriteString(toJSON(payload))
-			event.WriteString("\n\n")
-
-			// Final guard against oversized formatted events (JSON inflation).
-			if h.MaxEventSize > 0 && event.Len() > h.MaxEventSize {
-				metricsMessagesDropped.Inc()
-				h.logger.Warn("dropping oversized SSE event",
-					zap.String("topic", msg.Subject),
-					zap.Int("event_size", event.Len()),
-					zap.Int("max_event_size", h.MaxEventSize),
-				)
-				continue
-			}
-
-			if err := writeSSEChunk(w, flusher, event.String()); err != nil {
+			if err := writeSSEChunk(w, flusher, formatted.Frame); err != nil {
 				h.logger.Debug("failed to write message event", zap.String("topic", msg.Subject), zap.Error(err))
 				return nil
 			}
@@ -465,11 +500,84 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			}
 
 		case <-heartbeat.C:
-			if err := writeSSEChunk(w, flusher, fmt.Sprintf(": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339))); err != nil {
+			if err := writeSSEChunk(w, flusher, formatHeartbeatEvent(time.Now())); err != nil {
 				h.logger.Debug("failed to write heartbeat", zap.Error(err))
 				return nil
 			}
 		}
+	}
+}
+
+func formatConnectedEvent(topics []string) string {
+	return fmt.Sprintf("event: connected\ndata: {\"topics\":%s}\n\n", toJSON(topics))
+}
+
+func formatHeartbeatEvent(now time.Time) string {
+	return fmt.Sprintf(": heartbeat %s\n\n", now.UTC().Format(time.RFC3339))
+}
+
+func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMessageEvent {
+	formatted := formattedMessageEvent{Subject: msg.Subject}
+	if h.MaxEventSize > 0 && len(msg.Data) > h.MaxEventSize {
+		formatted.Dropped = true
+		formatted.DropReason = dropReasonRawPayload
+		formatted.DropSize = len(msg.Data)
+		return formatted
+	}
+
+	payload := messageEventPayload{
+		Topic:   strings.TrimPrefix(msg.Subject, h.TopicPrefix),
+		Payload: tryParseJSON(msg.Data),
+		Time:    now.UTC().Format(time.RFC3339),
+	}
+	var eventID uint64
+	hasEventID := false
+	meta, metaErr := msg.Metadata()
+	if metaErr != nil {
+		formatted.MetadataErr = metaErr
+	} else {
+		payload.Time = meta.Timestamp.UTC().Format(time.RFC3339)
+		eventID = meta.Sequence.Stream
+		hasEventID = true
+	}
+
+	var event strings.Builder
+	event.Grow(len(msg.Data) + 128)
+	if hasEventID {
+		event.WriteString("id: ")
+		event.WriteString(strconv.FormatUint(eventID, 10))
+		event.WriteString("\n")
+	}
+	event.WriteString("event: message\n")
+	event.WriteString("data: ")
+	event.WriteString(toJSON(payload))
+	event.WriteString("\n\n")
+
+	if h.MaxEventSize > 0 && event.Len() > h.MaxEventSize {
+		formatted.Dropped = true
+		formatted.DropReason = dropReasonFormattedSSEMessage
+		formatted.DropSize = event.Len()
+		return formatted
+	}
+	formatted.Frame = event.String()
+	return formatted
+}
+
+func (h *Handler) recordDroppedMessage(formatted formattedMessageEvent) {
+	metricsMessagesDropped.Inc()
+	switch formatted.DropReason {
+	case dropReasonRawPayload:
+		h.logger.Warn("dropping oversized NATS payload",
+			zap.String("topic", formatted.Subject),
+			zap.Int("payload_size", formatted.DropSize),
+			zap.Int("max_event_size", h.MaxEventSize),
+		)
+	case dropReasonFormattedSSEMessage:
+		h.logger.Warn("dropping oversized SSE event",
+			zap.String("topic", formatted.Subject),
+			zap.Int("event_size", formatted.DropSize),
+			zap.Int("max_event_size", h.MaxEventSize),
+		)
 	}
 }
 
