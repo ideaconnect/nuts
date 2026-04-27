@@ -40,12 +40,12 @@ This plan turns the current quality review into an execution checklist. It is in
 
 ## P1: Functional Test Reliability
 
-- [ ] P1: Replace fixed sleeps in `functional_test/steps_test.go` with polling helpers that wait for observable conditions.
-- [ ] P1: Add wait helpers for connected events, target message counts, heartbeat comments, stream availability, and client disconnect completion.
-- [ ] P1: Run functional tests with `-count=1` in CI or Make targets when validating real Docker/NATS behavior.
-- [ ] P1: Add retry-safe cleanup for functional test state so failed scenarios do not contaminate later scenarios.
-- [ ] P1: Add a CI stress pass that runs the functional suite multiple times to detect flakes before release.
-- [ ] P1: Capture service logs automatically when functional tests fail in CI.
+- [x] P1: Replace fixed sleeps in `functional_test/steps_test.go` with polling helpers that wait for observable conditions.
+- [x] P1: Add wait helpers for connected events, target message counts, heartbeat comments, stream availability, and client disconnect completion.
+- [x] P1: Run functional tests with `-count=1` in CI or Make targets when validating real Docker/NATS behavior.
+- [x] P1: Add retry-safe cleanup for functional test state so failed scenarios do not contaminate later scenarios.
+- [x] P1: Add a CI stress pass that runs the functional suite multiple times to detect flakes before release.
+- [x] P1: Capture service logs automatically when functional tests fail in CI.
 
 ## P1: Compatibility And NATS Behavior
 

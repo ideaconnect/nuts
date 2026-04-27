@@ -57,5 +57,4 @@ Feature: SSE Streaming with JetStream
 
   Scenario: Heartbeat keeps connection alive
     Given I am connected to SSE endpoint "/events?topic=heartbeat"
-    When I wait for 2 seconds
     Then I should receive a heartbeat comment

@@ -58,14 +58,17 @@ jobs:
       - name: Run govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
-      - name: Start functional test stack
-        run: make docker-up
-
       - name: Run functional tests
         env:
           TEST_BASE_URL: http://localhost:8080
           TEST_NATS_URL: nats://localhost:4222
-        run: cd functional_test && go test -v -timeout 120s ./...
+        run: make test-functional
+
+      - name: Run functional test stress pass
+        env:
+          TEST_BASE_URL: http://localhost:8080
+          TEST_NATS_URL: nats://localhost:4222
+        run: make test-functional-stress FUNCTIONAL_TEST_STRESS_COUNT=3
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
@@ -78,9 +81,6 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Stop functional test stack
-        if: always()
-        run: make docker-down
 
   docker-build:
     needs: test
