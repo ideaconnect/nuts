@@ -1,0 +1,47 @@
+groups:
+  - name: nuts.rules
+    rules:
+      - alert: NutsSlowClientDisconnectsHigh
+        expr: rate(nuts_slow_client_disconnects_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS is disconnecting slow SSE clients
+          description: "Slow-client disconnects are above 1/sec for {{ $labels.job }}. Check client processing speed, proxy buffering, and client_buffer_size."
+
+      - alert: NutsSubscriptionErrorsHigh
+        expr: increase(nuts_subscription_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: NUTS JetStream subscription errors detected
+          description: "NUTS failed to create JetStream subscriptions for {{ $labels.job }}. Check stream availability, subject filters, NATS credentials, and NATS server health."
+
+      - alert: NutsReplayFallbackSpike
+        expr: rate(nuts_replay_fallbacks_total[5m]) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS replay fallback rate is elevated
+          description: "Replay fallbacks are above 0.2/sec for {{ $labels.job }}. Clients may be reconnecting with stale Last-Event-ID values or retention may be too short."
+
+      - alert: NutsReplayCapReachedHigh
+        expr: rate(nuts_replay_cap_reached_total[5m]) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS replay cap is closing many streams
+          description: "replay_max_messages is being reached frequently for {{ $labels.job }}. Check for replay storms and tune replay_window or replay_max_messages."
+
+      - alert: NutsMaxConnectionRejections
+        expr: increase(nuts_connections_rejected_total{reason="max_connections"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS max_connections is rejecting clients
+          description: "NUTS rejected SSE clients because max_connections was reached for {{ $labels.job }}. Check active clients, instance capacity, and edge retry behavior."

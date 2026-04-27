@@ -75,11 +75,11 @@ This plan turns the current quality review into an execution checklist. It is in
 
 ## P1: Observability And Operations
 
-- [ ] P1: Add example Prometheus alert rules for high disconnect rates, subscription errors, replay fallback spikes, and max-connection rejections.
-- [ ] P1: Add a dashboard example for active clients, delivered messages, drops, replay activity, and NATS connectivity.
-- [ ] P1: Add structured log fields consistently for request topics, subject labels, replay mode, and disconnect reason.
-- [ ] P1: Consider a readiness endpoint distinct from liveness if deployments need separate orchestration semantics.
-- [ ] P1: Add an operations runbook for common incidents: NATS down, stream missing, replay storm, slow consumers, and CORS misconfiguration.
+- [x] P1: Add example Prometheus alert rules for high disconnect rates, subscription errors, replay fallback spikes, and max-connection rejections.
+- [x] P1: Add a dashboard example for active clients, delivered messages, drops, replay activity, and NATS connectivity.
+- [x] P1: Add structured log fields consistently for request topics, subject labels, replay mode, and disconnect reason.
+- [x] P1: Consider a readiness endpoint distinct from liveness if deployments need separate orchestration semantics.
+- [x] P1: Add an operations runbook for common incidents: NATS down, stream missing, replay storm, slow consumers, and CORS misconfiguration.
 
 ## P1: CI, Release, And Supply Chain
 

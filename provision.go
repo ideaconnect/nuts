@@ -25,6 +25,12 @@ const defaultClientBufferSize = 64
 // defaultHealthPath is used when no health_path directive is configured.
 const defaultHealthPath = "/healthz"
 
+// defaultLivePath is used when no live_path directive is configured.
+const defaultLivePath = "/livez"
+
+// defaultReadyPath is used when no ready_path directive is configured.
+const defaultReadyPath = "/readyz"
+
 // Provision sets up the handler.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
@@ -73,6 +79,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	if h.HealthPath == "" {
 		h.HealthPath = defaultHealthPath
+	}
+	if h.LivePath == "" {
+		h.LivePath = defaultLivePath
+	}
+	if h.ReadyPath == "" {
+		h.ReadyPath = defaultReadyPath
 	}
 
 	// Create the shutdown signal before opening any sockets so that if
@@ -123,6 +135,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		zap.String("nats_url", redactURL(h.NatsURL)),
 		zap.String("stream_name", h.StreamName),
 		zap.String("topic_prefix", h.TopicPrefix),
+		zap.String("health_path", h.HealthPath),
+		zap.String("live_path", h.LivePath),
+		zap.String("ready_path", h.ReadyPath),
 	)
 
 	return nil

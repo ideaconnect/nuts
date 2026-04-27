@@ -197,6 +197,18 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.HealthPath = d.Val()
 
+			case "live_path":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.LivePath = d.Val()
+
+			case "ready_path":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.ReadyPath = d.Val()
+
 			case "hub_url":
 				if !d.NextArg() {
 					return d.ArgErr()

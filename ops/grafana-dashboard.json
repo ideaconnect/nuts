@@ -1,0 +1,123 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "sum(nuts_active_connections{job=~\"$job\"})", "legendFormat": "active clients", "refId": "A" }
+      ],
+      "title": "Active SSE Clients",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(nuts_messages_delivered_total{job=~\"$job\"}[5m]))", "legendFormat": "delivered/sec", "refId": "A" }
+      ],
+      "title": "Delivered Messages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(nuts_messages_dropped_total{job=~\"$job\"}[5m]))", "legendFormat": "dropped/sec", "refId": "A" }
+      ],
+      "title": "Dropped Messages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(nuts_slow_client_disconnects_total{job=~\"$job\"}[5m]))", "legendFormat": "slow disconnects/sec", "refId": "A" }
+      ],
+      "title": "Slow Client Disconnects",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 6 },
+      "id": 5,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(nuts_replay_requests_total{job=~\"$job\"}[5m]))", "legendFormat": "replay requests/sec", "refId": "A" },
+        { "expr": "sum(rate(nuts_replay_fallbacks_total{job=~\"$job\"}[5m]))", "legendFormat": "fallbacks/sec", "refId": "B" },
+        { "expr": "sum(rate(nuts_replay_cap_reached_total{job=~\"$job\"}[5m]))", "legendFormat": "caps/sec", "refId": "C" }
+      ],
+      "title": "Replay Activity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 6 },
+      "id": 6,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(nuts_subscription_errors_total{job=~\"$job\"}[5m]))", "legendFormat": "subscription errors/sec", "refId": "A" },
+        { "expr": "sum(rate(nuts_connections_rejected_total{job=~\"$job\",reason=\"max_connections\"}[5m]))", "legendFormat": "max connection rejections/sec", "refId": "B" }
+      ],
+      "title": "Errors And Rejections",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "mappings": [{ "options": { "0": { "text": "not ready" }, "1": { "text": "ready" } }, "type": "value" }], "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 13 },
+      "id": 7,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "min(probe_success{job=~\"$blackbox_job\",instance=~\"$ready_instance\"})", "legendFormat": "ready", "refId": "A" }
+      ],
+      "title": "NATS Readiness Via /readyz",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "mappings": [{ "options": { "0": { "text": "down" }, "1": { "text": "up" } }, "type": "value" }], "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 13 },
+      "id": 8,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "min(up{job=~\"$job\"})", "legendFormat": "scrape", "refId": "A" }
+      ],
+      "title": "Caddy Metrics Scrape",
+      "type": "stat"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["nuts", "sse", "nats"],
+  "templating": {
+    "list": [
+      { "current": { "selected": false, "text": ".*", "value": ".*" }, "hide": 0, "label": "NUTS metrics job", "name": "job", "query": ".*", "type": "textbox" },
+      { "current": { "selected": false, "text": "blackbox", "value": "blackbox" }, "hide": 0, "label": "Blackbox job", "name": "blackbox_job", "query": "blackbox", "type": "textbox" },
+      { "current": { "selected": false, "text": ".*/readyz", "value": ".*/readyz" }, "hide": 0, "label": "Ready endpoint instance", "name": "ready_instance", "query": ".*/readyz", "type": "textbox" }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "NUTS Overview",
+  "uid": "nuts-overview",
+  "version": 1
+}

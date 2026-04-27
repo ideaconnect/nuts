@@ -197,6 +197,8 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				reconnect_wait 5
 				max_reconnects 10
 				max_event_size 524288
+				live_path /live
+				ready_path /ready
 				hub_url https://example.com/events
 				allowed_origins https://example.com https://other.com
 			}`,
@@ -208,6 +210,8 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				ReconnectWait:     5,
 				MaxReconnects:     intPtr(10),
 				MaxEventSize:      524288,
+				LivePath:          "/live",
+				ReadyPath:         "/ready",
 				HubURL:            "https://example.com/events",
 				AllowedOrigins:    []string{"https://example.com", "https://other.com"},
 			},
@@ -399,6 +403,12 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 			if h.HubURL != tt.expected.HubURL {
 				t.Errorf("HubURL: expected %q, got %q", tt.expected.HubURL, h.HubURL)
 			}
+			if h.LivePath != tt.expected.LivePath {
+				t.Errorf("LivePath: expected %q, got %q", tt.expected.LivePath, h.LivePath)
+			}
+			if h.ReadyPath != tt.expected.ReadyPath {
+				t.Errorf("ReadyPath: expected %q, got %q", tt.expected.ReadyPath, h.ReadyPath)
+			}
 			if len(tt.expected.AllowedOrigins) > 0 {
 				if len(h.AllowedOrigins) != len(tt.expected.AllowedOrigins) {
 					t.Errorf("AllowedOrigins length: expected %d, got %d", len(tt.expected.AllowedOrigins), len(h.AllowedOrigins))
@@ -500,6 +510,10 @@ func TestHandler_UnmarshalCaddyfile_MissingArgs(t *testing.T) {
 		{name: "missing max_event_size arg", directive: "max_event_size"},
 		{name: "missing replay_max_messages arg", directive: "replay_max_messages"},
 		{name: "missing replay_window arg", directive: "replay_window"},
+		{name: "missing health_path arg", directive: "health_path"},
+		{name: "missing live_path arg", directive: "live_path"},
+		{name: "missing ready_path arg", directive: "ready_path"},
+		{name: "missing hub_url arg", directive: "hub_url"},
 	}
 
 	for _, tt := range tests {

@@ -897,6 +897,52 @@ func TestHandler_HealthPath_CustomSuffix(t *testing.T) {
 	}
 }
 
+func TestHandler_LiveAndReadyPaths_AreDistinctProbes(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	h := &Handler{
+		NatsURL:    ns.ClientURL(),
+		StreamName: "EVENTS",
+		logger:     zap.NewNop(),
+	}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	assertProbe := func(path string, wantStatus int, wantBody string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		if err := h.ServeHTTP(rr, req, nil); err != nil {
+			t.Fatalf("ServeHTTP(%s): %v", path, err)
+		}
+		if rr.Code != wantStatus {
+			t.Fatalf("%s status = %d, want %d; body=%s", path, rr.Code, wantStatus, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), wantBody) {
+			t.Fatalf("%s body = %q, want to contain %q", path, rr.Body.String(), wantBody)
+		}
+	}
+
+	assertProbe("/livez", http.StatusOK, `"status":"ok"`)
+	assertProbe("/readyz", http.StatusOK, `"stream":"available"`)
+	assertProbe("/events/healthz", http.StatusOK, `"nats":"connected"`)
+
+	if err := h.Cleanup(); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	assertProbe("/livez", http.StatusOK, `"status":"ok"`)
+	assertProbe("/readyz", http.StatusServiceUnavailable, `"nats":"disconnected"`)
+}
+
 // ── health_path segment-boundary match ──────────────────────────────────
 
 func TestHandler_MatchesHealthPath_SegmentBoundary(t *testing.T) {
@@ -1050,6 +1096,15 @@ func TestHandler_ReplayMaxMessages_CapsFallback(t *testing.T) {
 	}
 	if !hasLogField(obs, "reason", "sequence below retention") {
 		t.Errorf("expected below-retention replay fallback log, entries=%+v", obs.All())
+	}
+	if !hasLogField(obs, "disconnect_reason", "replay_cap_reached") {
+		t.Errorf("expected replay cap disconnect reason log, entries=%+v", obs.All())
+	}
+	if !hasLogField(obs, "subject_label", "events.cap") {
+		t.Errorf("expected subject_label log field, entries=%+v", obs.All())
+	}
+	if !hasLogField(obs, "replay_mode", string(replayModeFallbackDeliverAll)) {
+		t.Errorf("expected replay_mode log field, entries=%+v", obs.All())
 	}
 }
 

@@ -253,6 +253,8 @@ nuts {
     replay_max_messages <count>  # Cap replay-fallback messages per connection (default: 0 = unlimited)
     replay_window <seconds>      # Time-bound replay fallback to the last N seconds (default: 0 = all retained)
     health_path <path>           # Health-check endpoint (empty/default: /healthz)
+    live_path <path>             # Process liveness endpoint (empty/default: /livez)
+    ready_path <path>            # NATS/stream readiness endpoint (empty/default: /readyz)
     hub_url <url>                # URL for Link header hub discovery (disabled by default)
 
     # Optional NATS TLS
@@ -472,25 +474,43 @@ replay-heavy requests with very old `last-id` values, and repeated `503`
 responses from connection caps or subscription failures. `max_connections`
 protects concurrent streams, while rate limiting protects request churn.
 
-### Health Check
+### Liveness And Readiness Checks
 
-NUTS exposes a health check on any path ending in `/healthz` within the configured route. It verifies NATS connectivity and stream availability, returning JSON:
+NUTS exposes separate probe paths within the configured route:
+
+- `live_path` (default `/livez`) returns process liveness only and does not
+  check NATS. Use this for Kubernetes liveness probes.
+- `ready_path` (default `/readyz`) checks the NATS connection and configured
+  JetStream stream. Use this for readiness probes and load balancer target
+  health.
+- `health_path` (default `/healthz`) remains a backward-compatible
+  readiness-style check with the same NATS and stream checks as `ready_path`.
 
 ```bash
-curl -i http://localhost:8080/events/healthz
+curl -i http://localhost:8080/events/livez
+curl -i http://localhost:8080/events/readyz
 ```
 
-**Healthy (200):**
+**Live (200):**
+```json
+{"status":"ok"}
+```
+
+The readiness and legacy health endpoints return NATS connectivity and stream
+availability:
+
+**Ready (200):**
 ```json
 {"status":"ok","nats":"connected","stream":"available"}
 ```
 
-**Degraded (503):**
+**Not ready (503):**
 ```json
 {"status":"degraded","nats":"disconnected","stream":"unavailable"}
 ```
 
-Use this endpoint as a liveness/readiness probe in Kubernetes or any load balancer health check.
+Operational runbooks and Kubernetes probe examples are in
+[OPERATIONS.md](OPERATIONS.md).
 
 ### Prometheus Metrics
 
@@ -527,6 +547,15 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
 | `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` labels the cause (e.g. `max_connections`). |
 | `nuts_replay_cap_reached_total` | Counter | SSE connections closed after `replay_max_messages` was reached during a replay fallback |
+
+Example alert rules and a Grafana dashboard are available in
+[ops/prometheus-alerts.yml](ops/prometheus-alerts.yml) and
+[ops/grafana-dashboard.json](ops/grafana-dashboard.json).
+
+Streaming logs include structured fields such as `topics`, `subjects`,
+`subject_label`, `replay_mode`, `replay_start_sequence`,
+`replay_fallback_reason`, and `disconnect_reason`; see
+[OPERATIONS.md](OPERATIONS.md) for incident-response guidance.
 
 ### Hub Discovery
 

@@ -29,7 +29,7 @@
 //   - provision.go — Provision/Validate/Cleanup: defaults, NATS dial,
 //     JetStream context, stream existence check, TLS config,
 //     teardown.
-//   - serve.go     — ServeHTTP and its helpers: health endpoint, CORS
+//   - serve.go     — ServeHTTP and its helpers: liveness/readiness probes, CORS
 //     preflight, topic extraction and validation, last-id
 //     parsing, connection-slot reservation, JetStream
 //     subscription (with purged-sequence fallback), the SSE
@@ -143,10 +143,20 @@ type Handler struct {
 	// Leave empty to disable hub discovery (default).
 	HubURL string `json:"hub_url,omitempty"`
 
-	// HealthPath is the URL path (relative to the matched route) that
-	// returns NATS / stream health as JSON. Empty uses the default.
+	// HealthPath is the legacy URL path (relative to the matched route) that
+	// returns NATS / stream readiness as JSON. Empty uses the default.
 	// Default: "/healthz".
 	HealthPath string `json:"health_path,omitempty"`
+
+	// LivePath is the URL path for a process-liveness probe. It returns 200
+	// when the handler can serve HTTP, without checking NATS or JetStream.
+	// Default: "/livez".
+	LivePath string `json:"live_path,omitempty"`
+
+	// ReadyPath is the URL path for a readiness probe. It checks the NATS
+	// connection and configured JetStream stream before returning 200.
+	// Default: "/readyz".
+	ReadyPath string `json:"ready_path,omitempty"`
 
 	// AllowedHeaders lists HTTP headers permitted by CORS preflight responses.
 	// Default: ["Cache-Control", "Last-Event-ID"].

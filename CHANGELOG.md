@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - New Caddyfile directive `health_path` (default `/healthz`) to customize
   the health-check endpoint.
+- New Caddyfile directives `live_path` (default `/livez`) and `ready_path`
+  (default `/readyz`) to split process liveness from NATS/JetStream
+  readiness while keeping `health_path` as a backward-compatible readiness
+  check.
 - New Caddyfile directives `nats_tls_ca`, `nats_tls_cert`, `nats_tls_key`,
   `nats_tls_insecure_skip_verify` for mutual TLS to NATS.
 - New Caddyfile directive `allowed_headers` (default
@@ -34,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON compaction, topic validation, and multi-topic filtering, plus bounded
   load, replay, slow-reader, goroutine, and memory-growth tests documented in
   `PERFORMANCE.md`.
+- Operations assets: Prometheus alert rules, a Grafana dashboard example, and
+  a runbook for NATS outages, missing streams, replay storms, slow consumers,
+  and CORS misconfiguration.
 - `CONTRIBUTING.md`, `SECURITY.md`, and this `CHANGELOG.md`.
 - Docker image now runs as non-root user `nuts` (uid 10001).
 
@@ -81,6 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Caddyfile` and Caddy's own `caddy fmt` output, so `caddy adapt`
   no longer logs `Caddyfile input is not formatted` on every run.
 - Dockerfile uses BuildKit cache mounts for `go mod download` and `go build`.
+- Stream lifecycle logs now include consistent structured fields for requested
+  topics, full subjects, replay mode, replay start/fallback context, and
+  disconnect reason.
 
 ### Fixed
 - [`Caddyfile`](Caddyfile) and [`Dockerfile.test`](Dockerfile.test) each had
