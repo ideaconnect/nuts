@@ -57,12 +57,12 @@ This plan turns the current quality review into an execution checklist. It is in
 
 ## P1: Security And Authorization
 
-- [ ] P1: Add documented Caddy examples for protecting the NUTS route with authentication middleware or a reverse proxy.
-- [ ] P1: Add documented examples for per-tenant isolation using separate streams, prefixes, or route blocks.
-- [ ] P1: Consider an optional first-party subscriber authorization hook if Caddy-only policy is not sufficient for real deployments.
-- [ ] P1: Add rate-limit guidance for connection attempts, replay-heavy clients, and invalid-topic probes.
-- [ ] P1: Add security tests for CORS credential behavior, method filtering, invalid topics, and replay bounds to CI-focused suites.
-- [ ] P1: Document operational guidance for `replay_max_messages` and `replay_window` defaults on large retained streams.
+- [x] P1: Add documented Caddy examples for protecting the NUTS route with authentication middleware or a reverse proxy.
+- [x] P1: Add documented examples for per-tenant isolation using separate streams, prefixes, or route blocks.
+- [x] P1: Consider an optional first-party subscriber authorization hook if Caddy-only policy is not sufficient for real deployments.
+- [x] P1: Add rate-limit guidance for connection attempts, replay-heavy clients, and invalid-topic probes.
+- [x] P1: Add security tests for CORS credential behavior, method filtering, invalid topics, and replay bounds to CI-focused suites.
+- [x] P1: Document operational guidance for `replay_max_messages` and `replay_window` defaults on large retained streams.
 
 ## P1: Performance And Load Confidence
 

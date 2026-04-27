@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -165,6 +166,112 @@ func TestHandler_CORS_ExplicitWinsOverWildcard(t *testing.T) {
 
 	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
 		t.Errorf("Access-Control-Allow-Credentials: got %q, want 'true' when explicit origin matches", got)
+	}
+}
+
+func TestHandler_CORS_CredentialPolicyAppliesToSSE(t *testing.T) {
+	tests := []struct {
+		name            string
+		allowedOrigins  []string
+		origin          string
+		wantCredentials string
+	}{
+		{
+			name:            "wildcard omits credentials on stream response",
+			allowedOrigins:  []string{"*"},
+			origin:          "https://app.example.com",
+			wantCredentials: "",
+		},
+		{
+			name:            "explicit origin enables credentials on stream response",
+			allowedOrigins:  []string{"https://app.example.com"},
+			origin:          "https://app.example.com",
+			wantCredentials: "true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, ns, nc := newProvisionedHandler(t)
+			defer ns.Shutdown()
+			defer nc.Close()
+			defer h.Cleanup()
+			h.AllowedOrigins = tt.allowedOrigins
+
+			ctx, cancel := context.WithCancel(context.Background())
+			req := httptest.NewRequest(http.MethodGet, "/events?topic=cors", nil).WithContext(ctx)
+			req.Header.Set("Origin", tt.origin)
+			rr := newSafeRecorder()
+			done := make(chan error, 1)
+			go func() { done <- h.ServeHTTP(rr, req, nil) }()
+
+			if !waitForSSEBody(rr, "event: connected", 2*time.Second) {
+				cancel()
+				<-done
+				t.Fatalf("SSE stream did not connect; body=%s", rr.Body())
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("ServeHTTP returned error: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("ServeHTTP did not return after cancel")
+			}
+
+			if got := rr.Header().Get("Access-Control-Allow-Origin"); got != tt.origin {
+				t.Fatalf("Access-Control-Allow-Origin = %q, want %q", got, tt.origin)
+			}
+			if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != tt.wantCredentials {
+				t.Fatalf("Access-Control-Allow-Credentials = %q, want %q", got, tt.wantCredentials)
+			}
+			if got := rr.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+				t.Fatalf("Vary = %q, want Origin", got)
+			}
+		})
+	}
+}
+
+func TestHandler_Security_InvalidTopicsRejectedBeforeStreaming(t *testing.T) {
+	h := &Handler{logger: zap.NewNop()}
+	tests := []struct {
+		name  string
+		topic string
+	}{
+		{name: "wildcard star", topic: "orders.*"},
+		{name: "wildcard greater-than", topic: "orders.>"},
+		{name: "system prefix", topic: "$SYS.accounts"},
+		{name: "slash", topic: "tenant/a"},
+		{name: "control character", topic: "tenant\x00a"},
+		{name: "over max length", topic: strings.Repeat("a", 257)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/events?topic="+url.QueryEscape(tt.topic), nil)
+			rr := httptest.NewRecorder()
+
+			if err := h.ServeHTTP(rr, req, nil); err != nil {
+				t.Fatalf("ServeHTTP returned error: %v", err)
+			}
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", rr.Code, http.StatusBadRequest)
+			}
+			if !strings.Contains(rr.Body.String(), "Invalid topic name") {
+				t.Fatalf("body = %q, want invalid-topic error", rr.Body.String())
+			}
+			if strings.Contains(rr.Body.String(), "event: connected") {
+				t.Fatalf("invalid topic reached streaming path: %q", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAllowedMethodsHeader_FiltersToServedMethods(t *testing.T) {
+	got := allowedMethodsHeader([]string{"POST", "get", "GET", "OPTIONS", "TRACE"})
+	if got != "GET, OPTIONS" {
+		t.Fatalf("allowedMethodsHeader() = %q, want GET, OPTIONS", got)
 	}
 }
 

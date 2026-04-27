@@ -115,6 +115,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   auth over the network) and when `nats_tls_insecure_skip_verify=true`.
 - JSON parse is skipped for oversized payloads to avoid unbounded
   allocation for hostile producers.
+- README and SECURITY now document subscriber-auth boundaries, Caddy
+  `basic_auth` / `forward_auth` examples, per-tenant route isolation,
+  rate-limit guidance, replay-bound guidance, and the decision to defer a
+  first-party subscriber authorization hook to the opt-in JWT/private-topic
+  roadmap.
 
 ## [0.x] - prior history
 

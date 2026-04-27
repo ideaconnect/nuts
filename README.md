@@ -324,6 +324,12 @@ Both default to `0` (unlimited / all retained) to preserve the original
 behaviour. They can be combined: `replay_window` bounds the time range,
 `replay_max_messages` bounds the count within that range.
 
+For public or multi-tenant deployments, treat the default `0` values as a
+compatibility mode rather than a production recommendation for large retained
+streams. Pick bounds that match the largest replay you are willing to serve to
+one client, then size JetStream retention, `max_connections`, and edge
+rate-limits around that budget.
+
 #### CORS and `allowed_origins`
 
 NUTS never emits a literal `Access-Control-Allow-Origin: *`; it echoes the
@@ -371,6 +377,96 @@ configured `topic_prefix`. Protect subscriber access with Caddy route policy,
 an authentication plugin, an upstream reverse proxy, application-issued
 cookies, or separate NUTS instances with distinct prefixes/streams when tenant
 isolation matters.
+
+Current decision: NUTS does not implement a first-party subscriber
+authorization hook in the handler. Subscriber identity, sessions, and policy
+are intentionally delegated to Caddy or an upstream gateway so the NUTS module
+stays a read-only JetStream-to-SSE bridge. If deployments need claim-to-topic
+authorization inside the handler, the future Phase 2 work in [ROADMAP.md](ROADMAP.md)
+is the place for an opt-in JWT/private-topic design.
+
+Protect a route with Caddy `basic_auth` when simple operator-controlled access
+is enough. Generate the password hash with `caddy hash-password` and keep the
+route prefix strip before `nuts`:
+
+```caddyfile
+:8080 {
+  route /events* {
+    basic_auth {
+      alice <bcrypt-hash-from-caddy-hash-password>
+    }
+    uri strip_prefix /events
+    nuts {
+      nats_url nats://nats:4222
+      stream_name EVENTS
+      topic_prefix events.
+      allowed_origins https://app.example.com
+    }
+  }
+}
+```
+
+For application-owned sessions, put an auth service or reverse proxy in front
+of NUTS. The auth layer should reject unauthenticated requests before `nuts`
+creates a JetStream consumer:
+
+```caddyfile
+:8080 {
+  route /events* {
+    forward_auth https://auth.internal {
+      uri /verify
+      copy_headers X-User X-Tenant
+    }
+    uri strip_prefix /events
+    nuts {
+      nats_url nats://nats:4222
+      stream_name EVENTS
+      topic_prefix events.
+      allowed_origins https://app.example.com
+    }
+  }
+}
+```
+
+Use separate route blocks, streams, or prefixes for tenant isolation. A single
+public route with only a broad `topic_prefix` is not tenant authorization:
+
+```caddyfile
+:8080 {
+  route /tenant-a/events* {
+    uri strip_prefix /tenant-a/events
+    nuts {
+      nats_url nats://nats:4222
+      stream_name TENANT_A_EVENTS
+      topic_prefix tenants.a.
+      allowed_origins https://tenant-a.example.com
+      max_connections 500
+      replay_max_messages 1000
+      replay_window 300
+    }
+  }
+
+  route /tenant-b/events* {
+    uri strip_prefix /tenant-b/events
+    nuts {
+      nats_url nats://nats:4222
+      stream_name TENANT_B_EVENTS
+      topic_prefix tenants.b.
+      allowed_origins https://tenant-b.example.com
+      max_connections 500
+      replay_max_messages 1000
+      replay_window 300
+    }
+  }
+}
+```
+
+Apply rate limits at the edge, CDN, WAF, Caddy plugin, or reverse proxy that
+already knows the client IP or user identity. Useful buckets are connection
+attempts to the SSE route, repeated `400` responses from invalid topics,
+replay-heavy requests with very old `last-id` values, and repeated `503`
+responses from connection caps or subscription failures. `max_connections`
+protects concurrent streams, while rate limiting protects request churn.
 
 ### Health Check
 
