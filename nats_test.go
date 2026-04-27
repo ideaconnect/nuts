@@ -879,6 +879,24 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 		}
 	})
 
+	t.Run("overflowing last-id parameter", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=test&last-id="+strconv.FormatUint(^uint64(0), 10), nil)
+		ctx, cancel := context.WithTimeout(req.Context(), 500*time.Millisecond)
+		defer cancel()
+		req = req.WithContext(ctx)
+		rr := httptest.NewRecorder()
+
+		h.ServeHTTP(rr, req, nil)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("expected status %d for overflowing last-id, got %d", http.StatusBadRequest, rr.Code)
+		}
+
+		if !strings.Contains(rr.Body.String(), "Invalid last-id") {
+			t.Errorf("response should mention invalid last-id, got: %s", rr.Body.String())
+		}
+	})
+
 	t.Run("Last-Event-ID header replays messages", func(t *testing.T) {
 		jsCtx, _ := nc.JetStream()
 		var firstSequence uint64
@@ -1135,6 +1153,212 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 			t.Errorf("response should contain both topics, got: %s", body)
 		}
 	})
+}
+
+func TestHandler_ServeHTTP_PreservesJSONNumberLexemes(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	jsPub, _ := nc.JetStream()
+	largeJSON := `{"id":900719925474099312345,"nested":{"n":12345678901234567890}}`
+	if _, err := jsPub.Publish("events.json", []byte(largeJSON)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=json&last-id=0", nil).WithContext(ctx)
+	rr := newSafeRecorder()
+	done := make(chan error, 1)
+	go func() { done <- h.ServeHTTP(rr, req, nil) }()
+
+	if !waitForSSEBody(rr, `900719925474099312345`, 1500*time.Millisecond) {
+		cancel()
+		<-done
+		t.Fatalf("large JSON number was not delivered; body=%s", rr.Body())
+	}
+	cancel()
+	<-done
+
+	body := rr.Body()
+	if !strings.Contains(body, `900719925474099312345`) || !strings.Contains(body, `12345678901234567890`) {
+		t.Fatalf("JSON number lexemes were not preserved; body=%s", body)
+	}
+	if strings.Contains(body, `9.007199254740993e+20`) || strings.Contains(body, `12345678901234567000`) {
+		t.Fatalf("JSON numbers appear to have been coerced through float64; body=%s", body)
+	}
+}
+
+func TestHandler_ServeHTTP_MultiTopicReplayEmitsIncreasingIDs(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	jsPub, _ := nc.JetStream()
+	for i := 0; i < 40; i++ {
+		subject := "events.alpha"
+		if i%2 == 1 {
+			subject = "events.beta"
+		}
+		if _, err := jsPub.Publish(subject, []byte(`{"i":`+strconv.Itoa(i)+`}`)); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=alpha&topic=beta&last-id=0", nil).WithContext(ctx)
+	rr := newSafeRecorder()
+	done := make(chan error, 1)
+	go func() { done <- h.ServeHTTP(rr, req, nil) }()
+
+	if !waitForSSEBody(rr, `"i":39`, 2*time.Second) {
+		cancel()
+		<-done
+		t.Fatalf("did not receive full replay; body=%s", rr.Body())
+	}
+	cancel()
+	<-done
+
+	ids := parseSSEIDs(t, rr.Body())
+	if len(ids) != 40 {
+		t.Fatalf("expected 40 message ids, got %d; ids=%v body=%s", len(ids), ids, rr.Body())
+	}
+	for i := 1; i < len(ids); i++ {
+		if ids[i] <= ids[i-1] {
+			t.Fatalf("SSE ids must be strictly increasing for a single Last-Event-ID cursor; ids=%v body=%s", ids, rr.Body())
+		}
+	}
+}
+
+func parseSSEIDs(t *testing.T, body string) []uint64 {
+	t.Helper()
+	var ids []uint64
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "id: ") {
+			continue
+		}
+		id, err := strconv.ParseUint(strings.TrimPrefix(line, "id: "), 10, 64)
+		if err != nil {
+			t.Fatalf("parse SSE id from %q: %v", line, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func TestCommonSubjectFilter(t *testing.T) {
+	tests := []struct {
+		name     string
+		subjects []string
+		expect   string
+	}{
+		{
+			name:     "same prefix siblings",
+			subjects: []string{"events.alpha", "events.beta"},
+			expect:   "events.>",
+		},
+		{
+			name:     "nested subject backs up one token",
+			subjects: []string{"events.alpha", "events.alpha.beta"},
+			expect:   "events.>",
+		},
+		{
+			name:     "unrelated subjects use root wildcard",
+			subjects: []string{"alpha", "beta"},
+			expect:   ">",
+		},
+		{
+			name:     "deeper sibling prefix",
+			subjects: []string{"events.alpha.one", "events.alpha.two"},
+			expect:   "events.alpha.>",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := commonSubjectFilter(tt.subjects); got != tt.expect {
+				t.Fatalf("commonSubjectFilter(%v) = %q, want %q", tt.subjects, got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestParseMajorMinorVersion(t *testing.T) {
+	tests := []struct {
+		version string
+		major   int
+		minor   int
+		ok      bool
+	}{
+		{version: "2.10.1", major: 2, minor: 10, ok: true},
+		{version: "v2.12.0", major: 2, minor: 12, ok: true},
+		{version: "2.10.0-beta.1", major: 2, minor: 10, ok: true},
+		{version: "3.0.0+meta", major: 3, minor: 0, ok: true},
+		{version: "2", ok: false},
+		{version: "not-a-version", ok: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.version, func(t *testing.T) {
+			major, minor, ok := parseMajorMinorVersion(tt.version)
+			if ok != tt.ok || major != tt.major || minor != tt.minor {
+				t.Fatalf("parseMajorMinorVersion(%q) = (%d, %d, %v), want (%d, %d, %v)",
+					tt.version, major, minor, ok, tt.major, tt.minor, tt.ok)
+			}
+		})
+	}
+}
+
+func TestSubjectAllowedByStream(t *testing.T) {
+	tests := []struct {
+		name           string
+		subject        string
+		streamSubjects []string
+		want           bool
+	}{
+		{
+			name:           "full wildcard allows nested subject",
+			subject:        "events.alpha.beta",
+			streamSubjects: []string{"events.>"},
+			want:           true,
+		},
+		{
+			name:           "single token wildcard allows one token",
+			subject:        "events.alpha",
+			streamSubjects: []string{"events.*"},
+			want:           true,
+		},
+		{
+			name:           "single token wildcard rejects nested token",
+			subject:        "events.alpha.beta",
+			streamSubjects: []string{"events.*"},
+			want:           false,
+		},
+		{
+			name:           "exact subject match",
+			subject:        "events.alpha",
+			streamSubjects: []string{"events.alpha"},
+			want:           true,
+		},
+		{
+			name:           "unmatched subject",
+			subject:        "orders.alpha",
+			streamSubjects: []string{"events.>"},
+			want:           false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := subjectAllowedByStream(tt.subject, tt.streamSubjects); got != tt.want {
+				t.Fatalf("subjectAllowedByStream(%q, %v) = %v, want %v", tt.subject, tt.streamSubjects, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestHandler_StreamNotFound(t *testing.T) {

@@ -11,13 +11,13 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 
 - **Real-time Updates**: Stream NATS messages to web browsers via SSE/EventSource
 - **[JetStream Persistence](#jetstream-setup)**: Messages are persisted in NATS JetStream for replay
-- **[Message Replay](#message-replay-with-last-id-or-last-event-id)**: Clients can reconnect and replay messages from a specific ID using `?last-id=` or the standard `Last-Event-ID` header. If the requested sequence is no longer available in JetStream retention, NUTS falls back to replaying all retained messages for that topic.
+- **[Message Replay](#message-replay-with-last-id-or-last-event-id)**: Clients can reconnect and replay messages from a specific ID using `?last-id=` or the standard `Last-Event-ID` header. If the requested sequence is no longer available in JetStream retention, NUTS uses fallback replay, bounded by `replay_max_messages` or `replay_window` when configured.
 - **Multiple Topics**: Subscribe to multiple NATS subjects simultaneously
 - **Automatic Reconnection**: Built-in NATS reconnection handling
 - **[CORS Support](#cors-and-allowed_origins)**: Configurable cross-origin resource sharing
 - **Heartbeat**: Keep-alive mechanism to prevent connection timeouts
-- **[No Message Drops For Connected Clients](#slow-clients-and-replay)**: When a client falls behind, NUTS disconnects that SSE session before dropping queued messages so the client can resume from the last delivered event ID
-- **[Flexible Authentication](#with-nats-authentication)**: Support for credentials file, token, or user/password auth
+- **[No Silent Drops For Slow Clients](#slow-clients-and-replay)**: When a client falls behind, NUTS disconnects that SSE session before dropping queued messages so the client can resume from the last delivered event ID. Oversized events can still be rejected by `max_event_size`.
+- **[NATS Authentication](#with-nats-authentication)**: Credentials file, token, or user/password auth for the NUTS-to-NATS connection
 - **Topic Prefixing**: Optional prefix for all NATS subscriptions
 - **[Prometheus Metrics](#prometheus-metrics)**: Built-in `nuts_*` counters and gauges (active connections, messages delivered, slow-client disconnects, replay stats)
 - **[Health Check](#health-check)**: `/healthz` endpoint verifying NATS connectivity and stream availability
@@ -57,9 +57,15 @@ The image expects a Caddyfile mounted at `/app/Caddyfile` and exposes port `8080
 ```bash
 docker run -d \
   -p 8080:8080 \
+  -e NATS_URL=nats://host.docker.internal:4222 \
+  --add-host=host.docker.internal:host-gateway \
   -v ./Caddyfile:/app/Caddyfile:ro \
   idcttech/nuts:latest
 ```
+
+Set `NATS_URL` to a NATS server reachable from inside the container. If NATS
+runs in the same Compose network, use its service name instead, for example
+`nats://nats:4222`.
 
 #### Docker Compose
 
@@ -72,6 +78,11 @@ services:
     command: ["--jetstream", "--store_dir=/data"]
     volumes:
       - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
 
   nats-init:
     image: natsio/nats-box:0.19.0
@@ -222,7 +233,7 @@ nuts {
     # JetStream stream name (required)
     stream_name <name>
 
-    # Authentication (choose exactly one; user/password must be set together)
+    # NATS authentication (choose exactly one; user/password must be set together)
     nats_credentials <path>      # Path to .creds file
     nats_token <token>           # Token auth
     nats_user <username>         # User/password auth
@@ -232,16 +243,16 @@ nuts {
     topic_prefix <prefix>        # Prefix for all subscriptions
     allowed_origins <origins...> # CORS origins (default: *)
     allowed_headers <headers...> # CORS request headers (default: Cache-Control Last-Event-ID)
-    allowed_methods <methods...> # CORS methods (default: GET OPTIONS)
+    allowed_methods <methods...> # CORS methods; only GET OPTIONS are supported
     heartbeat_interval <seconds> # Heartbeat interval (default: 30)
     reconnect_wait <seconds>     # Reconnect wait time (default: 2)
     max_reconnects <count>       # Max reconnects, 0=none, -1=infinite (default: -1)
     max_event_size <bytes>       # Max SSE event size (0=default 1 MiB, <0=unlimited)
     max_connections <count>      # Global concurrent-stream cap (default: 0 = unlimited)
-    client_buffer_size <count>   # Per-connection send buffer (default: 64)
+    client_buffer_size <count>   # Per-connection send buffer (0=default 64)
     replay_max_messages <count>  # Cap replay-fallback messages per connection (default: 0 = unlimited)
     replay_window <seconds>      # Time-bound replay fallback to the last N seconds (default: 0 = all retained)
-    health_path <path>           # Health-check endpoint (default: /healthz)
+    health_path <path>           # Health-check endpoint (empty/default: /healthz)
     hub_url <url>                # URL for Link header hub discovery (disabled by default)
 
     # Optional NATS TLS
@@ -323,9 +334,11 @@ response to another.
 `Access-Control-Allow-Credentials: true` is only advertised when the request
 `Origin` is explicitly listed in `allowed_origins`. If `allowed_origins`
 contains `*`, the request is accepted but credentials are **not** advertised —
-browsers will reject any credentialed `EventSource` (i.e. `withCredentials:
-true`, cookies, or `Authorization` headers). To support credentialed CORS,
-replace `*` with the explicit origins that should be trusted:
+browsers will reject credentialed cross-origin streams. Native browser
+`EventSource` can send cookies with `withCredentials: true`, but it cannot set
+custom `Authorization` headers; use cookies, a reverse proxy, or a custom SSE
+client for header-based subscriber auth. To support credentialed CORS, replace
+`*` with the explicit origins that should be trusted:
 
 Pick **one** of the two forms below (a second `allowed_origins` directive
 inside the same `nuts { }` block overwrites the first):
@@ -341,6 +354,23 @@ Explicit — credentials allowed for these origins:
 ```caddyfile
 allowed_origins https://app.example.com https://admin.example.com
 ```
+
+`allowed_methods` is intentionally limited to `GET` and `OPTIONS`, because
+NUTS only serves SSE streams and CORS preflight requests. Subscriber
+authentication and topic authorization are separate from CORS: CORS controls
+which browser origins may read responses, not who is allowed to subscribe.
+
+#### Subscriber authentication and topic authorization
+
+The `nats_credentials`, `nats_token`, and `nats_user` / `nats_password`
+directives authenticate the NUTS process to NATS. They do **not** authenticate
+browser subscribers to NUTS, and they do not apply per-topic access control.
+
+Any client that can reach the NUTS route can request any valid topic under the
+configured `topic_prefix`. Protect subscriber access with Caddy route policy,
+an authentication plugin, an upstream reverse proxy, application-issued
+cookies, or separate NUTS instances with distinct prefixes/streams when tenant
+isolation matters.
 
 ### Health Check
 
@@ -393,7 +423,7 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_messages_dropped_total` | Counter | Messages dropped (exceeded `max_event_size`) |
 | `nuts_slow_client_disconnects_total` | Counter | Clients disconnected due to slow consumption |
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
-| `nuts_replay_fallbacks_total` | Counter | Replay requests that fell back to `DeliverAll` |
+| `nuts_replay_fallbacks_total` | Counter | Replay requests that used fallback replay because the requested sequence was purged |
 | `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
 | `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` labels the cause (e.g. `max_connections`). |
 | `nuts_replay_cap_reached_total` | Counter | SSE connections closed after `replay_max_messages` was reached during a replay fallback |
@@ -406,10 +436,10 @@ When `hub_url` is configured, every SSE response includes a `Link` header:
 Link: <https://example.com/events>; rel="nuts"
 ```
 
-This lets upstream APIs advertise the event hub URL so clients can self-configure their `EventSource` connections. A client can discover the hub by inspecting the header:
+This lets clients discover the event hub URL from the SSE endpoint. If an upstream API wants clients to discover the hub from normal API responses, that API or a reverse proxy must also emit the same `Link` header. A client can then inspect the header:
 
 ```javascript
-const resp = await fetch('/api/resource');
+const resp = await fetch('/api/resource'); // API/proxy must include the Link header
 const link = resp.headers.get('Link');
 // Parse link header to extract the hub URL, then:
 const events = new EventSource(hubUrl + '?topic=updates');
@@ -523,7 +553,7 @@ events.onerror = (e) => {
 
 ### Slow Clients And Replay
 
-NUTS does not intentionally drop messages for an active SSE client.
+NUTS does not silently drop queued messages merely because an active SSE client is slow.
 
 If a client cannot read fast enough and its per-connection queue fills, NUTS closes that SSE connection instead of discarding queued messages. A reconnecting client can then resume from the last delivered SSE `id` using either:
 
@@ -532,9 +562,10 @@ If a client cannot read fast enough and its per-connection queue fills, NUTS clo
 
 This means the delivery policy is effectively:
 
-- No silent per-client message loss in the live stream path
+- No silent per-client message loss in the live stream path due to slow consumers
 - Slow clients must reconnect to continue
 - Replay depends on the requested sequence still being retained in JetStream
+- Oversized raw payloads or formatted SSE events are rejected according to `max_event_size`
 
 ### Message Replay with `last-id` or `Last-Event-ID`
 
@@ -618,6 +649,9 @@ nats stream add METRICS --subjects "metrics.>" --storage memory --max-age 1h
 
 ### With NATS Authentication
 
+These settings secure the backend NATS connection used by NUTS. They are not
+browser subscriber credentials.
+
 ```caddyfile
 :8080 {
     route /secure/events {
@@ -647,7 +681,7 @@ the inspiration.
 
 ### Prerequisites
 
-- Go 1.25+
+- Go 1.26.2+
 - Docker (for running NATS server)
 - [NATS CLI](https://github.com/nats-io/natscli) (optional, for manual testing)
 
@@ -779,7 +813,8 @@ When submitting a pull request, please:
 1. Keep changes focused and minimal.
 2. Add or update tests when behavior changes.
 3. Run `make test` to verify both unit and functional tests pass.
-4. Follow the existing code style (`go fmt ./...`).
+4. Run `go vet ./...` and `go mod tidy && git diff --exit-code go.mod go.sum`.
+5. Follow the existing code style (`go fmt ./...`).
 
 ---
 

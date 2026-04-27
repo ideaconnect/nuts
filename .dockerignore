@@ -19,6 +19,7 @@ media/
 # Build tooling
 Makefile
 scripts/
+caddy
 
 # Tests (not needed in runtime image; build stage pulls what it needs)
 features/
@@ -39,7 +40,13 @@ profile.cov
 # Editor / OS
 .vscode/
 .idea/
+.claude/
 .DS_Store
+
+# Local env / workspace artifacts
+.env
+go.work
+go.work.sum
 
 # Compose / dev extras
 docker-compose.yml

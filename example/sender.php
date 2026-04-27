@@ -4,7 +4,7 @@
  * NUTS Demo Sender
  *
  * Publishes a random number (0-100) to "events.numbers" and a random
- * letter (A-Z) to "events.letters" every 250 ms using
+ * letter (A-Z) to "events.letters" every 50 ms using
  * idct/php-nats-jetstream-client for JetStream-backed publishing.
  */
 
@@ -24,7 +24,7 @@ $client->connect()->await();
 
 $js = $client->jetStream();
 
-echo "Connected! Publishing every 250ms...\n";
+echo "Connected! Publishing every 50ms...\n";
 
 while (true) {
     $number = random_int(0, 100);

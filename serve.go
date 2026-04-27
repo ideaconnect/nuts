@@ -15,6 +15,8 @@ import (
 	"go.uber.org/zap"
 )
 
+const maxReplayCursor = ^uint64(0)
+
 // ServeHTTP implements the caddyhttp.MiddlewareHandler interface.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// Health check.
@@ -32,11 +34,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// Method check.
 	if r.Method != http.MethodGet {
 		if next == nil {
-			allow := "GET, OPTIONS"
-			if len(h.AllowedMethods) > 0 {
-				allow = strings.Join(h.AllowedMethods, ", ")
-			}
-			w.Header().Set("Allow", allow)
+			w.Header().Set("Allow", allowedMethodsHeader(h.AllowedMethods))
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return nil
 		}
@@ -78,22 +76,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if lastIDStr == "" {
 		lastIDStr = r.Header.Get("Last-Event-ID")
 	}
-	var lastID uint64
+	var nextSequence uint64
 	var hasLastID bool
 	if lastIDStr != "" {
 		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
-		if err != nil {
+		if err != nil || parsedID == maxReplayCursor {
 			if queryProvided {
-				http.Error(w, "Invalid last-id value: must be a positive integer", http.StatusBadRequest)
+				http.Error(w, "Invalid last-id value: must be an unsigned integer below the maximum cursor value", http.StatusBadRequest)
 				return nil
 			}
 			// Browser-supplied Last-Event-ID is unparseable. Fall back to
 			// DeliverNew so the client does not loop forever on a bad value.
+			fields := []zap.Field{zap.String("value", lastIDStr)}
+			if err != nil {
+				fields = append(fields, zap.Error(err))
+			} else {
+				fields = append(fields, zap.String("reason", "cursor would overflow"))
+			}
 			h.logger.Warn("ignoring unparseable Last-Event-ID header; resuming with DeliverNew",
-				zap.String("value", lastIDStr),
-				zap.Error(err))
+				fields...)
 		} else {
-			lastID = parsedID
+			nextSequence = parsedID + 1
 			hasLastID = true
 			metricsReplayRequests.Inc()
 		}
@@ -107,6 +110,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	h.mu.RLock()
+	conn := h.conn
 	js := h.js
 	shutdown := h.shutdown
 	h.mu.RUnlock()
@@ -163,6 +167,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	var subscribedTopics []string
 	var failedTopics []string
 	replayFellBack := false
+	requestedSubjects := make(map[string]struct{}, len(topics))
+	var fullTopics []string
+	for _, topic := range topics {
+		fullTopic := h.TopicPrefix + topic
+		if _, exists := requestedSubjects[fullTopic]; exists {
+			continue
+		}
+		requestedSubjects[fullTopic] = struct{}{}
+		fullTopics = append(fullTopics, fullTopic)
+		subscribedTopics = append(subscribedTopics, topic)
+	}
 	cleanupSubscriptions := func() {
 		close(done)
 		for _, sub := range subscriptions {
@@ -173,6 +188,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			}
 		}
 	}
+	enqueueRequestedMessage := func(msg *nats.Msg) {
+		if _, ok := requestedSubjects[msg.Subject]; !ok {
+			return
+		}
+		enqueueMessage(msg)
+	}
 
 	// Pre-check the stream's retained range so we can detect "requested
 	// sequence is below the purged frontier" before Subscribe() silently
@@ -180,16 +201,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// replay-storm trigger in modern NATS — StartSequence(N) where N <
 	// FirstSeq does not error.
 	var streamFirstSeq uint64
-	if hasLastID {
+	var streamSubjects []string
+	if hasLastID || len(fullTopics) > 1 {
 		if info, infoErr := js.StreamInfo(h.StreamName); infoErr == nil {
 			streamFirstSeq = info.State.FirstSeq
+			streamSubjects = info.Config.Subjects
 		} else {
-			h.logger.Debug("failed to read StreamInfo for fallback pre-check",
+			h.logger.Debug("failed to read StreamInfo for request pre-check",
 				zap.Error(infoErr))
 		}
 	}
+	if len(fullTopics) > 1 && len(streamSubjects) > 0 {
+		for idx, fullTopic := range fullTopics {
+			if !subjectAllowedByStream(fullTopic, streamSubjects) {
+				failedTopics = append(failedTopics, subscribedTopics[idx])
+			}
+		}
+		if len(failedTopics) > 0 {
+			cleanupSubscriptions()
+			http.Error(w, fmt.Sprintf("Failed to subscribe to requested topics: %s", strings.Join(failedTopics, ", ")), http.StatusServiceUnavailable)
+			return nil
+		}
+	}
 
-	buildFallbackOpts := func(fullTopic string, requested uint64, reason string) []nats.SubOpt {
+	buildFallbackOpts := func(subjectLabel string, requested uint64, reason string) []nats.SubOpt {
 		metricsReplayFallbacks.Inc()
 		replayFellBack = true
 		opts := []nats.SubOpt{
@@ -200,7 +235,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			start := time.Now().Add(-time.Duration(h.ReplayWindow) * time.Second)
 			opts = append(opts, nats.StartTime(start))
 			h.logger.Warn("replay fallback: using time-bounded window",
-				zap.String("topic", fullTopic),
+				zap.String("topic", subjectLabel),
 				zap.Uint64("requested_sequence", requested),
 				zap.String("reason", reason),
 				zap.Int("replay_window_seconds", h.ReplayWindow),
@@ -208,32 +243,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		} else {
 			opts = append(opts, nats.DeliverAll())
 			h.logger.Warn("replay fallback: delivering all retained messages",
-				zap.String("topic", fullTopic),
+				zap.String("topic", subjectLabel),
 				zap.Uint64("requested_sequence", requested),
 				zap.String("reason", reason),
 			)
 		}
 		return opts
 	}
-
-	for _, topic := range topics {
-		fullTopic := h.TopicPrefix + topic
-
+	buildSubscriptionOpts := func(subjectLabel string) ([]nats.SubOpt, bool) {
 		var opts []nats.SubOpt
-		belowRetention := hasLastID && streamFirstSeq > 0 && lastID+1 < streamFirstSeq
+		belowRetention := hasLastID && streamFirstSeq > 0 && nextSequence < streamFirstSeq
 
 		switch {
 		case belowRetention:
-			opts = buildFallbackOpts(fullTopic, lastID+1, "sequence below retention")
+			opts = buildFallbackOpts(subjectLabel, nextSequence, "sequence below retention")
 		case hasLastID:
 			opts = []nats.SubOpt{
 				nats.BindStream(h.StreamName),
 				nats.AckNone(),
-				nats.StartSequence(lastID + 1),
+				nats.StartSequence(nextSequence),
 			}
 			h.logger.Debug("subscribing from sequence",
-				zap.String("topic", fullTopic),
-				zap.Uint64("start_sequence", lastID+1),
+				zap.String("topic", subjectLabel),
+				zap.Uint64("start_sequence", nextSequence),
 			)
 		default:
 			opts = []nats.SubOpt{
@@ -242,19 +274,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				nats.DeliverNew(),
 			}
 		}
+		return opts, belowRetention
+	}
 
+	startSequenceErr := func(err error) bool {
+		if err == nil || !hasLastID {
+			return false
+		}
+		errMsg := err.Error()
+		return strings.Contains(errMsg, "start sequence") || strings.Contains(errMsg, "sequence not found")
+	}
+
+	if len(fullTopics) == 1 {
+		fullTopic := fullTopics[0]
+		opts, belowRetention := buildSubscriptionOpts(fullTopic)
 		sub, err := js.Subscribe(fullTopic, enqueueMessage, opts...)
 
 		// Belt-and-suspenders: preserved error-string fallback for the rare
 		// case where Subscribe rejects StartSequence instead of silently
 		// adjusting. No-op on modern NATS but harmless.
-		if err != nil && !belowRetention {
-			errMsg := err.Error()
-			if hasLastID && (strings.Contains(errMsg, "start sequence") ||
-				strings.Contains(errMsg, "sequence not found")) {
-				sub, err = js.Subscribe(fullTopic, enqueueMessage,
-					buildFallbackOpts(fullTopic, lastID+1, "subscribe error")...)
-			}
+		if err != nil && !belowRetention && startSequenceErr(err) {
+			sub, err = js.Subscribe(fullTopic, enqueueMessage,
+				buildFallbackOpts(fullTopic, nextSequence, "subscribe error")...)
 		}
 
 		if err != nil {
@@ -263,12 +304,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				zap.String("topic", fullTopic),
 				zap.Error(err),
 			)
-			failedTopics = append(failedTopics, topic)
-			continue
+			failedTopics = append(failedTopics, subscribedTopics[0])
+		} else {
+			subscriptions = append(subscriptions, sub)
+			h.logger.Debug("subscribed to topic", zap.String("topic", fullTopic))
 		}
-		subscriptions = append(subscriptions, sub)
-		subscribedTopics = append(subscribedTopics, topic)
-		h.logger.Debug("subscribed to topic", zap.String("topic", fullTopic))
+	} else {
+		subjectLabel := strings.Join(fullTopics, ",")
+		opts, belowRetention := buildSubscriptionOpts(subjectLabel)
+		sub, err := h.subscribeToMultipleTopics(js, conn, fullTopics, opts, enqueueRequestedMessage)
+		if err != nil && !belowRetention && startSequenceErr(err) {
+			sub, err = h.subscribeToMultipleTopics(js, conn, fullTopics,
+				buildFallbackOpts(subjectLabel, nextSequence, "subscribe error"), enqueueRequestedMessage)
+		}
+		if err != nil {
+			metricsSubscriptionErrors.Inc()
+			h.logger.Error("failed to subscribe to topics",
+				zap.Strings("topics", fullTopics),
+				zap.Error(err),
+			)
+			failedTopics = append(failedTopics, subscribedTopics...)
+		} else {
+			subscriptions = append(subscriptions, sub)
+			h.logger.Debug("subscribed to topics", zap.Strings("topics", fullTopics))
+		}
 	}
 
 	if len(failedTopics) > 0 {
@@ -414,6 +473,116 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 }
 
+func (h *Handler) subscribeToMultipleTopics(js nats.JetStreamContext, conn *nats.Conn, fullTopics []string, opts []nats.SubOpt, cb nats.MsgHandler) (*nats.Subscription, error) {
+	if supportsMultiFilterSubjects(conn) {
+		filterOpts := append([]nats.SubOpt{}, opts...)
+		filterOpts = append(filterOpts, nats.ConsumerFilterSubjects(fullTopics...))
+		return js.Subscribe("", cb, filterOpts...)
+	}
+
+	wildcardSubject := commonSubjectFilter(fullTopics)
+	h.logger.Warn("NATS server does not support multi-filter consumers; using common wildcard subscription",
+		zap.Strings("topics", fullTopics),
+		zap.String("wildcard_subject", wildcardSubject),
+		zap.String("server_version", connectedServerVersion(conn)),
+	)
+	return js.Subscribe(wildcardSubject, cb, opts...)
+}
+
+func supportsMultiFilterSubjects(conn *nats.Conn) bool {
+	version := connectedServerVersion(conn)
+	major, minor, ok := parseMajorMinorVersion(version)
+	if !ok {
+		return false
+	}
+	return major > 2 || (major == 2 && minor >= 10)
+}
+
+func connectedServerVersion(conn *nats.Conn) string {
+	if conn == nil {
+		return ""
+	}
+	return conn.ConnectedServerVersion()
+}
+
+func parseMajorMinorVersion(version string) (int, int, bool) {
+	version = strings.TrimPrefix(version, "v")
+	if cut := strings.IndexAny(version, "-+"); cut >= 0 {
+		version = version[:cut]
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
+
+func commonSubjectFilter(subjects []string) string {
+	if len(subjects) == 0 {
+		return ">"
+	}
+	common := strings.Split(subjects[0], ".")
+	for _, subject := range subjects[1:] {
+		parts := strings.Split(subject, ".")
+		limit := len(common)
+		if len(parts) < limit {
+			limit = len(parts)
+		}
+		idx := 0
+		for idx < limit && common[idx] == parts[idx] {
+			idx++
+		}
+		common = common[:idx]
+		if len(common) == 0 {
+			return ">"
+		}
+	}
+	for _, subject := range subjects {
+		if len(strings.Split(subject, ".")) == len(common) {
+			common = common[:len(common)-1]
+			break
+		}
+	}
+	if len(common) == 0 {
+		return ">"
+	}
+	return strings.Join(common, ".") + ".>"
+}
+
+func subjectAllowedByStream(subject string, streamSubjects []string) bool {
+	for _, streamSubject := range streamSubjects {
+		if subjectMatchesFilter(subject, streamSubject) {
+			return true
+		}
+	}
+	return false
+}
+
+func subjectMatchesFilter(subject, filter string) bool {
+	subjectTokens := strings.Split(subject, ".")
+	filterTokens := strings.Split(filter, ".")
+	for idx, filterToken := range filterTokens {
+		if filterToken == ">" {
+			return idx < len(subjectTokens)
+		}
+		if idx >= len(subjectTokens) {
+			return false
+		}
+		if filterToken != "*" && filterToken != subjectTokens[idx] {
+			return false
+		}
+	}
+	return len(subjectTokens) == len(filterTokens)
+}
+
 // matchesHealthPath returns true when the request path equals HealthPath or
 // ends with HealthPath as a full path segment. Because HealthPath is
 // normalised to start with '/', a plain HasSuffix check already enforces
@@ -449,6 +618,29 @@ func (h *Handler) releaseConnSlot() {
 	atomic.AddInt64(&h.connCount, -1)
 }
 
+func allowedMethodsHeader(methods []string) string {
+	if len(methods) == 0 {
+		return "GET, OPTIONS"
+	}
+	seen := make(map[string]struct{}, len(methods))
+	allowed := make([]string, 0, 2)
+	for _, method := range methods {
+		method = strings.ToUpper(method)
+		switch method {
+		case http.MethodGet, http.MethodOptions:
+			if _, exists := seen[method]; exists {
+				continue
+			}
+			seen[method] = struct{}{}
+			allowed = append(allowed, method)
+		}
+	}
+	if len(allowed) == 0 {
+		return "GET, OPTIONS"
+	}
+	return strings.Join(allowed, ", ")
+}
+
 // setCORSHeaders sets CORS response headers when the request includes an
 // Origin header.
 //
@@ -466,10 +658,7 @@ func (h *Handler) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	if origin == "" {
 		return
 	}
-	methods := "GET, OPTIONS"
-	if len(h.AllowedMethods) > 0 {
-		methods = strings.Join(h.AllowedMethods, ", ")
-	}
+	methods := allowedMethodsHeader(h.AllowedMethods)
 	headers := "Cache-Control, Last-Event-ID"
 	if len(h.AllowedHeaders) > 0 {
 		headers = strings.Join(h.AllowedHeaders, ", ")

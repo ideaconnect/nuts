@@ -33,6 +33,11 @@ jobs:
             exit 1
           fi
 
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
@@ -41,11 +46,17 @@ jobs:
       - name: Run unit tests with coverage
         run: go test -covermode=atomic -coverprofile=coverage.out -v -timeout 120s .
 
+      - name: Run focused race tests
+        run: go test -race -v -timeout 180s -run 'TestHandler_ServeHTTP_MultiTopicReplayEmitsIncreasingIDs|TestHandler_ServeHTTP_PreservesJSONNumberLexemes|TestMetrics_ActiveConnections_ReflectsLifecycle' .
+
       - name: Print coverage summary
         run: go tool cover -func=coverage.out
 
       - name: Run go vet
         run: go vet ./...
+
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
       - name: Start functional test stack
         run: make docker-up
@@ -62,6 +73,7 @@ jobs:
           files: ./coverage.out
           flags: unittests
           name: unit-tests
+          fail_ci_if_error: false
           verbose: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
@@ -69,6 +81,30 @@ jobs:
       - name: Stop functional test stack
         if: always()
         run: make docker-down
+
+  docker-build:
+    needs: test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: idcttech/nuts:ci
+
+      - name: Validate production Caddyfile in image
+        run: docker run --rm idcttech/nuts:ci /app/caddy adapt --config /app/Caddyfile
 
   docker:
     needs: test

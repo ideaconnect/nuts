@@ -874,4 +874,3 @@ func TestHandler_JetStreamPersistence_MessagesSurviveHandlerLifetime(t *testing.
 		}
 	}
 }
-

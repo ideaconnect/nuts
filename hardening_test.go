@@ -58,7 +58,7 @@ func TestHandler_CORS_CustomAllowedHeaders(t *testing.T) {
 	if got := rr.Header().Get("Access-Control-Allow-Headers"); got != "Authorization, X-Custom-Header" {
 		t.Errorf("Access-Control-Allow-Headers: got %q", got)
 	}
-	if got := rr.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, OPTIONS" {
+	if got := rr.Header().Get("Access-Control-Allow-Methods"); got != "GET, OPTIONS" {
 		t.Errorf("Access-Control-Allow-Methods: got %q", got)
 	}
 	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
@@ -471,6 +471,76 @@ func TestHandler_UnmarshalCaddyfile_RejectsNonNumericInt(t *testing.T) {
 				t.Errorf("expected parse error for %q", line)
 			}
 		})
+	}
+}
+
+func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Handler)
+		wantErr string
+	}{
+		{
+			name:    "negative max connections",
+			mutate:  func(h *Handler) { h.MaxConnections = -1 },
+			wantErr: "max_connections",
+		},
+		{
+			name:    "negative client buffer size",
+			mutate:  func(h *Handler) { h.ClientBufferSize = -1 },
+			wantErr: "client_buffer_size",
+		},
+		{
+			name:    "negative replay max messages",
+			mutate:  func(h *Handler) { h.ReplayMaxMessages = -1 },
+			wantErr: "replay_max_messages",
+		},
+		{
+			name:    "negative replay window",
+			mutate:  func(h *Handler) { h.ReplayWindow = -1 },
+			wantErr: "replay_window",
+		},
+		{
+			name:    "unsupported allowed method",
+			mutate:  func(h *Handler) { h.AllowedMethods = []string{"GET", "POST", "OPTIONS"} },
+			wantErr: "allowed_methods",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := Handler{
+				NatsURL:    "nats://localhost:4222",
+				StreamName: "EVENTS",
+			}
+			tt.mutate(&h)
+			err := h.Validate()
+			if err == nil {
+				t.Fatalf("expected validation error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %q, want to contain %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestHandler_MethodNotAllowed_AllowHeaderOnlyAdvertisesServedMethods(t *testing.T) {
+	h := &Handler{
+		AllowedMethods: []string{"GET", "POST", "OPTIONS"},
+		logger:         zap.NewNop(),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/events?topic=x", nil)
+	rr := httptest.NewRecorder()
+
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusMethodNotAllowed)
+	}
+	if got := rr.Header().Get("Allow"); got != "GET, OPTIONS" {
+		t.Fatalf("Allow header = %q, want GET, OPTIONS", got)
 	}
 }
 

@@ -166,8 +166,8 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if err != nil {
 					return err
 				}
-				if v <= 0 {
-					return d.Errf("client_buffer_size must be > 0")
+				if v < 0 {
+					return d.Errf("client_buffer_size must be >= 0")
 				}
 				h.ClientBufferSize = v
 

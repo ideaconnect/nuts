@@ -43,7 +43,12 @@ Out of scope:
 Production deployments should:
 
 - Enable NATS TLS via `nats_tls_ca` / `nats_tls_cert` / `nats_tls_key`.
+- Protect the NUTS HTTP route with Caddy, a reverse proxy, or application
+  policy when subscriber authentication or per-topic authorization is needed.
+  NATS auth directives only authenticate NUTS to NATS.
 - Set `max_connections` to a value appropriate for the host.
 - Set `max_event_size` to bound memory per event.
+- Set `replay_max_messages` or `replay_window` when a large retained stream
+  could make fallback replay too expensive.
 - Restrict `allowed_origins` to your trusted front-ends.
 - Run the container as a non-root user (already the default).

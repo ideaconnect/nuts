@@ -5,6 +5,7 @@
 
 :8080 {
 	route /events* {
+		uri strip_prefix /events
 		nuts {
 			nats_url nats://nats:4222
 			stream_name EVENTS

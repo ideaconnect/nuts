@@ -1,6 +1,6 @@
 .PHONY: all build test test-unit test-functional docker-up docker-down clean
 
-DOCKER_COMPOSE := $(shell if command -v docker-compose >/dev/null 2>&1; then echo docker-compose; else echo docker compose; fi)
+DOCKER_COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo docker compose; elif docker-compose version >/dev/null 2>&1; then echo docker-compose; fi)
 
 # Default target
 all: build test
@@ -18,6 +18,10 @@ test-unit:
 
 # Start Docker services for functional tests
 docker-up:
+	@if [ -z "$(DOCKER_COMPOSE)" ]; then \
+		echo "Docker Compose is not available. Install Docker Compose or enable Docker integration for this environment."; \
+		exit 1; \
+	fi
 	@if $(DOCKER_COMPOSE) up --help 2>/dev/null | grep -q -- --wait; then \
 		echo "Starting Docker services with readiness checks..."; \
 		$(DOCKER_COMPOSE) up -d --build --wait; \
@@ -30,13 +34,19 @@ docker-up:
 
 # Stop Docker services
 docker-down:
-	$(DOCKER_COMPOSE) down -v
+	@if [ -z "$(DOCKER_COMPOSE)" ]; then \
+		echo "Docker Compose is not available. Nothing to stop."; \
+	else \
+		$(DOCKER_COMPOSE) down -v; \
+	fi
 
 # Run functional tests (requires Docker services)
 test-functional: docker-up
 	@echo "Running functional tests..."
-	cd functional_test && go test -v -timeout 120s ./...
-	@$(MAKE) docker-down
+	@status=0; \
+	(cd functional_test && go test -v -timeout 120s ./...) || status=$$?; \
+	$(MAKE) docker-down || status=$$?; \
+	exit $$status
 
 # Run functional tests without stopping Docker (for development)
 test-functional-dev:
@@ -44,18 +54,22 @@ test-functional-dev:
 
 # Run Godog with pretty output
 godog: docker-up
-	cd functional_test && go test -v -godog.format=pretty
-	@$(MAKE) docker-down
+	@status=0; \
+	(cd functional_test && go test -v -godog.format=pretty) || status=$$?; \
+	$(MAKE) docker-down || status=$$?; \
+	exit $$status
 
 # Install dependencies
 deps:
 	go mod download
-	go get github.com/cucumber/godog/cmd/godog@latest
+	go install github.com/cucumber/godog/cmd/godog@v0.15.1
 
 # Clean build artifacts
 clean:
 	rm -f ./caddy
-	$(DOCKER_COMPOSE) down -v 2>/dev/null || true
+	@if [ -n "$(DOCKER_COMPOSE)" ]; then \
+		$(DOCKER_COMPOSE) down -v 2>/dev/null || true; \
+	fi
 
 # Format code
 fmt:

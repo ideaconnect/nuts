@@ -52,11 +52,11 @@ var (
 	})
 
 	// nuts_replay_fallbacks_total counts how many times the requested
-	// sequence was purged and NUTS fell back to DeliverAll().
+	// sequence was purged and NUTS used the configured fallback strategy.
 	metricsReplayFallbacks = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "replay_fallbacks_total",
-		Help:      "Total number of replay requests that fell back to DeliverAll due to purged sequences.",
+		Help:      "Total number of replay requests that used fallback replay due to purged sequences.",
 	})
 
 	// nuts_subscription_errors_total counts failed JetStream subscribe attempts.
@@ -75,7 +75,7 @@ var (
 	}, []string{"reason"})
 
 	// nuts_replay_cap_reached_total counts SSE connections that were closed
-	// because the DeliverAll fallback delivered replay_max_messages events.
+	// because replay fallback delivered replay_max_messages events.
 	metricsReplayCapReached = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "replay_cap_reached_total",

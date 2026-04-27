@@ -18,12 +18,12 @@ import (
 
 // clientContext holds per-client SSE state for multi-client scenarios
 type clientContext struct {
-	sseResponse            *http.Response
-	sseEvents              []sseEvent
-	allEvents              []sseEvent // accumulated across disconnect/reconnect cycles
-	mu                     sync.Mutex
-	cancelFunc             context.CancelFunc
-	lastEventID            string
+	sseResponse             *http.Response
+	sseEvents               []sseEvent
+	allEvents               []sseEvent // accumulated across disconnect/reconnect cycles
+	mu                      sync.Mutex
+	cancelFunc              context.CancelFunc
+	lastEventID             string
 	lastEventIDAtDisconnect string // snapshot taken at disconnect time
 }
 

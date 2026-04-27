@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -265,10 +266,38 @@ func (h *Handler) validateRequiredFields() error {
 	return nil
 }
 
+// validateConfigValues checks semantic constraints that must be identical
+// whether config was supplied through a Caddyfile or Caddy's JSON API.
+func (h *Handler) validateConfigValues() error {
+	if h.MaxConnections < 0 {
+		return fmt.Errorf("max_connections must be >= 0")
+	}
+	if h.ClientBufferSize < 0 {
+		return fmt.Errorf("client_buffer_size must be >= 0")
+	}
+	if h.ReplayMaxMessages < 0 {
+		return fmt.Errorf("replay_max_messages must be >= 0")
+	}
+	if h.ReplayWindow < 0 {
+		return fmt.Errorf("replay_window must be >= 0")
+	}
+	for _, method := range h.AllowedMethods {
+		switch strings.ToUpper(method) {
+		case http.MethodGet, http.MethodOptions:
+		default:
+			return fmt.Errorf("allowed_methods may only include GET and OPTIONS; got %q", method)
+		}
+	}
+	return nil
+}
+
 // Validate is called by Caddy after Provision to sanity-check the config and
 // surface warnings.
 func (h *Handler) Validate() error {
 	if err := h.validateRequiredFields(); err != nil {
+		return err
+	}
+	if err := h.validateConfigValues(); err != nil {
 		return err
 	}
 

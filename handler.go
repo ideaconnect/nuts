@@ -19,27 +19,27 @@
 // events with the JetStream sequence number as the SSE id. Clients reconnect
 // with either the browser-managed Last-Event-ID header or an explicit
 // ?last-id= query parameter to resume from a specific sequence; if that
-// sequence has already been purged from the stream NUTS falls back to a
-// full-retention replay (bounded by replay_max_messages / replay_window when
-// configured).
+// sequence has already been purged from the stream NUTS uses the configured
+// fallback replay strategy (bounded by replay_max_messages / replay_window
+// when configured).
 //
 // Source files:
 //   - handler.go   — Package godoc, Handler struct (config + runtime state),
-//                    module registration, Caddy interface guards.
+//     module registration, Caddy interface guards.
 //   - provision.go — Provision/Validate/Cleanup: defaults, NATS dial,
-//                    JetStream context, stream existence check, TLS config,
-//                    teardown.
+//     JetStream context, stream existence check, TLS config,
+//     teardown.
 //   - serve.go     — ServeHTTP and its helpers: health endpoint, CORS
-//                    preflight, topic extraction and validation, last-id
-//                    parsing, connection-slot reservation, JetStream
-//                    subscription (with purged-sequence fallback), the SSE
-//                    streaming select loop, slow-client disconnect, and
-//                    heartbeat.
+//     preflight, topic extraction and validation, last-id
+//     parsing, connection-slot reservation, JetStream
+//     subscription (with purged-sequence fallback), the SSE
+//     streaming select loop, slow-client disconnect, and
+//     heartbeat.
 //   - caddyfile.go — Caddyfile directive parser (UnmarshalCaddyfile).
 //   - helpers.go   — Small utilities: JSON marshalling, topic validation,
-//                    SSE frame writer, URL credential redaction.
+//     SSE frame writer, URL credential redaction.
 //   - metrics.go   — Prometheus counters and gauges registered via promauto
-//                    (nuts_* namespace).
+//     (nuts_* namespace).
 //
 // See cmd/caddy/main.go for the build entry point that compiles Caddy with
 // this module baked in.
@@ -144,7 +144,7 @@ type Handler struct {
 	HubURL string `json:"hub_url,omitempty"`
 
 	// HealthPath is the URL path (relative to the matched route) that
-	// returns NATS / stream health as JSON. Empty disables the endpoint.
+	// returns NATS / stream health as JSON. Empty uses the default.
 	// Default: "/healthz".
 	HealthPath string `json:"health_path,omitempty"`
 
@@ -153,6 +153,7 @@ type Handler struct {
 	AllowedHeaders []string `json:"allowed_headers,omitempty"`
 
 	// AllowedMethods lists HTTP methods permitted by CORS preflight responses.
+	// NUTS only serves GET streams and OPTIONS preflight requests.
 	// Default: ["GET", "OPTIONS"].
 	AllowedMethods []string `json:"allowed_methods,omitempty"`
 
@@ -162,18 +163,19 @@ type Handler struct {
 	MaxConnections int `json:"max_connections,omitempty"`
 
 	// ClientBufferSize is the size of the per-connection NATS message buffer.
+	// 0 (or unset) uses the default.
 	// When the buffer fills, the slow client is disconnected to avoid drops.
 	// Default: 64.
 	ClientBufferSize int `json:"client_buffer_size,omitempty"`
 
 	// ReplayMaxMessages caps how many messages a single client can receive
-	// during a DeliverAll fallback (triggered when the requested sequence
+	// during replay fallback (triggered when the requested sequence
 	// has been purged from the stream). 0 (default) disables the cap. When
 	// the cap is reached the SSE connection is closed cleanly; the client
 	// may reconnect with a fresher Last-Event-ID.
 	ReplayMaxMessages int `json:"replay_max_messages,omitempty"`
 
-	// ReplayWindow caps how far back in time a DeliverAll fallback reaches.
+	// ReplayWindow caps how far back in time replay fallback reaches.
 	// Value is in seconds. When > 0 the fallback subscribes with
 	// StartTime(now - ReplayWindow) instead of DeliverAll, so the client
 	// only sees recent retained messages. 0 (default) preserves the
@@ -239,7 +241,7 @@ type Handler struct {
 //	data: {"topic":"orders","payload":{"id":1},"time":"2024-01-01T12:00:00Z"}
 type messageEventPayload struct {
 	Topic   string      `json:"topic"`   // Topic name (without the prefix)
-	Payload interface{} `json:"payload"` // Original message body; parsed as JSON when valid
+	Payload interface{} `json:"payload"` // Original message body; valid JSON is embedded without numeric coercion
 	Time    string      `json:"time"`    // ISO 8601 timestamp (from JetStream metadata when available)
 }
 
