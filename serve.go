@@ -17,6 +17,14 @@ import (
 
 const maxReplayCursor = ^uint64(0)
 
+func isReplayStartSequenceError(err error, hasLastID bool) bool {
+	if err == nil || !hasLastID {
+		return false
+	}
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "start sequence") || strings.Contains(errMsg, "sequence not found")
+}
+
 // ServeHTTP implements the caddyhttp.MiddlewareHandler interface.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// Health check.
@@ -277,14 +285,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return opts, belowRetention
 	}
 
-	startSequenceErr := func(err error) bool {
-		if err == nil || !hasLastID {
-			return false
-		}
-		errMsg := err.Error()
-		return strings.Contains(errMsg, "start sequence") || strings.Contains(errMsg, "sequence not found")
-	}
-
 	if len(fullTopics) == 1 {
 		fullTopic := fullTopics[0]
 		opts, belowRetention := buildSubscriptionOpts(fullTopic)
@@ -293,9 +293,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// Belt-and-suspenders: preserved error-string fallback for the rare
 		// case where Subscribe rejects StartSequence instead of silently
 		// adjusting. No-op on modern NATS but harmless.
-		if err != nil && !belowRetention && startSequenceErr(err) {
+		if err != nil && !belowRetention && isReplayStartSequenceError(err, hasLastID) {
 			sub, err = js.Subscribe(fullTopic, enqueueMessage,
-				buildFallbackOpts(fullTopic, nextSequence, "subscribe error")...)
+				buildFallbackOpts(fullTopic, nextSequence, "subscribe-time start sequence error")...)
 		}
 
 		if err != nil {
@@ -313,9 +313,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		subjectLabel := strings.Join(fullTopics, ",")
 		opts, belowRetention := buildSubscriptionOpts(subjectLabel)
 		sub, err := h.subscribeToMultipleTopics(js, conn, fullTopics, opts, enqueueRequestedMessage)
-		if err != nil && !belowRetention && startSequenceErr(err) {
+		if err != nil && !belowRetention && isReplayStartSequenceError(err, hasLastID) {
 			sub, err = h.subscribeToMultipleTopics(js, conn, fullTopics,
-				buildFallbackOpts(subjectLabel, nextSequence, "subscribe error"), enqueueRequestedMessage)
+				buildFallbackOpts(subjectLabel, nextSequence, "subscribe-time start sequence error"), enqueueRequestedMessage)
 		}
 		if err != nil {
 			metricsSubscriptionErrors.Inc()

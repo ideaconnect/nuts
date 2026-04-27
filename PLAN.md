@@ -22,12 +22,12 @@ This plan turns the current quality review into an execution checklist. It is in
 
 ## P0: Correctness And Safety
 
-- [ ] P0: Run semantic config validation before default normalization and before opening NATS connections in `Provision()`.
-- [ ] P0: Add lifecycle tests that prove invalid JSON config is rejected through the realistic Caddy `Provision()` / `Validate()` path.
-- [ ] P0: Preserve documented sentinel semantics while validating config, especially `max_event_size < 0` for unlimited and `client_buffer_size == 0` for default.
-- [ ] P0: Add regression tests for negative `max_connections`, `client_buffer_size`, `replay_max_messages`, `replay_window`, and unsupported `allowed_methods` through both Caddyfile and JSON-style construction.
-- [ ] P0: Make fallback replay behavior explicit in tests for both below-retention pre-checks and subscribe-time sequence errors.
-- [ ] P0: Verify cleanup behavior after every early return path that creates subscriptions or reserves a connection slot.
+- [x] P0: Run semantic config validation before default normalization and before opening NATS connections in `Provision()`.
+- [x] P0: Add lifecycle tests that prove invalid JSON config is rejected through the realistic Caddy `Provision()` / `Validate()` path.
+- [x] P0: Preserve documented sentinel semantics while validating config, especially `max_event_size < 0` for unlimited and `client_buffer_size == 0` for default.
+- [x] P0: Add regression tests for negative `max_connections`, `client_buffer_size`, `replay_max_messages`, `replay_window`, and unsupported `allowed_methods` through both Caddyfile and JSON-style construction.
+- [x] P0: Make fallback replay behavior explicit in tests for both below-retention pre-checks and subscribe-time sequence errors.
+- [x] P0: Verify cleanup behavior after every early return path that creates subscriptions or reserves a connection slot.
 
 ## P1: Request-Handling Refactor
 

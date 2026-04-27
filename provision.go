@@ -29,9 +29,12 @@ const defaultHealthPath = "/healthz"
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
 
-	// Step 0: validate required fields BEFORE opening any sockets so that a
-	// bad config can't leak resources.
+	// Step 0: validate configuration BEFORE normalizing defaults or opening any
+	// sockets so that a bad config can't leak resources.
 	if err := h.validateRequiredFields(); err != nil {
+		return err
+	}
+	if err := h.validateConfigValues(); err != nil {
 		return err
 	}
 

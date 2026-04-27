@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus"
@@ -361,6 +362,17 @@ func hasLogContaining(obs *observer.ObservedLogs, needle string) bool {
 	return false
 }
 
+func hasLogField(obs *observer.ObservedLogs, key, value string) bool {
+	for _, e := range obs.All() {
+		for _, field := range e.Context {
+			if field.Key == key && field.String == value {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ── TLS field validation ──────────────────────────────────────────────────
 
 func TestHandler_Validate_TLSCertKeyPairing(t *testing.T) {
@@ -474,6 +486,86 @@ func TestHandler_UnmarshalCaddyfile_RejectsNonNumericInt(t *testing.T) {
 	}
 }
 
+func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		line        string
+		wantErr     string
+		validateErr bool
+	}{
+		{
+			name:    "negative max connections",
+			line:    "max_connections -1",
+			wantErr: "max_connections",
+		},
+		{
+			name:    "negative client buffer size",
+			line:    "client_buffer_size -1",
+			wantErr: "client_buffer_size",
+		},
+		{
+			name:    "negative replay max messages",
+			line:    "replay_max_messages -1",
+			wantErr: "replay_max_messages",
+		},
+		{
+			name:    "negative replay window",
+			line:    "replay_window -1",
+			wantErr: "replay_window",
+		},
+		{
+			name:        "unsupported allowed method",
+			line:        "allowed_methods GET POST OPTIONS",
+			wantErr:     "allowed_methods",
+			validateErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := "nuts {\n    nats_url nats://localhost:4222\n    stream_name EVENTS\n    " + tt.line + "\n}"
+			d := caddyfile.NewTestDispenser(input)
+			h := Handler{}
+			err := h.UnmarshalCaddyfile(d)
+			if tt.validateErr {
+				if err != nil {
+					t.Fatalf("UnmarshalCaddyfile returned error before validation: %v", err)
+				}
+				err = h.Validate()
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want to contain %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestHandler_UnmarshalCaddyfile_PreservesSentinelConfigSemantics(t *testing.T) {
+	input := `nuts {
+        nats_url nats://localhost:4222
+        stream_name EVENTS
+        max_event_size -1
+        client_buffer_size 0
+    }`
+	d := caddyfile.NewTestDispenser(input)
+	h := Handler{}
+	if err := h.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile: %v", err)
+	}
+	if err := h.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if h.MaxEventSize != -1 {
+		t.Fatalf("MaxEventSize = %d, want -1 unlimited sentinel", h.MaxEventSize)
+	}
+	if h.ClientBufferSize != 0 {
+		t.Fatalf("ClientBufferSize = %d, want 0 default sentinel", h.ClientBufferSize)
+	}
+}
+
 func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -522,6 +614,104 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 				t.Fatalf("Validate() error = %q, want to contain %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *testing.T) {
+	tests := []struct {
+		name     string
+		fragment string
+		wantErr  string
+	}{
+		{
+			name:     "negative max connections",
+			fragment: `"max_connections": -1`,
+			wantErr:  "max_connections",
+		},
+		{
+			name:     "negative client buffer size",
+			fragment: `"client_buffer_size": -1`,
+			wantErr:  "client_buffer_size",
+		},
+		{
+			name:     "negative replay max messages",
+			fragment: `"replay_max_messages": -1`,
+			wantErr:  "replay_max_messages",
+		},
+		{
+			name:     "negative replay window",
+			fragment: `"replay_window": -1`,
+			wantErr:  "replay_window",
+		},
+		{
+			name:     "unsupported allowed method",
+			fragment: `"allowed_methods": ["GET", "POST", "OPTIONS"]`,
+			wantErr:  "allowed_methods",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte(`{"nats_url":"nats://127.0.0.1:1","stream_name":"EVENTS",` + tt.fragment + `}`)
+			var h Handler
+			if err := json.Unmarshal(raw, &h); err != nil {
+				t.Fatalf("json.Unmarshal: %v", err)
+			}
+
+			if err := h.Validate(); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want to contain %q", err, tt.wantErr)
+			}
+
+			err := h.Provision(caddy.Context{Context: context.Background()})
+			if err == nil {
+				t.Fatalf("expected Provision error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Provision() error = %q, want to contain %q", err.Error(), tt.wantErr)
+			}
+			if strings.Contains(err.Error(), "failed to connect to NATS") {
+				t.Fatalf("Provision dialed NATS before rejecting config: %v", err)
+			}
+
+			h.mu.RLock()
+			connNil := h.conn == nil
+			jsNil := h.js == nil
+			shutdownNil := h.shutdown == nil
+			h.mu.RUnlock()
+			if !connNil || !jsNil || !shutdownNil {
+				t.Fatalf("expected no runtime state after validation rejection, got connNil=%v jsNil=%v shutdownNil=%v", connNil, jsNil, shutdownNil)
+			}
+		})
+	}
+}
+
+func TestHandler_Provision_PreservesSentinelConfigSemantics(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	h := &Handler{
+		NatsURL:          ns.ClientURL(),
+		StreamName:       "EVENTS",
+		MaxEventSize:     -1,
+		ClientBufferSize: 0,
+	}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer h.Cleanup()
+
+	if h.MaxEventSize != -1 {
+		t.Fatalf("MaxEventSize = %d, want -1 unlimited sentinel", h.MaxEventSize)
+	}
+	if h.ClientBufferSize != defaultClientBufferSize {
+		t.Fatalf("ClientBufferSize = %d, want default %d", h.ClientBufferSize, defaultClientBufferSize)
 	}
 }
 
@@ -708,6 +898,7 @@ func TestHandler_ReplayMaxMessages_CapsFallback(t *testing.T) {
 		t.Fatalf("purge: %v", err)
 	}
 
+	core, obs := observer.New(zap.WarnLevel)
 	h := &Handler{
 		NatsURL:           ns.ClientURL(),
 		StreamName:        "EVENTS",
@@ -716,7 +907,7 @@ func TestHandler_ReplayMaxMessages_CapsFallback(t *testing.T) {
 		MaxEventSize:      -1,
 		AllowedOrigins:    []string{"*"},
 		ReplayMaxMessages: 2,
-		logger:            zap.NewNop(),
+		logger:            zap.New(core),
 	}
 	if err := h.connectNATS(); err != nil {
 		t.Fatalf("connectNATS: %v", err)
@@ -749,6 +940,9 @@ func TestHandler_ReplayMaxMessages_CapsFallback(t *testing.T) {
 	delivered := strings.Count(body, "event: message")
 	if delivered != 2 {
 		t.Errorf("expected exactly 2 message events under replay_max_messages=2, got %d\nbody: %s", delivered, body)
+	}
+	if !hasLogField(obs, "reason", "sequence below retention") {
+		t.Errorf("expected below-retention replay fallback log, entries=%+v", obs.All())
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1605,6 +1606,26 @@ func (f *failingFlushRecorder) Flush() {
 	// No-op for testing, actual flushing happens in real HTTP response.
 }
 
+func waitForConsumerCount(t *testing.T, js nats.JetStreamContext, stream string, want int, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if consumerCount(js, stream) == want {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return consumerCount(js, stream) == want
+}
+
+func consumerCount(js nats.JetStreamContext, stream string) int {
+	count := 0
+	for range js.ConsumerNames(stream) {
+		count++
+	}
+	return count
+}
+
 type slowFlushRecorder struct {
 	*httptest.ResponseRecorder
 	writeDelay time.Duration
@@ -1643,6 +1664,29 @@ func TestIsValidTopic(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isValidTopic(tt.topic); got != tt.want {
 				t.Errorf("isValidTopic(%q) = %v, want %v", tt.topic, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsReplayStartSequenceError(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		hasLastID bool
+		want      bool
+	}{
+		{name: "nil", hasLastID: true},
+		{name: "no last id", err: errors.New("start sequence 42 is no longer available"), want: false},
+		{name: "start sequence", err: errors.New("start sequence 42 is no longer available"), hasLastID: true, want: true},
+		{name: "sequence not found", err: errors.New("sequence not found"), hasLastID: true, want: true},
+		{name: "unrelated", err: errors.New("stream not found"), hasLastID: true, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isReplayStartSequenceError(tt.err, tt.hasLastID); got != tt.want {
+				t.Fatalf("isReplayStartSequenceError(%v, %v) = %v, want %v", tt.err, tt.hasLastID, got, tt.want)
 			}
 		})
 	}
@@ -1724,6 +1768,7 @@ func TestHandler_ServeHTTP_ConnectedWriteFailure(t *testing.T) {
 		ReconnectWait:     2,
 		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
+		MaxConnections:    1,
 		logger:            zap.NewNop(),
 	}
 
@@ -1756,6 +1801,83 @@ func TestHandler_ServeHTTP_ConnectedWriteFailure(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("ServeHTTP did not return after initial write failure")
 	}
+	if got := atomic.LoadInt64(&h.connCount); got != 0 {
+		t.Fatalf("connCount = %d, want 0 after connected write failure", got)
+	}
+	if !waitForConsumerCount(t, js, "TEST_EVENTS", 0, 2*time.Second) {
+		t.Fatalf("ephemeral consumer leaked after connected write failure")
+	}
+}
+
+func TestHandler_ServeHTTP_SubscribeFailureReleasesConnectionSlot(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	h.MaxConnections = 1
+	h.StreamName = "NOPE_DOES_NOT_EXIST"
+
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=err", nil)
+	w := &flushRecorder{httptest.NewRecorder()}
+	if err := h.ServeHTTP(w, req, nil); err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+	if got := atomic.LoadInt64(&h.connCount); got != 0 {
+		t.Fatalf("connCount = %d, want 0 after subscription failure", got)
+	}
+}
+
+func TestHandler_ServeHTTP_SubjectPrecheckReleasesConnectionSlot(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("failed to connect to NATS: %v", err)
+	}
+	defer nc.Close()
+
+	createTestStream(t, nc, "TEST_EVENTS", []string{"events.allowed"})
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "TEST_EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30,
+		MaxConnections:    1,
+		AllowedOrigins:    []string{"*"},
+		logger:            zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("failed to connect handler to NATS: %v", err)
+	}
+	defer h.Cleanup()
+	js, err := h.conn.JetStream()
+	if err != nil {
+		t.Fatalf("failed to create JetStream context: %v", err)
+	}
+	h.mu.Lock()
+	h.js = js
+	h.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=allowed&topic=blocked", nil)
+	w := &flushRecorder{httptest.NewRecorder()}
+	if err := h.ServeHTTP(w, req, nil); err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+	if got := atomic.LoadInt64(&h.connCount); got != 0 {
+		t.Fatalf("connCount = %d, want 0 after subject pre-check failure", got)
+	}
+	if !waitForConsumerCount(t, js, "TEST_EVENTS", 0, 2*time.Second) {
+		t.Fatalf("unexpected consumer after subject pre-check failure")
+	}
 }
 
 func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
@@ -1778,6 +1900,7 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 		ReconnectWait:     2,
 		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
+		MaxConnections:    1,
 		logger:            zap.NewNop(),
 	}
 
@@ -1818,6 +1941,12 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ServeHTTP did not return after message write failure")
+	}
+	if got := atomic.LoadInt64(&h.connCount); got != 0 {
+		t.Fatalf("connCount = %d, want 0 after message write failure", got)
+	}
+	if !waitForConsumerCount(t, js, "TEST_EVENTS", 0, 2*time.Second) {
+		t.Fatalf("ephemeral consumer leaked after message write failure")
 	}
 }
 
