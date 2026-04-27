@@ -1,4 +1,4 @@
-.PHONY: all build test test-unit test-functional test-functional-dev test-functional-stress test-functional-matrix docker-up wait-functional-stack docker-down docker-logs clean
+.PHONY: all build test test-unit test-performance test-functional test-functional-dev test-functional-stress test-functional-matrix docker-up wait-functional-stack docker-down docker-logs clean
 
 DOCKER_COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo docker compose; elif docker-compose version >/dev/null 2>&1; then echo docker-compose; fi)
 FUNCTIONAL_TEST_STRESS_COUNT ?= 3
@@ -17,6 +17,11 @@ test: test-unit test-functional
 # Run unit tests (uses embedded NATS server)
 test-unit:
 	go test -v -timeout 120s .
+
+# Run performance confidence tests and hot-path benchmarks.
+test-performance:
+	go test -run '^TestPerformance_' -timeout 180s .
+	go test -run '^$$' -bench 'Benchmark(FormatMessageEvent|TryParseJSON|IsValidTopic|CommonSubjectFilter|MultiTopicRequestedMessageHandler)' -benchmem .
 
 # Start Docker services for functional tests
 docker-up:
@@ -138,6 +143,7 @@ help:
 	@echo "  build            - Build the Caddy binary"
 	@echo "  test             - Run all tests (unit + functional)"
 	@echo "  test-unit        - Run unit tests with embedded NATS"
+	@echo "  test-performance - Run performance confidence tests and benchmarks"
 	@echo "  test-functional  - Run functional/BDD tests with Docker"
 	@echo "  test-functional-stress - Run functional/BDD tests repeatedly with Docker"
 	@echo "  test-functional-matrix - Run functional/BDD tests against old and current NATS images"

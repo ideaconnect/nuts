@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's retained range (previously the JetStream subscribe only
   silently started at `FirstSeq`; this flag-lit fallback enables the cap
   and window directives above and updates `nuts_replay_fallbacks_total`).
+- Performance confidence suite with benchmarks for SSE event formatting,
+  JSON compaction, topic validation, and multi-topic filtering, plus bounded
+  load, replay, slow-reader, goroutine, and memory-growth tests documented in
+  `PERFORMANCE.md`.
 - `CONTRIBUTING.md`, `SECURITY.md`, and this `CHANGELOG.md`.
 - Docker image now runs as non-root user `nuts` (uid 10001).
 

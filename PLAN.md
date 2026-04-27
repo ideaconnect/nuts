@@ -66,12 +66,12 @@ This plan turns the current quality review into an execution checklist. It is in
 
 ## P1: Performance And Load Confidence
 
-- [ ] P1: Add benchmarks for SSE event formatting, JSON compaction, topic validation, and multi-topic filtering.
-- [ ] P1: Add load tests for many concurrent SSE clients with a realistic message rate.
-- [ ] P1: Add slow-reader tests that measure disconnect behavior and ensure no goroutine leaks.
-- [ ] P1: Add replay-load tests for large retained streams with and without fallback caps.
-- [ ] P1: Track memory growth during large payload and large replay scenarios.
-- [ ] P1: Define target performance budgets for latency, memory per connection, and maximum sustainable clients per instance.
+- [x] P1: Add benchmarks for SSE event formatting, JSON compaction, topic validation, and multi-topic filtering.
+- [x] P1: Add load tests for many concurrent SSE clients with a realistic message rate.
+- [x] P1: Add slow-reader tests that measure disconnect behavior and ensure no goroutine leaks.
+- [x] P1: Add replay-load tests for large retained streams with and without fallback caps.
+- [x] P1: Track memory growth during large payload and large replay scenarios.
+- [x] P1: Define target performance budgets for latency, memory per connection, and maximum sustainable clients per instance.
 
 ## P1: Observability And Operations
 

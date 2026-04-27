@@ -302,6 +302,10 @@ worst-case ceiling before slow-client disconnects kick in. Lower
 `max_event_size -1` (unlimited) removes the per-event bound entirely and
 makes the ceiling unbounded.
 
+See [PERFORMANCE.md](PERFORMANCE.md) for latency, memory, and per-instance
+client-count budgets plus the load and benchmark commands used to validate
+them.
+
 #### `replay_max_messages` and `replay_window`
 
 Both guard against replay storms — when a client reconnects with a
@@ -804,6 +808,19 @@ go test -v -timeout 120s .
 # Run specific test
 go test -v -run TestHandler_ServeHTTP_Integration .
 ```
+
+#### Performance Confidence
+
+Performance confidence tests also use an embedded NATS server. They cover
+concurrent SSE clients, replay-load behavior, slow-reader disconnects,
+goroutine cleanup, large-payload memory growth, and hot-path benchmarks:
+
+```bash
+make test-performance
+```
+
+The current budgets and raw benchmark commands are documented in
+[PERFORMANCE.md](PERFORMANCE.md).
 
 #### Functional/BDD Tests
 
