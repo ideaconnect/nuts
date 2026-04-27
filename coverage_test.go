@@ -787,6 +787,140 @@ func TestHandler_NATSReconnect_AllowsSubsequentSSE(t *testing.T) {
 	<-done
 }
 
+func TestHandler_NATSReconnect_ConnectedSSEReceivesPostReconnectMessage(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+
+	storeDir := t.TempDir()
+	startServer := func() *server.Server {
+		opts := &server.Options{
+			Host:      "127.0.0.1",
+			Port:      port,
+			JetStream: true,
+			StoreDir:  storeDir,
+		}
+		ns, err := server.NewServer(opts)
+		if err != nil {
+			t.Fatalf("new server: %v", err)
+		}
+		go ns.Start()
+		if !ns.ReadyForConnections(5 * time.Second) {
+			t.Fatal("server not ready")
+		}
+		return ns
+	}
+
+	ns := startServer()
+	admin, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		ns.Shutdown()
+		t.Fatalf("admin connect: %v", err)
+	}
+	adminJS, _ := admin.JetStream()
+	if _, err := adminJS.AddStream(&nats.StreamConfig{
+		Name:     "EVENTS",
+		Subjects: []string{"events.>"},
+		Storage:  nats.FileStorage,
+	}); err != nil {
+		admin.Close()
+		ns.Shutdown()
+		t.Fatalf("add stream: %v", err)
+	}
+	admin.Close()
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30,
+		ReconnectWait:     1,
+		MaxReconnects:     intPtr(-1),
+		MaxEventSize:      -1,
+		AllowedOrigins:    []string{"*"},
+		logger:            zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		ns.Shutdown()
+		t.Fatalf("connectNATS: %v", err)
+	}
+	js, _ := h.conn.JetStream()
+	h.mu.Lock()
+	h.js = js
+	h.mu.Unlock()
+	defer h.Cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=live-reconnect", nil).WithContext(ctx)
+	rr := newSafeRecorder()
+	done := make(chan error, 1)
+	go func() { done <- h.ServeHTTP(rr, req, nil) }()
+
+	if !waitForSSEBody(rr, "event: connected", 2*time.Second) {
+		cancel()
+		<-done
+		ns.Shutdown()
+		t.Fatalf("SSE stream did not connect before restart; body=%s", rr.Body())
+	}
+
+	ns.Shutdown()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && h.conn.IsConnected() {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if h.conn.IsConnected() {
+		cancel()
+		<-done
+		t.Fatal("handler's NATS connection did not observe the shutdown")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("connected SSE stream ended during NATS shutdown: %v body=%s", err, rr.Body())
+	default:
+	}
+
+	ns2 := startServer()
+	defer ns2.Shutdown()
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && !h.conn.IsConnected() {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !h.conn.IsConnected() {
+		cancel()
+		<-done
+		t.Fatal("handler's NATS connection did not reconnect")
+	}
+
+	pub, err := nats.Connect(ns2.ClientURL())
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("post-reconnect admin connect: %v", err)
+	}
+	defer pub.Close()
+	pubJS, _ := pub.JetStream()
+	if _, err := pubJS.Publish("events.live-reconnect", []byte(`{"after":true}`)); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("publish after reconnect: %v", err)
+	}
+
+	if !waitForSSEBody(rr, `"after":true`, 5*time.Second) {
+		cancel()
+		<-done
+		t.Fatalf("connected SSE stream did not receive post-reconnect message; body=%s", rr.Body())
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ServeHTTP did not return after context cancel")
+	}
+}
+
 // ── JetStream persistence: messages survive handler cleanup ───────────────
 
 func TestHandler_JetStreamPersistence_MessagesSurviveHandlerLifetime(t *testing.T) {

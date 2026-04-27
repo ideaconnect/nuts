@@ -1314,6 +1314,29 @@ func TestParseMajorMinorVersion(t *testing.T) {
 	}
 }
 
+func TestSupportsMultiFilterSubjectsVersion(t *testing.T) {
+	tests := []struct {
+		version string
+		want    bool
+	}{
+		{version: "", want: false},
+		{version: "2.8.4", want: false},
+		{version: "2.9.25", want: false},
+		{version: "2.10.0", want: true},
+		{version: "v2.12.0", want: true},
+		{version: "3.0.0", want: true},
+		{version: "not-a-version", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.version, func(t *testing.T) {
+			if got := supportsMultiFilterSubjectsVersion(tt.version); got != tt.want {
+				t.Fatalf("supportsMultiFilterSubjectsVersion(%q) = %v, want %v", tt.version, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSubjectAllowedByStream(t *testing.T) {
 	tests := []struct {
 		name           string

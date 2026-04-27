@@ -598,7 +598,10 @@ func (h *Handler) subscribeToMultipleTopics(js nats.JetStreamContext, conn *nats
 }
 
 func supportsMultiFilterSubjects(conn *nats.Conn) bool {
-	version := connectedServerVersion(conn)
+	return supportsMultiFilterSubjectsVersion(connectedServerVersion(conn))
+}
+
+func supportsMultiFilterSubjectsVersion(version string) bool {
 	major, minor, ok := parseMajorMinorVersion(version)
 	if !ok {
 		return false

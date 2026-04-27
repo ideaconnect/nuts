@@ -49,11 +49,11 @@ This plan turns the current quality review into an execution checklist. It is in
 
 ## P1: Compatibility And NATS Behavior
 
-- [ ] P1: Add a NATS server version matrix for functional tests, including one version below 2.10 and one current 2.12+ version.
-- [ ] P1: Add explicit tests that prove NATS 2.10+ uses `ConsumerFilterSubjects` for multi-topic subscriptions.
-- [ ] P1: Add explicit tests that prove older NATS versions use wildcard subscription plus in-process filtering without duplicate delivery.
-- [ ] P1: Add tests for stream subject mismatches in multi-topic requests and verify the response is clear and consistent.
-- [ ] P1: Validate behavior when NATS reconnects while SSE clients are connected.
+- [x] P1: Add a NATS server version matrix for functional tests, including one version below 2.10 and one current 2.12+ version.
+- [x] P1: Add explicit tests that prove NATS 2.10+ uses `ConsumerFilterSubjects` for multi-topic subscriptions.
+- [x] P1: Add explicit tests that prove older NATS versions use wildcard subscription plus in-process filtering without duplicate delivery.
+- [x] P1: Add tests for stream subject mismatches in multi-topic requests and verify the response is clear and consistent.
+- [x] P1: Validate behavior when NATS reconnects while SSE clients are connected.
 
 ## P1: Security And Authorization
 

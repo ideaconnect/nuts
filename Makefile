@@ -1,7 +1,8 @@
-.PHONY: all build test test-unit test-functional test-functional-dev test-functional-stress docker-up wait-functional-stack docker-down docker-logs clean
+.PHONY: all build test test-unit test-functional test-functional-dev test-functional-stress test-functional-matrix docker-up wait-functional-stack docker-down docker-logs clean
 
 DOCKER_COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo docker compose; elif docker-compose version >/dev/null 2>&1; then echo docker-compose; fi)
 FUNCTIONAL_TEST_STRESS_COUNT ?= 3
+NATS_COMPAT_IMAGES ?= nats:2.9-alpine nats:2.12-alpine
 
 # Default target
 all: build test
@@ -93,6 +94,16 @@ test-functional-stress: docker-up
 	$(MAKE) docker-down || status=$$?; \
 	exit $$status
 
+# Run functional tests against old and current NATS server images.
+test-functional-matrix:
+	@echo "Running functional tests across NATS images: $(NATS_COMPAT_IMAGES)"
+	@status=0; \
+	for image in $(NATS_COMPAT_IMAGES); do \
+		echo "Functional matrix image: $$image"; \
+		NATS_IMAGE=$$image $(MAKE) test-functional || { status=$$?; break; }; \
+	done; \
+	exit $$status
+
 # Run Godog with pretty output
 godog: docker-up
 	@status=0; \
@@ -129,6 +140,7 @@ help:
 	@echo "  test-unit        - Run unit tests with embedded NATS"
 	@echo "  test-functional  - Run functional/BDD tests with Docker"
 	@echo "  test-functional-stress - Run functional/BDD tests repeatedly with Docker"
+	@echo "  test-functional-matrix - Run functional/BDD tests against old and current NATS images"
 	@echo "  docker-up        - Start Docker services"
 	@echo "  docker-down      - Stop Docker services"
 	@echo "  docker-logs      - Print functional test Docker service logs"

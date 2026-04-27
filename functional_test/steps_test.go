@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -160,6 +161,14 @@ func eventContains(events []sseEvent, text string) bool {
 	return false
 }
 
+func eventHasTopic(event sseEvent, topic string) bool {
+	if event.Event != "message" {
+		return false
+	}
+	return strings.Contains(event.Data, fmt.Sprintf(`"topic":"%s"`, topic)) ||
+		strings.Contains(event.Data, fmt.Sprintf(`"topic": "%s"`, topic))
+}
+
 func waitForSingleEvent(description string, match func(sseEvent) bool) error {
 	return waitUntil(description, functionalWaitTimeout, func() (bool, string) {
 		events, _ := singleEventsSnapshot()
@@ -175,6 +184,133 @@ func waitForSingleEvent(description string, match func(sseEvent) bool) error {
 func waitForSingleConnectedEvent() error {
 	return waitForSingleEvent("connected SSE event", func(event sseEvent) bool {
 		return event.Event == "connected"
+	})
+}
+
+func splitSubjects(subjectsCSV string) []string {
+	rawSubjects := strings.Split(subjectsCSV, ",")
+	subjects := make([]string, 0, len(rawSubjects))
+	for _, subject := range rawSubjects {
+		subject = strings.TrimSpace(subject)
+		if subject != "" {
+			subjects = append(subjects, subject)
+		}
+	}
+	return subjects
+}
+
+func functionalSupportsMultiFilterSubjects(version string) bool {
+	version = strings.TrimPrefix(version, "v")
+	if cut := strings.IndexAny(version, "-+"); cut >= 0 {
+		version = version[:cut]
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	return major > 2 || (major == 2 && minor >= 10)
+}
+
+func functionalCommonSubjectFilter(subjects []string) string {
+	if len(subjects) == 0 {
+		return ">"
+	}
+	common := strings.Split(subjects[0], ".")
+	for _, subject := range subjects[1:] {
+		parts := strings.Split(subject, ".")
+		limit := len(common)
+		if len(parts) < limit {
+			limit = len(parts)
+		}
+		idx := 0
+		for idx < limit && common[idx] == parts[idx] {
+			idx++
+		}
+		common = common[:idx]
+		if len(common) == 0 {
+			return ">"
+		}
+	}
+	for _, subject := range subjects {
+		if len(strings.Split(subject, ".")) == len(common) {
+			common = common[:len(common)-1]
+			break
+		}
+	}
+	if len(common) == 0 {
+		return ">"
+	}
+	return strings.Join(common, ".") + ".>"
+}
+
+func sameStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	wantSet := make(map[string]int, len(want))
+	for _, value := range want {
+		wantSet[value]++
+	}
+	for _, value := range got {
+		if wantSet[value] == 0 {
+			return false
+		}
+		wantSet[value]--
+	}
+	return true
+}
+
+func consumerUsesExpectedMultiTopicStrategy(info *nats.ConsumerInfo, subjects []string, supportsMultiFilter bool) bool {
+	if supportsMultiFilter {
+		return info.Config.FilterSubject == "" && sameStringSet(info.Config.FilterSubjects, subjects)
+	}
+	return len(info.Config.FilterSubjects) == 0 && info.Config.FilterSubject == functionalCommonSubjectFilter(subjects)
+}
+
+func consumerFilterSummary(infos []*nats.ConsumerInfo) string {
+	parts := make([]string, 0, len(infos))
+	for _, info := range infos {
+		parts = append(parts, fmt.Sprintf("name=%s filter_subject=%q filter_subjects=%v", info.Name, info.Config.FilterSubject, info.Config.FilterSubjects))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func streamShouldHaveActiveConsumerUsingExpectedMultiTopicFilters(streamName, subjectsCSV string) error {
+	subjects := splitSubjects(subjectsCSV)
+	if len(subjects) < 2 {
+		return fmt.Errorf("expected at least two subjects, got %q", subjectsCSV)
+	}
+	version := ""
+	if tc.natsConn != nil {
+		version = tc.natsConn.ConnectedServerVersion()
+	}
+	supportsMultiFilter := functionalSupportsMultiFilterSubjects(version)
+
+	return waitUntil("active multi-topic consumer filter strategy", functionalWaitTimeout, func() (bool, string) {
+		var infos []*nats.ConsumerInfo
+		for info := range tc.js.ConsumersInfo(streamName) {
+			if info != nil {
+				infos = append(infos, info)
+			}
+		}
+		for _, info := range infos {
+			if consumerUsesExpectedMultiTopicStrategy(info, subjects, supportsMultiFilter) {
+				return true, ""
+			}
+		}
+		strategy := "wildcard FilterSubject"
+		if supportsMultiFilter {
+			strategy = "FilterSubjects"
+		}
+		return false, fmt.Sprintf("server_version=%q expected=%s subjects=%v consumers=[%s]", version, strategy, subjects, consumerFilterSummary(infos))
 	})
 }
 
@@ -363,11 +499,37 @@ func iPublishMessageToSubject(message, subject string) error {
 
 func iShouldReceiveAnSSEEventWithTopic(topic string) error {
 	return waitForSingleEvent("SSE message with topic "+topic, func(event sseEvent) bool {
-		if event.Event != "message" {
-			return false
+		return eventHasTopic(event, topic)
+	})
+}
+
+func iShouldNotReceiveAnSSEEventWithTopic(topic string) error {
+	return waitForNoEvent("SSE message with topic "+topic, functionalQuietWindow, func() (bool, string) {
+		events, _ := singleEventsSnapshot()
+		for _, event := range events {
+			if eventHasTopic(event, topic) {
+				return true, fmt.Sprintf("events=%+v", events)
+			}
 		}
-		return strings.Contains(event.Data, fmt.Sprintf(`"topic":"%s"`, topic)) ||
-			strings.Contains(event.Data, fmt.Sprintf(`"topic": "%s"`, topic))
+		return false, ""
+	})
+}
+
+func iShouldHaveReceivedSSEMessageEvents(expected int) error {
+	if err := waitUntil(fmt.Sprintf("%d SSE message events", expected), functionalWaitTimeout, func() (bool, string) {
+		events, _ := singleEventsSnapshot()
+		got := countMessages(events)
+		return got == expected, fmt.Sprintf("got %d message events", got)
+	}); err != nil {
+		return err
+	}
+	return waitForNoEvent(fmt.Sprintf("more than %d SSE message events", expected), functionalQuietWindow, func() (bool, string) {
+		events, _ := singleEventsSnapshot()
+		got := countMessages(events)
+		if got > expected {
+			return true, fmt.Sprintf("got %d message events", got)
+		}
+		return false, ""
 	})
 }
 
@@ -865,6 +1027,8 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 
 	// Then steps
 	ctx.Step(`^I should receive an SSE event with topic "([^"]*)"$`, iShouldReceiveAnSSEEventWithTopic)
+	ctx.Step(`^I should not receive an SSE event with topic "([^"]*)"$`, iShouldNotReceiveAnSSEEventWithTopic)
+	ctx.Step(`^I should have received (\d+) SSE message events?$`, iShouldHaveReceivedSSEMessageEvents)
 	ctx.Step(`^the event payload should contain "([^"]*)"$`, theEventPayloadShouldContain)
 	ctx.Step(`^the event should have an ID$`, theEventShouldHaveAnID)
 	ctx.Step(`^I should receive an SSE event containing '([^']*)'$`, iShouldReceiveAnSSEEventContaining)
@@ -875,6 +1039,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the response should contain "([^"]*)"$`, theResponseShouldContain)
 	ctx.Step(`^the response header "([^"]*)" should be "([^"]*)"$`, theResponseHeaderShouldBe)
 	ctx.Step(`^I should receive a heartbeat comment$`, iShouldReceiveAHeartbeatComment)
+	ctx.Step(`^the stream "([^"]*)" should have an active consumer using expected multi-topic filters for subjects "([^"]*)"$`, streamShouldHaveActiveConsumerUsingExpectedMultiTopicFilters)
 
 	// Multi-client steps
 	ctx.Step(`^client "([^"]*)" is connected to SSE endpoint "([^"]*)"$`, clientIsConnectedToSSEEndpoint)

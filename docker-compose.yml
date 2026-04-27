@@ -1,6 +1,6 @@
 services:
   nats:
-    image: nats:2.12-alpine
+    image: ${NATS_IMAGE:-nats:2.12-alpine}
     container_name: nuts-nats
     ports:
       - "4222:4222"   # Client connections
