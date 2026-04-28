@@ -1,4 +1,21 @@
 // serve.go — HTTP/SSE request handling.
+//
+// This file contains the per-request hot path: it accepts an HTTP GET from a
+// browser EventSource, parses the requested topics and replay cursor, opens a
+// JetStream subscription, and pumps messages back as Server-Sent Events until
+// the client disconnects, the handler shuts down, or the slow-client guard
+// fires.
+//
+// The request lifecycle is broken into small, testable steps invoked from
+// ServeHTTP:
+//
+//  1. handleControlRequest    — short-circuits health/liveness/readiness/CORS.
+//  2. parseStreamRequest      — extracts and validates topics and Last-Event-ID.
+//  3. authorizeStreamRequest  — enforces optional subscriber JWT auth.
+//  4. readStreamSnapshot      — reads JetStream state to inform planning.
+//  5. planSubscription        — picks the replay mode and detects bad topics.
+//  6. executeSubscriptionPlan — opens the JetStream subscription (with fallback).
+//  7. serveStream             — runs the SSE select-loop until disconnect.
 package nuts
 
 import (
@@ -17,48 +34,110 @@ import (
 )
 
 const (
+	// maxReplayCursor is reserved as an "invalid" sentinel: a Last-Event-ID
+	// equal to math.MaxUint64 cannot be incremented for StartSequence without
+	// wrapping, so we reject it up-front and fall back to DeliverNew.
 	maxReplayCursor = ^uint64(0)
 
-	// nats.go v1.37 exposes APIError but not this server error-code constant.
+	// jsErrCodeSequenceNotFound is the JetStream API error returned when a
+	// requested StartSequence has been purged from retention. nats.go v1.37
+	// exposes APIError but not this server error-code constant, so we redeclare
+	// it locally and match against APIError.ErrorCode.
 	jsErrCodeSequenceNotFound nats.ErrorCode = 10043
 )
 
+// replayMode describes how a JetStream subscription should position itself
+// when a client connects: starting at "now", at a specific sequence, or via
+// one of the fallback strategies when the requested sequence is unreachable.
 type replayMode string
 
 const (
-	replayModeDeliverNew          replayMode = "deliver_new"
-	replayModeStartSequence       replayMode = "start_sequence"
-	replayModeFallbackDeliverAll  replayMode = "fallback_deliver_all"
-	replayModeFallbackStartTime   replayMode = "fallback_start_time"
-	dropReasonRawPayload          string     = "raw_payload"
-	dropReasonFormattedSSEMessage string     = "formatted_sse_message"
+	// replayModeDeliverNew skips all retained messages and only delivers
+	// future events. Used when no Last-Event-ID is provided.
+	replayModeDeliverNew replayMode = "deliver_new"
+	// replayModeStartSequence resumes from a specific JetStream sequence
+	// (Last-Event-ID + 1). Used on browser EventSource reconnects.
+	replayModeStartSequence replayMode = "start_sequence"
+	// replayModeFallbackDeliverAll is chosen when the requested sequence has
+	// been purged and no replay window is configured: replay everything still
+	// retained.
+	replayModeFallbackDeliverAll replayMode = "fallback_deliver_all"
+	// replayModeFallbackStartTime is chosen when a replay window is configured
+	// and either the requested sequence was purged or it predates the window.
+	// The subscription starts at now-ReplayWindow instead of at the sequence.
+	replayModeFallbackStartTime replayMode = "fallback_start_time"
+
+	// dropReasonRawPayload tags a drop that fired because the inbound NATS
+	// payload itself exceeded MaxEventSize (checked before JSON parsing so we
+	// never allocate the formatted frame for an oversized message).
+	dropReasonRawPayload string = "raw_payload"
+	// dropReasonFormattedSSEMessage tags a drop where the raw payload fit but
+	// the JSON-wrapped SSE frame (id/event/data envelope plus encoded payload)
+	// exceeded MaxEventSize.
+	dropReasonFormattedSSEMessage string = "formatted_sse_message"
 )
 
+// isFallback reports whether the mode was selected by the fallback path
+// rather than by an explicit client request. Used to avoid double-fallback
+// when a fallback subscription itself fails.
 func (m replayMode) isFallback() bool {
 	return m == replayModeFallbackDeliverAll || m == replayModeFallbackStartTime
 }
 
+// replayPlan captures the resolved replay strategy for a single SSE request.
+// It is built during planSubscription and consumed by subscriptionOptions.
 type replayPlan struct {
-	HasLastID      bool
-	Mode           replayMode
-	StartSequence  uint64
-	StartTime      time.Time
-	CapSequence    uint64
+	// HasLastID is true when the request supplied either a Last-Event-ID
+	// header or a last-id query parameter.
+	HasLastID bool
+	// Mode is the strategy chosen for this request (see replayMode constants).
+	Mode replayMode
+	// StartSequence is the JetStream sequence to resume from (last-id + 1)
+	// when Mode is replayModeStartSequence, or the originally requested
+	// sequence preserved for log/diagnostic context when a fallback fires.
+	StartSequence uint64
+	// StartTime is set when Mode is replayModeFallbackStartTime; messages
+	// before this instant are filtered out client-side as well to defend
+	// against server clock skew.
+	StartTime time.Time
+	// CapSequence is the highest sequence considered "historical replay"
+	// at the moment the subscription opens. Anything above it is live
+	// traffic and does not count toward replay_max_messages.
+	CapSequence uint64
+	// FallbackReason is a short human-readable string explaining why a
+	// fallback was chosen; surfaced in logs and metrics.
 	FallbackReason string
 }
 
+// streamPlan is the full per-request plan: which topics/subjects to bind to,
+// the chosen replay strategy, and any topics that pre-flight rejected.
 type streamPlan struct {
-	Topics            []string
-	FullSubjects      []string
+	// Topics are the un-prefixed topic names from the request, in the order
+	// they were supplied. Used for client-facing log fields.
+	Topics []string
+	// FullSubjects are the topics with TopicPrefix applied, in the same order.
+	// These are what JetStream actually sees.
+	FullSubjects []string
+	// RequestedSubjects is a set of FullSubjects, used as a fast filter for
+	// the multi-topic wildcard fallback path (see subscribeToMultipleTopics).
 	RequestedSubjects map[string]struct{}
-	Replay            replayPlan
-	FailedTopics      []string
+	// Replay is the resolved replay plan for this request.
+	Replay replayPlan
+	// FailedTopics lists topic names that were rejected during planning
+	// (e.g. not allowed by the configured stream's subject filters). When
+	// non-empty, the request short-circuits with 503.
+	FailedTopics []string
 }
 
+// subjectLabel produces a single comma-joined subject string suitable for log
+// fields where one entry per stream is expected.
 func (p streamPlan) subjectLabel() string {
 	return strings.Join(p.FullSubjects, ",")
 }
 
+// streamLogFields builds the standard set of structured log fields for a
+// stream request. Always include these on stream-related log lines so log
+// aggregators can correlate events from the same SSE connection.
 func streamLogFields(plan streamPlan) []zap.Field {
 	fields := []zap.Field{
 		zap.Strings("topics", plan.Topics),
@@ -76,29 +155,53 @@ func streamLogFields(plan streamPlan) []zap.Field {
 	return fields
 }
 
+// appendStreamLogFields returns the standard stream log fields with extra
+// per-call fields appended. Prefer this over manual append() calls so the
+// base set stays consistent across log lines.
 func appendStreamLogFields(plan streamPlan, fields ...zap.Field) []zap.Field {
 	return append(streamLogFields(plan), fields...)
 }
 
+// streamInfoSnapshot is a frozen view of relevant JetStream stream state at
+// the moment the request was planned. Reading once and reusing avoids racing
+// against background JetStream activity during planning decisions.
 type streamInfoSnapshot struct {
-	FirstSeq             uint64
-	LastSeq              uint64
-	Subjects             []string
-	StartSequenceTime    time.Time
+	// FirstSeq is the lowest sequence currently retained in the stream.
+	// Used to detect requests for purged sequences.
+	FirstSeq uint64
+	// LastSeq is the highest sequence at snapshot time. Used as the replay
+	// cap so live messages don't count against replay_max_messages.
+	LastSeq uint64
+	// Subjects are the configured stream subject filters; a multi-topic
+	// request whose subjects are not allowed by these filters is rejected.
+	Subjects []string
+	// StartSequenceTime is the publish time of the requested replay start
+	// sequence, when the message is still retained. Used for replay_window
+	// comparisons.
+	StartSequenceTime time.Time
+	// HasStartSequenceTime distinguishes a missing timestamp from a zero one.
 	HasStartSequenceTime bool
 }
 
+// streamRuntime is a snapshot of the handler's NATS-level state under the
+// handler mutex. Captured once per request so the streaming loop can run
+// without re-locking on every message.
 type streamRuntime struct {
 	conn     *nats.Conn
 	js       nats.JetStreamContext
 	shutdown <-chan struct{}
 }
 
+// streamRequestError is a structured error returned by the request-parsing
+// and authorization steps. Exists so handlers can defer the actual HTTP
+// write (and any auth-specific headers) to a single .write() call.
 type streamRequestError struct {
 	status  int
 	message string
 }
 
+// write sends the error to the client. For 401 responses it also advertises
+// the bearer scheme so browsers and clients know which credential to send.
 func (e *streamRequestError) write(w http.ResponseWriter) {
 	if e.status == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="nuts"`)
@@ -106,24 +209,47 @@ func (e *streamRequestError) write(w http.ResponseWriter) {
 	http.Error(w, e.message, e.status)
 }
 
+// subscriptionResult is the outcome of executeSubscriptionPlan: either a set
+// of opened subscriptions to be cleaned up on disconnect, or a list of
+// topics that could not be subscribed.
 type subscriptionResult struct {
 	Subscriptions []*nats.Subscription
 	FailedTopics  []string
 }
 
+// formattedMessageEvent is the output of formatMessageEvent: either a fully
+// rendered SSE frame, or a drop record explaining why nothing was sent.
+// Splitting "format" from "write" keeps the streaming select-loop free of
+// allocation/encoding logic and makes the formatter unit-testable.
 type formattedMessageEvent struct {
-	Frame             string
-	Subject           string
+	// Frame is the rendered SSE bytes ready to flush. Empty when Dropped.
+	Frame string
+	// Subject is the NATS subject the message arrived on (logged on drops).
+	Subject string
+	// StreamSequence is the JetStream sequence; used as the SSE id: field and
+	// to bound replay_max_messages.
 	StreamSequence    uint64
 	HasStreamSequence bool
-	MessageTime       time.Time
-	HasMessageTime    bool
-	Dropped           bool
-	DropReason        string
-	DropSize          int
-	MetadataErr       error
+	// MessageTime is the original publish time from JetStream metadata; used
+	// to filter out messages older than the replay window.
+	MessageTime    time.Time
+	HasMessageTime bool
+	// Dropped is set when the formatter chose not to emit (oversize).
+	Dropped bool
+	// DropReason names the drop bucket for metrics/logging.
+	DropReason string
+	// DropSize is the size that triggered the drop, used in operator logs.
+	DropSize int
+	// MetadataErr captures a JetStream metadata read failure. The frame is
+	// still emitted in this case (with fallback timestamp/no id) so a
+	// metadata blip doesn't drop messages, but the error is logged.
+	MetadataErr error
 }
 
+// isReplayStartSequenceError reports whether the JetStream subscribe error
+// signals "the requested StartSequence is unreachable". Two server signals
+// can mean this: an APIError with code 10043, or a consumer sequence
+// mismatch. Both are recoverable via the replay-fallback path.
 func isReplayStartSequenceError(err error, hasLastID bool) bool {
 	if err == nil || !hasLastID {
 		return false
@@ -136,7 +262,11 @@ func isReplayStartSequenceError(err error, hasLastID bool) bool {
 	return errors.As(err, &sequenceMismatch)
 }
 
-// ServeHTTP implements the caddyhttp.MiddlewareHandler interface.
+// ServeHTTP implements caddyhttp.MiddlewareHandler. It dispatches health and
+// CORS-preflight requests, validates and authorizes the SSE subscription
+// request, opens a JetStream subscription, and runs the SSE streaming loop
+// until the client or the server closes the connection. Non-stream requests
+// are passed to the next handler in the Caddy chain when one is configured.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if handled, err := h.handleControlRequest(w, r, next); handled {
 		return err
@@ -169,6 +299,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
+	// Reserve before opening a JetStream subscription so we never pay the
+	// subscription cost for a request we'd just reject anyway.
 	if h.MaxConnections > 0 {
 		if !h.reserveConnSlot() {
 			metricsConnectionsRejected.WithLabelValues("max_connections").Inc()
@@ -221,6 +353,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return h.serveStream(w, flusher, r, plan, msgChan, slowClient, runtime.shutdown)
 }
 
+// handleControlRequest short-circuits requests that aren't SSE subscriptions:
+// liveness/readiness/health probes, CORS preflight, and any non-GET method.
+// The first return value reports whether the request was handled (and
+// ServeHTTP should stop); the second is the error to bubble up.
 func (h *Handler) handleControlRequest(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) (bool, error) {
 	if r.Method == http.MethodGet && h.matchesLivePath(r.URL.Path) {
 		return true, h.serveLiveCheck(w)
@@ -251,9 +387,16 @@ func (h *Handler) handleControlRequest(w http.ResponseWriter, r *http.Request, n
 	return false, nil
 }
 
+// parseStreamRequest extracts the topic list and replay cursor from the
+// incoming request and returns the resulting streamPlan. Topics may come
+// from repeated ?topic= query parameters or from a path shorthand
+// (/a/b → a.b). Returns a streamRequestError for any client-fixable issue
+// so ServeHTTP can map it to a 4xx response.
 func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamRequestError) {
 	topics := r.URL.Query()["topic"]
 	if len(topics) == 0 {
+		// Path shorthand: GET /orders/new is equivalent to ?topic=orders.new.
+		// Lets simple consumers subscribe without query-string handling.
 		path := strings.Trim(r.URL.Path, "/")
 		if path != "" {
 			topics = []string{strings.ReplaceAll(path, "/", ".")}
@@ -277,6 +420,8 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 	}
 	for _, topic := range topics {
 		fullSubject := h.TopicPrefix + topic
+		// De-duplicate so a client requesting ?topic=a&topic=a doesn't
+		// double-subscribe and double-deliver every message.
 		if _, exists := plan.RequestedSubjects[fullSubject]; exists {
 			continue
 		}
@@ -285,6 +430,8 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 		plan.FullSubjects = append(plan.FullSubjects, fullSubject)
 	}
 
+	// Query parameter takes precedence over the header so a client can
+	// override what the browser auto-attaches on EventSource reconnect.
 	lastIDStr := r.URL.Query().Get("last-id")
 	queryProvided := lastIDStr != ""
 	if lastIDStr == "" {
@@ -293,6 +440,9 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 	if lastIDStr != "" {
 		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
 		if err != nil || parsedID == maxReplayCursor {
+			// Explicit ?last-id= is a client error (bad request); a header
+			// value usually came from a browser auto-resume and we'd rather
+			// downgrade to DeliverNew than break reconnect entirely.
 			if queryProvided {
 				return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Invalid last-id value: must be an unsigned integer below the maximum cursor value"}
 			}
@@ -317,6 +467,10 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 	return plan, nil
 }
 
+// currentStreamRuntime takes a single locked snapshot of the handler's
+// NATS-level state. Cleanup() can swap these fields under the same mutex,
+// so a per-request snapshot lets the streaming loop run without holding
+// the lock for the duration of the connection.
 func (h *Handler) currentStreamRuntime() streamRuntime {
 	h.mu.RLock()
 	runtime := streamRuntime{conn: h.conn, js: h.js, shutdown: h.shutdown}
@@ -324,6 +478,17 @@ func (h *Handler) currentStreamRuntime() streamRuntime {
 	return runtime
 }
 
+// newMessageQueue creates the per-request fan-in channels used to ferry
+// JetStream messages from the NATS callback goroutine to the SSE writer.
+// Returns:
+//   - msgChan: the bounded buffer the SSE loop reads from.
+//   - slowClient: 1-slot signal channel; receives the offending subject when
+//     the buffer fills, telling the loop to disconnect rather than drop.
+//   - done: closed by cleanupStream to release the NATS callback if it is
+//     blocked trying to publish to a dead client.
+//   - enqueueMessage: the nats.MsgHandler the subscription is bound to.
+//
+// Buffer size comes from ClientBufferSize (defaults to defaultClientBufferSize).
 func (h *Handler) newMessageQueue() (chan *nats.Msg, chan string, chan struct{}, nats.MsgHandler) {
 	bufSize := h.ClientBufferSize
 	if bufSize <= 0 {
@@ -337,15 +502,26 @@ func (h *Handler) newMessageQueue() (chan *nats.Msg, chan string, chan struct{},
 	enqueueMessage := func(msg *nats.Msg) {
 		select {
 		case <-done:
+			// Connection already torn down; drop silently rather than
+			// blocking the NATS callback indefinitely.
 			return
 		case msgChan <- msg:
 		default:
+			// Buffer is full: the client is consuming slower than the stream
+			// is producing. Signal the SSE loop to disconnect (the only safe
+			// option — accumulating would OOM, dropping would silently lose).
 			h.signalSlowClient(slowClient, msg.Subject, done, dispatchTimeout)
 		}
 	}
 	return msgChan, slowClient, done, enqueueMessage
 }
 
+// signalSlowClient sends the subject of the message that overflowed the
+// client buffer to the SSE loop, so it can disconnect with a meaningful
+// log line. If timeout > 0 the send is bounded so a wedged loop cannot
+// deadlock the NATS callback goroutine; instead a warning is logged and
+// the message is effectively dropped at this point. The done channel
+// short-circuits the wait when the connection is being torn down.
 func (h *Handler) signalSlowClient(slowClient chan<- string, subject string, done <-chan struct{}, timeout time.Duration) {
 	if timeout <= 0 {
 		select {
@@ -370,6 +546,10 @@ func (h *Handler) signalSlowClient(slowClient chan<- string, subject string, don
 	}
 }
 
+// requestedMessageHandler wraps enqueueMessage with a subject filter. Used
+// for the multi-topic wildcard fallback (servers older than NATS 2.10 do
+// not support multi-filter consumers, so we subscribe to a common parent
+// subject and filter client-side).
 func (p streamPlan) requestedMessageHandler(enqueueMessage nats.MsgHandler) nats.MsgHandler {
 	return func(msg *nats.Msg) {
 		if _, ok := p.RequestedSubjects[msg.Subject]; !ok {
@@ -379,6 +559,14 @@ func (p streamPlan) requestedMessageHandler(enqueueMessage nats.MsgHandler) nats
 	}
 }
 
+// readStreamSnapshot fetches the JetStream stream metadata needed for
+// planning, but only when planning actually depends on it: replay requests
+// (need first/last sequence and the start-sequence timestamp for window
+// checks) or multi-topic requests (need configured subjects to validate
+// each topic against the stream filter). Single-topic, no-replay requests
+// skip the round trip entirely. Read failures are logged at debug and
+// return a zero-value snapshot, which downstream code treats as "no
+// snapshot info available".
 func (h *Handler) readStreamSnapshot(js nats.JetStreamContext, plan streamPlan) streamInfoSnapshot {
 	if plan.Replay.HasLastID || len(plan.FullSubjects) > 1 {
 		if info, infoErr := js.StreamInfo(h.StreamName); infoErr == nil {
@@ -409,6 +597,13 @@ func (h *Handler) readStreamSnapshot(js nats.JetStreamContext, plan streamPlan) 
 	return streamInfoSnapshot{}
 }
 
+// planSubscription finalises the streamPlan in the light of the JetStream
+// snapshot. It detects topics that the configured stream does not allow
+// (multi-topic only — single-topic subscribe failures surface at subscribe
+// time as a clearer error), and rewrites the replay plan to a fallback
+// when the requested sequence is below retention or outside the configured
+// replay_window. Idempotent: calling it twice with the same snapshot yields
+// the same result.
 func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot) streamPlan {
 	if len(plan.FullSubjects) > 1 && len(snapshot.Subjects) > 0 {
 		for idx, fullSubject := range plan.FullSubjects {
@@ -431,6 +626,12 @@ func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot)
 	return plan
 }
 
+// shouldUseReplayWindow reports whether the configured replay window forces
+// the request into the time-bounded fallback even though the requested
+// sequence is still retained. We force the fallback when the original
+// publish time is older than now-ReplayWindow, or when we couldn't read
+// the start-sequence timestamp at all (conservative: assume out-of-window
+// rather than risk emitting forbidden history).
 func (h *Handler) shouldUseReplayWindow(replay replayPlan, snapshot streamInfoSnapshot) bool {
 	if h.ReplayWindow <= 0 || !replay.HasLastID || snapshot.LastSeq < replay.StartSequence {
 		return false
@@ -442,6 +643,10 @@ func (h *Handler) shouldUseReplayWindow(replay replayPlan, snapshot streamInfoSn
 	return snapshot.StartSequenceTime.Before(windowStart)
 }
 
+// fallbackReplayPlan rewrites a replay plan to one of the two fallback
+// modes: time-bounded when ReplayWindow is configured, otherwise deliver-all.
+// The reason string is preserved on the plan and surfaced in logs/metrics so
+// operators can tell why a fallback fired.
 func (h *Handler) fallbackReplayPlan(replay replayPlan, reason string) replayPlan {
 	replay.FallbackReason = reason
 	if h.ReplayWindow > 0 {
@@ -453,10 +658,16 @@ func (h *Handler) fallbackReplayPlan(replay replayPlan, reason string) replayPla
 	return replay
 }
 
+// replayWindowStart returns the wall-clock instant at which a time-bounded
+// fallback subscription should begin (now - ReplayWindow seconds).
 func (h *Handler) replayWindowStart() time.Time {
 	return time.Now().Add(-time.Duration(h.ReplayWindow) * time.Second)
 }
 
+// subscriptionOptions translates the resolved replay plan into the SubOpts
+// that JetStream expects. Always pins the consumer to the configured stream
+// (BindStream) and disables acks (AckNone) — NUTS is read-only and replay is
+// driven entirely by start position, not by ack state.
 func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
 	opts := []nats.SubOpt{nats.BindStream(h.StreamName), nats.AckNone()}
 	switch plan.Replay.Mode {
@@ -495,6 +706,12 @@ func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
 	return opts
 }
 
+// executeSubscriptionPlan opens the JetStream subscription that backs the
+// SSE stream. If the initial subscribe fails specifically because the
+// requested StartSequence is unreachable, it retries once via the
+// replay-fallback path so a transient race between StreamInfo (used for
+// planning) and Subscribe (which actually positions the consumer) does not
+// surface as a 503 to the client.
 func (h *Handler) executeSubscriptionPlan(js nats.JetStreamContext, conn *nats.Conn, plan streamPlan, enqueueMessage, enqueueRequestedMessage nats.MsgHandler) subscriptionResult {
 	if len(plan.FailedTopics) > 0 {
 		return subscriptionResult{FailedTopics: append([]string{}, plan.FailedTopics...)}
@@ -530,6 +747,10 @@ func (h *Handler) executeSubscriptionPlan(js nats.JetStreamContext, conn *nats.C
 	}
 }
 
+// subscribeWithPlan opens one JetStream subscription that satisfies the
+// plan. Single-topic uses Subscribe directly; multi-topic dispatches to
+// subscribeToMultipleTopics, which picks between native multi-filter
+// (NATS 2.10+) and the wildcard-with-client-filter fallback.
 func (h *Handler) subscribeWithPlan(js nats.JetStreamContext, conn *nats.Conn, plan streamPlan, enqueueMessage, enqueueRequestedMessage nats.MsgHandler) (*nats.Subscription, error) {
 	opts := h.subscriptionOptions(plan)
 	if len(plan.FullSubjects) == 1 {
@@ -538,6 +759,11 @@ func (h *Handler) subscribeWithPlan(js nats.JetStreamContext, conn *nats.Conn, p
 	return h.subscribeToMultipleTopics(js, plan, opts, enqueueRequestedMessage, supportsMultiFilterSubjects(conn), connectedServerVersion(conn))
 }
 
+// cleanupStream tears down a request's NATS subscriptions and signals the
+// message-queue side via the done channel. Closing done first releases any
+// NATS callback that may still be blocked on a slow-client signal so it
+// doesn't outlive the request. Unsubscribe failures are logged but not
+// propagated — there's nothing the caller can do about them.
 func (h *Handler) cleanupStream(done chan struct{}, subscriptions []*nats.Subscription) {
 	close(done)
 	for _, sub := range subscriptions {
@@ -549,6 +775,20 @@ func (h *Handler) cleanupStream(done chan struct{}, subscriptions []*nats.Subscr
 	}
 }
 
+// serveStream is the SSE writer loop. It writes the response headers and the
+// initial "connected" event, then multiplexes between four sources until any
+// of them terminates the connection:
+//
+//   - shutdown    — Cleanup() closing the handler-wide channel.
+//   - slowClient  — the message queue overflowed; disconnect to protect us.
+//   - ctx.Done()  — the HTTP client closed or timed out.
+//   - msgChan     — a JetStream message to format and flush.
+//   - heartbeat.C — periodic SSE comment to keep proxies from closing idle
+//     connections.
+//
+// Returns nil on every termination path: SSE has no notion of an HTTP error
+// after streaming has begun, so all exits are observable as a normal
+// connection close.
 func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *http.Request, plan streamPlan, msgChan <-chan *nats.Msg, slowClient <-chan string, shutdown <-chan struct{}) error {
 	metricsActiveConnections.Inc()
 	defer metricsActiveConnections.Dec()
@@ -558,6 +798,9 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	// X-Accel-Buffering: no tells nginx (and other proxies that respect it)
+	// not to buffer the response, which would otherwise hold events until
+	// flush thresholds are met and break SSE's near-real-time guarantee.
 	w.Header().Set("X-Accel-Buffering", "no")
 	if h.HubURL != "" {
 		w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"nuts\"", h.HubURL))
@@ -673,6 +916,11 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 	}
 }
 
+// shouldSkipReplayWindowMessage filters out messages that JetStream
+// delivered but predate the configured replay window. Necessary because
+// nats.StartTime() resolution is server-side and can include messages
+// published an instant before the requested cutoff; this is the
+// belt-and-braces client-side check.
 func shouldSkipReplayWindowMessage(plan streamPlan, formatted formattedMessageEvent) bool {
 	return plan.Replay.Mode == replayModeFallbackStartTime &&
 		!plan.Replay.StartTime.IsZero() &&
@@ -680,6 +928,12 @@ func shouldSkipReplayWindowMessage(plan streamPlan, formatted formattedMessageEv
 		formatted.MessageTime.Before(plan.Replay.StartTime)
 }
 
+// countsTowardReplayCap reports whether a delivered message should count
+// against ReplayMaxMessages. Only true when (a) the cap is configured,
+// (b) the request asked for replay, and (c) the message's sequence is at
+// or below the cap recorded when the subscription opened (i.e. it is
+// historical replay, not new live traffic produced after we connected).
+// Without sequence metadata we conservatively count it.
 func (h *Handler) countsTowardReplayCap(plan streamPlan, formatted formattedMessageEvent) bool {
 	if h.ReplayMaxMessages <= 0 || !plan.Replay.HasLastID {
 		return false
@@ -690,14 +944,32 @@ func (h *Handler) countsTowardReplayCap(plan streamPlan, formatted formattedMess
 	return formatted.StreamSequence <= plan.Replay.CapSequence
 }
 
+// formatConnectedEvent renders the SSE handshake event sent immediately
+// after headers. Useful for clients that want to confirm the subscription
+// landed on the topics they expected (after path-shorthand expansion or
+// authorization-driven topic filtering).
 func formatConnectedEvent(topics []string) string {
 	return fmt.Sprintf("event: connected\ndata: {\"topics\":%s}\n\n", toJSON(topics))
 }
 
+// formatHeartbeatEvent renders an SSE comment line ("colon-prefixed"
+// per the SSE spec) carrying the current time. Comments are ignored by
+// EventSource clients but keep proxies from declaring the connection idle.
 func formatHeartbeatEvent(now time.Time) string {
 	return fmt.Sprintf(": heartbeat %s\n\n", now.UTC().Format(time.RFC3339))
 }
 
+// formatMessageEvent turns a NATS message into a fully rendered SSE frame
+// (or a Dropped record). Drops are decided in two places:
+//
+//  1. Before any work: if the raw NATS payload exceeds MaxEventSize, we
+//     bail before parsing JSON or building the envelope.
+//  2. After rendering: if the JSON-wrapped frame exceeds MaxEventSize.
+//
+// JetStream metadata read failures do not drop the message — we render
+// with `now` as the timestamp and no `id:` field so a metadata blip
+// doesn't take the stream down — but the error is surfaced to the caller
+// so it can be logged once.
 func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMessageEvent {
 	formatted := formattedMessageEvent{Subject: msg.Subject}
 	if h.MaxEventSize > 0 && len(msg.Data) > h.MaxEventSize {
@@ -727,6 +999,8 @@ func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMess
 		formatted.HasMessageTime = true
 	}
 
+	// Pre-size the SSE frame builder to avoid reallocations: payload + a
+	// rough envelope budget (id/event/data lines plus JSON wrapper).
 	var event strings.Builder
 	event.Grow(len(msg.Data) + 128)
 	if hasEventID {
@@ -749,6 +1023,9 @@ func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMess
 	return formatted
 }
 
+// recordDroppedMessage emits the metric and structured log line for a
+// message the formatter decided not to send. Operators rely on these logs
+// to size MaxEventSize correctly without grepping the message payloads.
 func (h *Handler) recordDroppedMessage(formatted formattedMessageEvent) {
 	metricsMessagesDropped.Inc()
 	switch formatted.DropReason {
@@ -767,6 +1044,17 @@ func (h *Handler) recordDroppedMessage(formatted formattedMessageEvent) {
 	}
 }
 
+// subscribeToMultipleTopics opens one consumer that delivers every
+// requested subject. Two paths:
+//
+//   - useMultiFilter (NATS 2.10+): use ConsumerFilterSubjects, the
+//     server-side multi-filter API. Server delivers only the requested
+//     subjects, no client-side filtering needed.
+//   - fallback (older servers): subscribe to the smallest common
+//     wildcard parent subject and rely on requestedMessageHandler to
+//     drop subjects the request didn't ask for. This wastes some bandwidth
+//     when sibling subjects are busy, but keeps the feature usable on
+//     older servers; we log a warning so operators notice.
 func (h *Handler) subscribeToMultipleTopics(js nats.JetStreamContext, plan streamPlan, opts []nats.SubOpt, cb nats.MsgHandler, useMultiFilter bool, serverVersion string) (*nats.Subscription, error) {
 	if useMultiFilter {
 		filterOpts := append([]nats.SubOpt{}, opts...)
@@ -784,18 +1072,27 @@ func (h *Handler) subscribeToMultipleTopics(js nats.JetStreamContext, plan strea
 	return js.Subscribe(wildcardSubject, cb, opts...)
 }
 
+// supportsMultiFilterSubjects reports whether the connected NATS server is
+// new enough to support ConsumerFilterSubjects (multi-filter consumers,
+// added in NATS 2.10).
 func supportsMultiFilterSubjects(conn *nats.Conn) bool {
 	return supportsMultiFilterSubjectsVersion(connectedServerVersion(conn))
 }
 
+// supportsMultiFilterSubjectsVersion is the version-string-only half of
+// supportsMultiFilterSubjects, exposed separately so it can be unit-tested
+// without standing up a NATS server.
 func supportsMultiFilterSubjectsVersion(version string) bool {
 	major, minor, ok := parseMajorMinorVersion(version)
 	if !ok {
+		// Unknown version → assume unsupported and use the wildcard fallback.
 		return false
 	}
 	return major > 2 || (major == 2 && minor >= 10)
 }
 
+// connectedServerVersion returns the version reported by the currently
+// connected NATS server, or "" if the connection isn't established.
 func connectedServerVersion(conn *nats.Conn) string {
 	if conn == nil {
 		return ""
@@ -803,6 +1100,10 @@ func connectedServerVersion(conn *nats.Conn) string {
 	return conn.ConnectedServerVersion()
 }
 
+// parseMajorMinorVersion extracts the MAJOR and MINOR components from a
+// semver-ish string (with optional leading "v" and "-pre"/"+build" suffix).
+// Returns ok=false if the string can't be parsed; callers should treat that
+// as an unknown / unsupported version.
 func parseMajorMinorVersion(version string) (int, int, bool) {
 	version = strings.TrimPrefix(version, "v")
 	if cut := strings.IndexAny(version, "-+"); cut >= 0 {
@@ -823,6 +1124,21 @@ func parseMajorMinorVersion(version string) (int, int, bool) {
 	return major, minor, true
 }
 
+// commonSubjectFilter returns the narrowest single wildcard NATS subject
+// that matches every input subject. Used by the older-server fallback in
+// subscribeToMultipleTopics.
+//
+// Examples:
+//
+//	["a.b.c", "a.b.d"]   → "a.b.>"
+//	["a.b", "a.c"]       → "a.>"
+//	["a.b", "x.y"]       → ">"
+//	["a.b.c", "a.b"]     → "a.>"   (the second is a parent of the first)
+//
+// The trim-by-one step at the end handles the parent/child case: if any
+// input subject is exactly the length of the common prefix, the prefix
+// itself can't be the wildcard subject (it would be too narrow), so we
+// drop one token before appending ">".
 func commonSubjectFilter(subjects []string) string {
 	if len(subjects) == 0 {
 		return ">"
@@ -855,6 +1171,10 @@ func commonSubjectFilter(subjects []string) string {
 	return strings.Join(common, ".") + ".>"
 }
 
+// subjectAllowedByStream reports whether the configured stream's subject
+// filters cover the given subject. Used during planning to reject topics
+// that would never produce messages, with a clearer error than the
+// JetStream subscribe-time failure.
 func subjectAllowedByStream(subject string, streamSubjects []string) bool {
 	for _, streamSubject := range streamSubjects {
 		if subjectMatchesFilter(subject, streamSubject) {
@@ -864,6 +1184,14 @@ func subjectAllowedByStream(subject string, streamSubjects []string) bool {
 	return false
 }
 
+// subjectMatchesFilter reports whether subject matches a NATS subject
+// filter. Recognises the two NATS wildcards:
+//
+//   - "*" matches exactly one token.
+//   - ">" matches one or more trailing tokens (must be the final token).
+//
+// A bare ">" matches any non-empty subject; an empty subject matches no
+// filter.
 func subjectMatchesFilter(subject, filter string) bool {
 	subjectTokens := strings.Split(subject, ".")
 	filterTokens := strings.Split(filter, ".")
@@ -889,14 +1217,25 @@ func (h *Handler) matchesHealthPath(reqPath string) bool {
 	return matchesConfiguredPath(reqPath, h.HealthPath, defaultHealthPath)
 }
 
+// matchesLivePath returns true when the request path matches LivePath
+// (exact-or-suffix), with the same segment-boundary guarantee as
+// matchesHealthPath.
 func (h *Handler) matchesLivePath(reqPath string) bool {
 	return matchesConfiguredPath(reqPath, h.LivePath, defaultLivePath)
 }
 
+// matchesReadyPath returns true when the request path matches ReadyPath
+// (exact-or-suffix), with the same segment-boundary guarantee as
+// matchesHealthPath.
 func (h *Handler) matchesReadyPath(reqPath string) bool {
 	return matchesConfiguredPath(reqPath, h.ReadyPath, defaultReadyPath)
 }
 
+// matchesConfiguredPath compares the request path against an operator-
+// configured probe path. Falls back to defaultPath when configuredPath is
+// empty, normalises a leading slash, and accepts either an exact match or
+// a HasSuffix match — the leading slash is what makes the suffix check
+// safe (e.g. "/eventslivez" cannot accidentally match "/livez").
 func matchesConfiguredPath(reqPath, configuredPath, defaultPath string) bool {
 	path := configuredPath
 	if path == "" {
@@ -911,7 +1250,11 @@ func matchesConfiguredPath(reqPath, configuredPath, defaultPath string) bool {
 	return strings.HasSuffix(reqPath, path)
 }
 
-// reserveConnSlot atomically tries to reserve a connection slot.
+// reserveConnSlot atomically tries to reserve a connection slot, returning
+// true on success and false if MaxConnections has already been reached.
+// Implemented as a CAS loop so concurrent ServeHTTP goroutines can race
+// without locking. Every successful reserveConnSlot must be paired with
+// exactly one releaseConnSlot.
 func (h *Handler) reserveConnSlot() bool {
 	for {
 		cur := atomic.LoadInt64(&h.connCount)
@@ -924,10 +1267,18 @@ func (h *Handler) reserveConnSlot() bool {
 	}
 }
 
+// releaseConnSlot decrements the connection counter. Always defer this
+// after a successful reserveConnSlot so an early return or panic doesn't
+// leak a slot.
 func (h *Handler) releaseConnSlot() {
 	atomic.AddInt64(&h.connCount, -1)
 }
 
+// allowedMethodsHeader builds a deduplicated, canonical "Allow"/CORS
+// methods header value from the configured AllowedMethods list. Only GET
+// and OPTIONS are advertised — NUTS is read-only, and exposing other
+// methods would mislead clients into expecting features that don't exist.
+// Falls back to "GET, OPTIONS" when nothing valid is configured.
 func allowedMethodsHeader(methods []string) string {
 	if len(methods) == 0 {
 		return "GET, OPTIONS"
