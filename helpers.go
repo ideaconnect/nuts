@@ -4,10 +4,12 @@ package nuts
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // toJSON marshals any value to a JSON string. On error it returns "{}".
@@ -41,6 +43,28 @@ func writeSSEChunk(w io.Writer, flusher http.Flusher, chunk string) error {
 		return err
 	}
 	flusher.Flush()
+	return nil
+}
+
+func writeSSEChunkWithTimeout(w http.ResponseWriter, flusher http.Flusher, chunk string, timeout time.Duration) error {
+	if timeout <= 0 {
+		return writeSSEChunk(w, flusher, chunk)
+	}
+
+	controller := http.NewResponseController(w)
+	if err := controller.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+		return writeSSEChunk(w, flusher, chunk)
+	}
+
+	if err := writeSSEChunk(w, flusher, chunk); err != nil {
+		return err
+	}
+	if err := controller.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
 	return nil
 }
 
@@ -85,4 +109,22 @@ func redactURL(raw string) string {
 	}
 	u.User = url.User("REDACTED")
 	return u.String()
+}
+
+func isValidCookieName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)):
+		default:
+			return false
+		}
+	}
+	return true
 }

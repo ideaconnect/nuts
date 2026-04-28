@@ -109,6 +109,8 @@ Useful checks:
 - `disconnect_reason="slow_client"` in logs
 - `client_buffer_size`, `max_event_size`, and the memory formula in
   [PERFORMANCE.md](PERFORMANCE.md)
+- `write_timeout` for blocked downstream writes and `dispatch_timeout` for
+  saturated slow-client signal waits
 - Proxy buffering between Caddy and the browser
 
 ## Docker Image Starts But Config Looks Wrong

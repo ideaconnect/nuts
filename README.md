@@ -11,7 +11,7 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 
 - **Real-time Updates**: Stream NATS messages to web browsers via SSE/EventSource
 - **[JetStream Persistence](#jetstream-setup)**: Messages are persisted in NATS JetStream for replay
-- **[Message Replay](#message-replay-with-last-id-or-last-event-id)**: Clients can reconnect and replay messages from a specific ID using `?last-id=` or the standard `Last-Event-ID` header. If the requested sequence is no longer available in JetStream retention, NUTS uses fallback replay, bounded by `replay_max_messages` or `replay_window` when configured.
+- **[Message Replay](#message-replay-with-last-id-or-last-event-id)**: Clients can reconnect and replay messages from a specific ID using `?last-id=` or the standard `Last-Event-ID` header. Replay can be bounded by `replay_max_messages` or `replay_window` when configured.
 - **Multiple Topics**: Subscribe to multiple NATS subjects simultaneously
 - **Automatic Reconnection**: Built-in NATS reconnection handling
 - **[CORS Support](#cors-and-allowed_origins)**: Configurable cross-origin resource sharing
@@ -261,14 +261,18 @@ nuts {
     allowed_origins <origins...> # CORS origins (default: *)
     allowed_headers <headers...> # CORS request headers (default: Cache-Control Last-Event-ID)
     allowed_methods <methods...> # CORS methods; only GET OPTIONS are supported
+    subscriber_jwt_key <secret>  # Enable HMAC JWT subscriber auth and topic claims
+    subscriber_jwt_cookie <name> # Optional JWT cookie for browser EventSource clients
     heartbeat_interval <seconds> # Heartbeat interval (default: 30)
     reconnect_wait <seconds>     # Reconnect wait time (default: 2)
     max_reconnects <count>       # Max reconnects, 0=none, -1=infinite (default: -1)
     max_event_size <bytes>       # Max SSE event size (0=default 1 MiB, <0=unlimited)
     max_connections <count>      # Global concurrent-stream cap (default: 0 = unlimited)
     client_buffer_size <count>   # Per-connection send buffer (0=default 64)
-    replay_max_messages <count>  # Cap replay-fallback messages per connection (default: 0 = unlimited)
-    replay_window <seconds>      # Time-bound replay fallback to the last N seconds (default: 0 = all retained)
+    dispatch_timeout <seconds>   # Cap slow-client signal wait in NATS callbacks (default: 0 = disabled)
+    write_timeout <seconds>      # Cap each SSE write/flush when supported (default: 0 = disabled)
+    replay_max_messages <count>  # Cap replayed messages per reconnect (default: 0 = unlimited)
+    replay_window <seconds>      # Time-bound replay to the last N seconds (default: 0 = all retained)
     health_path <path>           # Legacy readiness endpoint (empty/default: /healthz)
     live_path <path>             # Process liveness endpoint (empty/default: /livez)
     ready_path <path>            # NATS/stream readiness endpoint (empty/default: /readyz)
@@ -325,23 +329,40 @@ See [PERFORMANCE.md](PERFORMANCE.md) for latency, memory, and per-instance
 client-count budgets plus the load and benchmark commands used to validate
 them.
 
+#### `dispatch_timeout` and `write_timeout`
+
+These optional guards keep slow or blocked downstream connections from tying up
+NUTS indefinitely:
+
+- `dispatch_timeout <seconds>` caps how long a NATS callback waits to notify
+  the streaming loop after the client's queue is already full. `0` preserves
+  the original unbounded wait.
+- `write_timeout <seconds>` sets a per-frame write deadline before each SSE
+  connected, message, and heartbeat frame is written and flushed. `0` leaves
+  write deadlines entirely to Caddy and the surrounding HTTP server config.
+
+`write_timeout` uses Go's `http.ResponseController`; if a wrapper in front of
+NUTS does not support per-response write deadlines, NUTS falls back to the
+normal write path. Caddy server-level timeouts and proxy buffering policy still
+matter, but this directive gives the handler its own protection for supported
+HTTP stacks.
+
 #### `replay_max_messages` and `replay_window`
 
-Both guard against replay storms — when a client reconnects with a
-`last-id` (or `Last-Event-ID`) that points below the stream's retained
-range, NUTS would normally deliver *every* retained message for that
-topic before catching up to the live stream. On a stream with a long
-retention this can be tens of thousands of events.
+Both guard against replay storms — when a client reconnects with an old
+`last-id` (or `Last-Event-ID`), NUTS may need to deliver a large retained
+backlog before catching up to the live stream. On a stream with long retention
+this can be tens of thousands of events.
 
 - `replay_max_messages <count>` closes the SSE connection after the
-  configured number of events have been delivered on a fallback
-  subscription. The client reconnects with a fresher `Last-Event-ID` and
-  continues normally. The `nuts_replay_cap_reached_total` counter is
-  incremented each time the cap fires.
-- `replay_window <seconds>` replaces the `DeliverAll` fallback with a
-  `StartTime(now - window)` subscription, so only events from the last
-  `N` seconds are replayed. Useful when the business value of stale
-  messages decays with age.
+  configured number of historical replay events have been delivered. The
+  client reconnects with a fresher `Last-Event-ID` and continues normally.
+  The `nuts_replay_cap_reached_total` counter is incremented each time the cap
+  fires.
+- `replay_window <seconds>` time-bounds replay to recent retained messages.
+  If the requested cursor is older than the window, NUTS starts replay at
+  `now - window`; if the cursor is still inside the window, NUTS preserves
+  exact `last-id + 1` cursor semantics.
 
 Both default to `0` (unlimited / all retained) to preserve the original
 behaviour. They can be combined: `replay_window` bounds the time range,
@@ -392,21 +413,51 @@ which browser origins may read responses, not who is allowed to subscribe.
 #### Subscriber authentication and topic authorization
 
 The `nats_credentials`, `nats_token`, and `nats_user` / `nats_password`
-directives authenticate the NUTS process to NATS. They do **not** authenticate
-browser subscribers to NUTS, and they do not apply per-topic access control.
+directives authenticate the NUTS process to NATS. Subscriber access is separate
+and can be handled either by Caddy/upstream policy or by NUTS' optional
+first-party JWT check.
 
-Any client that can reach the NUTS route can request any valid topic under the
-configured `topic_prefix`. Protect subscriber access with Caddy route policy,
-an authentication plugin, an upstream reverse proxy, application-issued
-cookies, or separate NUTS instances with distinct prefixes/streams when tenant
-isolation matters.
+Set `subscriber_jwt_key` to require an HMAC-signed JWT before NUTS creates a
+JetStream consumer. Tokens are accepted from `Authorization: Bearer <jwt>` or,
+when `subscriber_jwt_cookie` is configured, from that cookie. The token must
+include a `subscribe` claim listing allowed topic filters before
+`topic_prefix` is applied:
 
-Current decision: NUTS does not implement a first-party subscriber
-authorization hook in the handler. Subscriber identity, sessions, and policy
-are intentionally delegated to Caddy or an upstream gateway so the NUTS module
-stays a read-only JetStream-to-SSE bridge. If deployments need claim-to-topic
-authorization inside the handler, the future Phase 2 work in [ROADMAP.md](ROADMAP.md)
-is the place for an opt-in JWT/private-topic design.
+```json
+{
+  "sub": "user-123",
+  "exp": 1777392000,
+  "subscribe": ["orders.*", "tenant-a.>"]
+}
+```
+
+Allowed filters use NATS-style tokens: exact topics such as `orders.created`,
+single-token wildcards such as `orders.*`, tail wildcards such as
+`tenant-a.>`, or `*` / `>` to allow every topic on that route. Missing,
+expired, badly signed, or unauthorized tokens are rejected before subscription.
+
+Example:
+
+```caddyfile
+:8080 {
+  route /events* {
+    uri strip_prefix /events
+    nuts {
+      nats_url nats://nats:4222
+      stream_name EVENTS
+      topic_prefix events.
+      allowed_origins https://app.example.com
+      allowed_headers Cache-Control Last-Event-ID Authorization
+      subscriber_jwt_key {$SUBSCRIBER_JWT_KEY}
+      subscriber_jwt_cookie nuts_session
+    }
+  }
+}
+```
+
+Native browser `EventSource` cannot set custom `Authorization` headers, so use
+same-site requests or a configured cookie for browser clients. Custom clients
+can use the Bearer header directly.
 
 Protect a route with Caddy `basic_auth` when simple operator-controlled access
 is enough. Generate the password hash with `caddy hash-password` and keep the
@@ -563,7 +614,7 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_replay_fallbacks_total` | Counter | Replay requests that used fallback replay because the requested sequence was purged |
 | `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
 | `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` labels the cause (e.g. `max_connections`). |
-| `nuts_replay_cap_reached_total` | Counter | SSE connections closed after `replay_max_messages` was reached during a replay fallback |
+| `nuts_replay_cap_reached_total` | Counter | Replaying SSE connections closed after `replay_max_messages` was reached |
 
 Example alert rules and a Grafana dashboard are available in
 [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml) and
@@ -710,6 +761,8 @@ This means the delivery policy is effectively:
 
 - No silent per-client message loss in the live stream path due to slow consumers
 - Slow clients must reconnect to continue
+- `dispatch_timeout` and `write_timeout` can bound callback waits and blocked
+  SSE writes when the downstream connection or proxy stalls
 - Replay depends on the requested sequence still being retained in JetStream
 - Oversized raw payloads or formatted SSE events are rejected according to `max_event_size`
 
@@ -727,8 +780,8 @@ const events = new EventSource(`/events?topic=updates&last-id=${lastId}`);
 
 **Behavior:**
 - Messages with sequence numbers greater than `last-id` will be delivered
-- If the requested sequence no longer exists (expired/deleted), all available messages are delivered
-- **Replay storm caveat**: When the fallback fires, *all* retained messages for that topic are replayed by default. If the stream holds a large backlog, this may deliver many messages the client has already seen. Design your stream retention policy (max age, max messages) accordingly — or cap the fallback with the `replay_max_messages` or `replay_window` directives (see [Configuration](#configuration)).
+- If the requested sequence no longer exists (expired/deleted), NUTS falls back to retained replay
+- **Replay storm caveat**: old cursors can trigger a large retained backlog. Design your stream retention policy (max age, max messages) accordingly, and cap replay with `replay_max_messages` or `replay_window` for public or multi-tenant routes.
 - Without `last-id`, only new messages are delivered
 - Standard `EventSource` reconnects can use the `Last-Event-ID` header automatically
 - When a slow client is disconnected, reconnecting with the last delivered event ID resumes from that point instead of losing messages silently

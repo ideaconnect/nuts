@@ -18,13 +18,13 @@ No breaking changes, immediately useful for production deployments.
 - [x] **Configurable CORS** — `allowed_headers` and `allowed_methods` directives so front-ends can send custom headers (e.g. `Authorization` for Phase 2).
 - [x] **Non-root container** — the published `idcttech/nuts` image runs as uid 10001.
 
-## Phase 2: Authorization & Access Control
+## Phase 2: Authorization & Access Control ✅
 
 Core security features. Prerequisite for private channels and subscription lifecycle.
 
-- [ ] **Subscriber JWT auth** — Validate JWT on SSE connect, extract allowed topics from claims. Support `subscriber_jwt_key` / `subscriber_jwks_url` Caddyfile directives. Anonymous mode preserved as default (opt-in auth).
-- [ ] **Private topics / per-topic access control** — JWT `subscribe` claim restricts which topics a client can subscribe to. Reject unauthorized subscriptions. Depends on subscriber JWT auth.
-- [ ] **Cookie-based auth** — Extract JWT from a configurable cookie name for browser `EventSource` (which cannot set custom headers). `cookie_name` Caddyfile directive. Depends on subscriber JWT auth.
+- [x] **Subscriber JWT auth** — Validate HMAC-signed JWTs on SSE connect with `subscriber_jwt_key`. Anonymous mode remains the default when the directive is omitted.
+- [x] **Private topics / per-topic access control** — JWT `subscribe` claim restricts which topics a client can subscribe to. Unauthorized subscriptions are rejected before JetStream subscription.
+- [x] **Cookie-based auth** — Extract JWT from `subscriber_jwt_cookie` for browser `EventSource` clients, which cannot set custom headers.
 
 ## Phase 3: Subscription Lifecycle
 
@@ -43,7 +43,7 @@ Broadens NUTS from a read-only bridge to a full event hub.
 
 Lower priority, can be tackled independently.
 
-- [ ] **Dispatch/write timeouts** — Configurable `dispatch_timeout` and `write_timeout` directives to cap how long NUTS waits on slow operations.
+- [x] **Dispatch/write timeouts** — Configurable `dispatch_timeout` and `write_timeout` directives to cap how long NUTS waits on slow operations.
 - [ ] **URI template topic selectors** — RFC 6570 `{id}` / `{+path}` wildcard matching for topic subscriptions.
 
 ## Out of Scope (for now)

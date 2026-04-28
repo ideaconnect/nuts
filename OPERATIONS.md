@@ -94,15 +94,17 @@ filters when correlating logs with alerts.
 
 - `nuts_replay_fallbacks_total` spikes.
 - `nuts_replay_cap_reached_total` rises if `replay_max_messages` is configured.
-- Logs show `replay_mode` as `fallback_deliver_all` or `fallback_start_time`
-  with `replay_fallback_reason` such as `sequence below retention`.
+- Logs may show `replay_mode` as `start_sequence`, `fallback_deliver_all`, or
+   `fallback_start_time`; fallback logs include `replay_fallback_reason` such as
+   `sequence below retention` or `sequence outside replay window`.
 
 **Actions**
 
 1. Check whether clients are reconnecting with very old `last-id` or
    `Last-Event-ID` values.
 2. Set or lower `replay_max_messages` and/or `replay_window` for public or
-   multi-tenant routes.
+   multi-tenant routes; these bounds apply to retained replay, not only purged
+   cursor fallback.
 3. Review JetStream retention. A short retention window increases fallback
    frequency; a very long retained backlog makes each fallback more expensive.
 
@@ -120,8 +122,10 @@ filters when correlating logs with alerts.
 1. Identify affected `subject_label` values and client cohorts.
 2. Lower `client_buffer_size` to disconnect slow clients sooner, or raise it
    only after checking the memory budget in [PERFORMANCE.md](PERFORMANCE.md).
-3. Inspect downstream proxy buffering and browser/client processing speed.
-4. Confirm clients resume with `Last-Event-ID`; slow disconnects are designed
+3. Set `write_timeout` to bound blocked SSE writes and `dispatch_timeout` to
+   bound NATS callback waits when a slow-client signal is already pending.
+4. Inspect downstream proxy buffering and browser/client processing speed.
+5. Confirm clients resume with `Last-Event-ID`; slow disconnects are designed
    to trigger replay rather than silently drop messages.
 
 ## Incident: CORS Misconfiguration

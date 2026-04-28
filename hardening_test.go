@@ -3,6 +3,9 @@ package nuts
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -25,6 +28,18 @@ import (
 
 // intPtr is a small helper for constructing *int fields in struct literals.
 func intPtr(v int) *int { return &v }
+
+type deadlineFlushRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (r *deadlineFlushRecorder) Flush() {}
+
+func (r *deadlineFlushRecorder) SetWriteDeadline(deadline time.Time) error {
+	r.deadlines = append(r.deadlines, deadline)
+	return nil
+}
 
 // counterValue returns the current value of a labelled counter or 0 if absent.
 func counterValue(c *prometheus.CounterVec, labels ...string) float64 {
@@ -266,6 +281,170 @@ func TestHandler_Security_InvalidTopicsRejectedBeforeStreaming(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHandler_SubscriberJWT_RequiresTokenBeforeStreaming(t *testing.T) {
+	h := &Handler{SubscriberJWTKey: "test-secret", logger: zap.NewNop()}
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=private", nil)
+	rr := httptest.NewRecorder()
+
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+	if got := rr.Header().Get("WWW-Authenticate"); got == "" {
+		t.Fatal("missing WWW-Authenticate header")
+	}
+	if strings.Contains(rr.Body.String(), "JetStream not available") {
+		t.Fatalf("unauthenticated request reached streaming runtime: %q", rr.Body.String())
+	}
+}
+
+func TestHandler_SubscriberJWT_AuthorizesTopicClaims(t *testing.T) {
+	secret := "test-secret"
+	token := signTestSubscriberJWT(t, secret, map[string]interface{}{
+		"sub":       "alice",
+		"subscribe": []string{"orders.*", "invoices.paid"},
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	h := &Handler{SubscriberJWTKey: secret, logger: zap.NewNop()}
+
+	allowedReq := httptest.NewRequest(http.MethodGet, "/events?topic=orders.created&topic=invoices.paid", nil)
+	allowedReq.Header.Set("Authorization", "Bearer "+token)
+	allowedPlan, requestErr := h.parseStreamRequest(allowedReq)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest: %v", requestErr)
+	}
+	if authErr := h.authorizeStreamRequest(allowedReq, allowedPlan); authErr != nil {
+		t.Fatalf("authorizeStreamRequest returned %#v, want allowed", authErr)
+	}
+
+	blockedReq := httptest.NewRequest(http.MethodGet, "/events?topic=admin.audit", nil)
+	blockedReq.Header.Set("Authorization", "Bearer "+token)
+	blockedPlan, requestErr := h.parseStreamRequest(blockedReq)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest: %v", requestErr)
+	}
+	if authErr := h.authorizeStreamRequest(blockedReq, blockedPlan); authErr == nil || authErr.status != http.StatusForbidden {
+		t.Fatalf("authorizeStreamRequest = %#v, want 403", authErr)
+	}
+}
+
+func TestHandler_SubscriberJWT_AcceptsConfiguredCookie(t *testing.T) {
+	secret := "test-secret"
+	token := signTestSubscriberJWT(t, secret, map[string]interface{}{
+		"sub":       "browser-client",
+		"subscribe": "tenant-a.>",
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	h := &Handler{
+		SubscriberJWTKey:    secret,
+		SubscriberJWTCookie: "nuts_session",
+		logger:              zap.NewNop(),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=tenant-a.orders", nil)
+	req.AddCookie(&http.Cookie{Name: "nuts_session", Value: token})
+	plan, requestErr := h.parseStreamRequest(req)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest: %v", requestErr)
+	}
+	if authErr := h.authorizeStreamRequest(req, plan); authErr != nil {
+		t.Fatalf("authorizeStreamRequest returned %#v, want allowed", authErr)
+	}
+}
+
+func TestHandler_SubscriberJWT_RejectsExpiredToken(t *testing.T) {
+	secret := "test-secret"
+	token := signTestSubscriberJWT(t, secret, map[string]interface{}{
+		"sub":       "alice",
+		"subscribe": "*",
+		"exp":       time.Now().Add(-time.Minute).Unix(),
+	})
+	h := &Handler{SubscriberJWTKey: secret, logger: zap.NewNop()}
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=orders", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	plan, requestErr := h.parseStreamRequest(req)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest: %v", requestErr)
+	}
+	if authErr := h.authorizeStreamRequest(req, plan); authErr == nil || authErr.status != http.StatusUnauthorized {
+		t.Fatalf("authorizeStreamRequest = %#v, want 401", authErr)
+	}
+}
+
+func TestSubscriberJWTVerifier_RejectsInvalidTokens(t *testing.T) {
+	secret := "test-secret"
+	now := time.Now()
+	tests := []struct {
+		name  string
+		token string
+	}{
+		{name: "malformed", token: "one.two"},
+		{name: "unsupported algorithm", token: unsignedTestJWT(t, "none", map[string]interface{}{"subscribe": "*"})},
+		{name: "bad signature", token: signTestSubscriberJWT(t, "wrong-secret", map[string]interface{}{"subscribe": "*", "exp": now.Add(time.Hour).Unix()})},
+		{name: "missing subscribe", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"exp": now.Add(time.Hour).Unix()})},
+		{name: "empty subscribe", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": []string{}, "exp": now.Add(time.Hour).Unix()})},
+		{name: "invalid subscribe filter", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": "orders/created", "exp": now.Add(time.Hour).Unix()})},
+		{name: "not before future", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": "*", "nbf": now.Add(time.Hour).Unix()})},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := verifySubscriberJWT(tt.token, []byte(secret), now); err == nil {
+				t.Fatal("expected verifySubscriberJWT to reject token")
+			}
+		})
+	}
+}
+
+func TestSubscriberTopicMatches(t *testing.T) {
+	tests := []struct {
+		name   string
+		topic  string
+		filter string
+		want   bool
+	}{
+		{name: "exact", topic: "orders.created", filter: "orders.created", want: true},
+		{name: "single token wildcard", topic: "orders.created", filter: "orders.*", want: true},
+		{name: "tail wildcard", topic: "tenant-a.orders.created", filter: "tenant-a.>", want: true},
+		{name: "route wildcard", topic: "anything.here", filter: "*", want: true},
+		{name: "single token wildcard does not cross dots", topic: "orders.created.high", filter: "orders.*", want: false},
+		{name: "different tenant", topic: "tenant-b.orders", filter: "tenant-a.>", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := subscriberTopicMatches(tt.topic, tt.filter); got != tt.want {
+				t.Fatalf("subscriberTopicMatches(%q, %q) = %v, want %v", tt.topic, tt.filter, got, tt.want)
+			}
+		})
+	}
+}
+
+func signTestSubscriberJWT(t *testing.T, secret string, claims map[string]interface{}) string {
+	t.Helper()
+	encodedHeader := encodeTestJWTPart(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+	encodedPayload := encodeTestJWTPart(t, claims)
+	signed := encodedHeader + "." + encodedPayload
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signed))
+	return signed + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func unsignedTestJWT(t *testing.T, alg string, claims map[string]interface{}) string {
+	t.Helper()
+	return encodeTestJWTPart(t, map[string]interface{}{"alg": alg, "typ": "JWT"}) + "." + encodeTestJWTPart(t, claims) + "."
+}
+
+func encodeTestJWTPart(t *testing.T, value interface{}) string {
+	t.Helper()
+	b, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal JWT part: %v", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 func TestAllowedMethodsHeader_FiltersToServedMethods(t *testing.T) {
@@ -579,6 +758,8 @@ func TestHandler_UnmarshalCaddyfile_RejectsNonNumericInt(t *testing.T) {
 		"max_event_size 1kb",
 		"max_connections twelve",
 		"client_buffer_size -",
+		"dispatch_timeout 1s",
+		"write_timeout 2s",
 	}
 	for _, line := range cases {
 		line := line
@@ -611,6 +792,16 @@ func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
 			wantErr: "client_buffer_size",
 		},
 		{
+			name:    "negative dispatch timeout",
+			line:    "dispatch_timeout -1",
+			wantErr: "dispatch_timeout",
+		},
+		{
+			name:    "negative write timeout",
+			line:    "write_timeout -1",
+			wantErr: "write_timeout",
+		},
+		{
 			name:    "negative replay max messages",
 			line:    "replay_max_messages -1",
 			wantErr: "replay_max_messages",
@@ -624,6 +815,18 @@ func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
 			name:        "unsupported allowed method",
 			line:        "allowed_methods GET POST OPTIONS",
 			wantErr:     "allowed_methods",
+			validateErr: true,
+		},
+		{
+			name:        "subscriber cookie requires key",
+			line:        "subscriber_jwt_cookie nuts_session",
+			wantErr:     "subscriber_jwt_key",
+			validateErr: true,
+		},
+		{
+			name:        "subscriber cookie validates name",
+			line:        "subscriber_jwt_key secret\n    subscriber_jwt_cookie bad;name",
+			wantErr:     "subscriber_jwt_cookie",
 			validateErr: true,
 		},
 	}
@@ -690,6 +893,16 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 			wantErr: "client_buffer_size",
 		},
 		{
+			name:    "negative dispatch timeout",
+			mutate:  func(h *Handler) { h.DispatchTimeout = -1 },
+			wantErr: "dispatch_timeout",
+		},
+		{
+			name:    "negative write timeout",
+			mutate:  func(h *Handler) { h.WriteTimeout = -1 },
+			wantErr: "write_timeout",
+		},
+		{
 			name:    "negative replay max messages",
 			mutate:  func(h *Handler) { h.ReplayMaxMessages = -1 },
 			wantErr: "replay_max_messages",
@@ -703,6 +916,19 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 			name:    "unsupported allowed method",
 			mutate:  func(h *Handler) { h.AllowedMethods = []string{"GET", "POST", "OPTIONS"} },
 			wantErr: "allowed_methods",
+		},
+		{
+			name:    "subscriber cookie requires key",
+			mutate:  func(h *Handler) { h.SubscriberJWTCookie = "nuts_session" },
+			wantErr: "subscriber_jwt_key",
+		},
+		{
+			name: "subscriber cookie validates name",
+			mutate: func(h *Handler) {
+				h.SubscriberJWTKey = "secret"
+				h.SubscriberJWTCookie = "bad;name"
+			},
+			wantErr: "subscriber_jwt_cookie",
 		},
 	}
 
@@ -741,6 +967,16 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			wantErr:  "client_buffer_size",
 		},
 		{
+			name:     "negative dispatch timeout",
+			fragment: `"dispatch_timeout": -1`,
+			wantErr:  "dispatch_timeout",
+		},
+		{
+			name:     "negative write timeout",
+			fragment: `"write_timeout": -1`,
+			wantErr:  "write_timeout",
+		},
+		{
 			name:     "negative replay max messages",
 			fragment: `"replay_max_messages": -1`,
 			wantErr:  "replay_max_messages",
@@ -754,6 +990,16 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			name:     "unsupported allowed method",
 			fragment: `"allowed_methods": ["GET", "POST", "OPTIONS"]`,
 			wantErr:  "allowed_methods",
+		},
+		{
+			name:     "subscriber cookie requires key",
+			fragment: `"subscriber_jwt_cookie": "nuts_session"`,
+			wantErr:  "subscriber_jwt_key",
+		},
+		{
+			name:     "subscriber cookie validates name",
+			fragment: `"subscriber_jwt_key": "secret", "subscriber_jwt_cookie": "bad;name"`,
+			wantErr:  "subscriber_jwt_cookie",
 		},
 	}
 
@@ -789,6 +1035,50 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 				t.Fatalf("expected no runtime state after validation rejection, got connNil=%v jsNil=%v shutdownNil=%v", connNil, jsNil, shutdownNil)
 			}
 		})
+	}
+}
+
+func TestWriteSSEChunkWithTimeout_SetsAndClearsDeadline(t *testing.T) {
+	rr := &deadlineFlushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	if err := writeSSEChunkWithTimeout(rr, rr, "event: ping\n\n", time.Second); err != nil {
+		t.Fatalf("writeSSEChunkWithTimeout: %v", err)
+	}
+	if got := rr.Body.String(); got != "event: ping\n\n" {
+		t.Fatalf("body = %q", got)
+	}
+	if len(rr.deadlines) != 2 {
+		t.Fatalf("deadline calls = %d, want 2", len(rr.deadlines))
+	}
+	if rr.deadlines[0].IsZero() {
+		t.Fatal("first deadline should set a non-zero write deadline")
+	}
+	if !rr.deadlines[1].IsZero() {
+		t.Fatalf("second deadline = %v, want zero reset", rr.deadlines[1])
+	}
+}
+
+func TestMessageQueue_DispatchTimeoutCapsSlowSignalWait(t *testing.T) {
+	h := &Handler{ClientBufferSize: 1, DispatchTimeout: 1, logger: zap.NewNop()}
+	msgChan, slowClient, done, enqueueMessage := h.newMessageQueue()
+	defer close(done)
+
+	msgChan <- &nats.Msg{Subject: "events.pending"}
+	slowClient <- "events.already-slow"
+
+	returned := make(chan struct{})
+	started := time.Now()
+	go func() {
+		enqueueMessage(&nats.Msg{Subject: "events.blocked"})
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+		if elapsed := time.Since(started); elapsed > 2*time.Second {
+			t.Fatalf("enqueueMessage returned after %s, want dispatch_timeout to cap the wait", elapsed)
+		}
+	case <-time.After(2500 * time.Millisecond):
+		t.Fatal("enqueueMessage did not return after dispatch_timeout")
 	}
 }
 
@@ -1105,6 +1395,113 @@ func TestHandler_ReplayMaxMessages_CapsFallback(t *testing.T) {
 	}
 	if !hasLogField(obs, "replay_mode", string(replayModeFallbackDeliverAll)) {
 		t.Errorf("expected replay_mode log field, entries=%+v", obs.All())
+	}
+}
+
+func TestHandler_ReplayMaxMessages_CapsValidRetainedReplay(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	jsPub, _ := nc.JetStream()
+	for i := 0; i < 10; i++ {
+		if _, err := jsPub.Publish("events.cap-valid", []byte(`{"i":`+strconv.Itoa(i)+`}`)); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30,
+		MaxEventSize:      -1,
+		AllowedOrigins:    []string{"*"},
+		ReplayMaxMessages: 2,
+		logger:            zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+	defer h.Cleanup()
+	js, _ := h.conn.JetStream()
+	h.mu.Lock()
+	h.js = js
+	h.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=cap-valid&last-id=1", nil)
+	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+	if delivered := strings.Count(rr.Body.String(), "event: message"); delivered != 2 {
+		t.Fatalf("delivered %d messages, want 2 under replay_max_messages=2\nbody: %s", delivered, rr.Body.String())
+	}
+}
+
+func TestHandler_ReplayWindow_BoundsValidRetainedReplay(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	replayWindow := 2
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30,
+		MaxEventSize:      -1,
+		AllowedOrigins:    []string{"*"},
+		ReplayWindow:      replayWindow,
+		logger:            zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+	defer h.Cleanup()
+	js, _ := h.conn.JetStream()
+	h.mu.Lock()
+	h.js = js
+	h.mu.Unlock()
+
+	jsPub, _ := nc.JetStream()
+	if _, err := jsPub.Publish("events.window-valid", []byte(`{"age":"old"}`)); err != nil {
+		t.Fatalf("publish old: %v", err)
+	}
+	time.Sleep(time.Duration(replayWindow+2) * time.Second)
+	if _, err := jsPub.Publish("events.window-valid", []byte(`{"age":"new"}`)); err != nil {
+		t.Fatalf("publish new: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=window-valid&last-id=0", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 1500*time.Millisecond)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	done := make(chan error, 1)
+	go func() { done <- h.ServeHTTP(rr, req, nil) }()
+	<-done
+
+	body := rr.Body.String()
+	if strings.Contains(body, `"old"`) {
+		t.Fatalf("old message outside replay_window was delivered:\n%s", body)
+	}
+	if !strings.Contains(body, `"new"`) {
+		t.Fatalf("new message inside replay_window was not delivered:\n%s", body)
 	}
 }
 

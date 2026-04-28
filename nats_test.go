@@ -197,23 +197,31 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				reconnect_wait 5
 				max_reconnects 10
 				max_event_size 524288
+				dispatch_timeout 2
+				write_timeout 3
 				live_path /live
 				ready_path /ready
 				hub_url https://example.com/events
+				subscriber_jwt_key secret-key
+				subscriber_jwt_cookie nuts_session
 				allowed_origins https://example.com https://other.com
 			}`,
 			expected: &Handler{
-				NatsURL:           "nats://localhost:4222",
-				StreamName:        "EVENTS",
-				TopicPrefix:       "events.",
-				HeartbeatInterval: 15,
-				ReconnectWait:     5,
-				MaxReconnects:     intPtr(10),
-				MaxEventSize:      524288,
-				LivePath:          "/live",
-				ReadyPath:         "/ready",
-				HubURL:            "https://example.com/events",
-				AllowedOrigins:    []string{"https://example.com", "https://other.com"},
+				NatsURL:             "nats://localhost:4222",
+				StreamName:          "EVENTS",
+				TopicPrefix:         "events.",
+				HeartbeatInterval:   15,
+				ReconnectWait:       5,
+				MaxReconnects:       intPtr(10),
+				MaxEventSize:        524288,
+				DispatchTimeout:     2,
+				WriteTimeout:        3,
+				LivePath:            "/live",
+				ReadyPath:           "/ready",
+				HubURL:              "https://example.com/events",
+				SubscriberJWTKey:    "secret-key",
+				SubscriberJWTCookie: "nuts_session",
+				AllowedOrigins:      []string{"https://example.com", "https://other.com"},
 			},
 			expectError: false,
 		},
@@ -400,8 +408,20 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 			if h.MaxEventSize != tt.expected.MaxEventSize {
 				t.Errorf("MaxEventSize: expected %d, got %d", tt.expected.MaxEventSize, h.MaxEventSize)
 			}
+			if h.DispatchTimeout != tt.expected.DispatchTimeout {
+				t.Errorf("DispatchTimeout: expected %d, got %d", tt.expected.DispatchTimeout, h.DispatchTimeout)
+			}
+			if h.WriteTimeout != tt.expected.WriteTimeout {
+				t.Errorf("WriteTimeout: expected %d, got %d", tt.expected.WriteTimeout, h.WriteTimeout)
+			}
 			if h.HubURL != tt.expected.HubURL {
 				t.Errorf("HubURL: expected %q, got %q", tt.expected.HubURL, h.HubURL)
+			}
+			if h.SubscriberJWTKey != tt.expected.SubscriberJWTKey {
+				t.Errorf("SubscriberJWTKey: expected %q, got %q", tt.expected.SubscriberJWTKey, h.SubscriberJWTKey)
+			}
+			if h.SubscriberJWTCookie != tt.expected.SubscriberJWTCookie {
+				t.Errorf("SubscriberJWTCookie: expected %q, got %q", tt.expected.SubscriberJWTCookie, h.SubscriberJWTCookie)
 			}
 			if h.LivePath != tt.expected.LivePath {
 				t.Errorf("LivePath: expected %q, got %q", tt.expected.LivePath, h.LivePath)
@@ -503,11 +523,15 @@ func TestHandler_UnmarshalCaddyfile_MissingArgs(t *testing.T) {
 		{name: "missing nats_token arg", directive: "nats_token"},
 		{name: "missing nats_user arg", directive: "nats_user"},
 		{name: "missing nats_password arg", directive: "nats_password"},
+		{name: "missing subscriber_jwt_key arg", directive: "subscriber_jwt_key"},
+		{name: "missing subscriber_jwt_cookie arg", directive: "subscriber_jwt_cookie"},
 		{name: "missing topic_prefix arg", directive: "topic_prefix"},
 		{name: "missing heartbeat_interval arg", directive: "heartbeat_interval"},
 		{name: "missing reconnect_wait arg", directive: "reconnect_wait"},
 		{name: "missing max_reconnects arg", directive: "max_reconnects"},
 		{name: "missing max_event_size arg", directive: "max_event_size"},
+		{name: "missing dispatch_timeout arg", directive: "dispatch_timeout"},
+		{name: "missing write_timeout arg", directive: "write_timeout"},
 		{name: "missing replay_max_messages arg", directive: "replay_max_messages"},
 		{name: "missing replay_window arg", directive: "replay_window"},
 		{name: "missing health_path arg", directive: "health_path"},

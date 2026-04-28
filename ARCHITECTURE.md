@@ -28,10 +28,11 @@ flowchart LR
 3. For a stream request, NUTS builds a stream plan from either repeated
    `?topic=` query parameters or path shorthand such as `/orders/new`.
 4. NUTS applies `topic_prefix`, de-duplicates topics, validates topic syntax,
-   and chooses a replay mode from `last-id` or `Last-Event-ID`.
+   checks subscriber JWT topic claims when configured, and chooses a replay
+   mode from `last-id` or `Last-Event-ID`.
 5. NUTS creates an ephemeral JetStream subscription and writes SSE frames until
-   the client disconnects, the handler shuts down, the client is too slow, or a
-   replay cap is reached.
+  the client disconnects, the handler shuts down, the client is too slow, a
+  configured dispatch/write timeout fires, or a replay cap is reached.
 
 ## Replay Flow
 
@@ -55,9 +56,10 @@ sequenceDiagram
 ```
 
 If JetStream has already purged the requested sequence, fallback replay is used.
-`replay_window` bounds fallback by time and `replay_max_messages` bounds it by
-count. Without either setting, fallback replays all retained messages for the
-requested subject.
+`replay_window` also bounds retained cursors older than the configured time
+window, while preserving exact sequence replay for cursors still inside the
+window. `replay_max_messages` bounds historical replay count. Without either
+setting, retained replay is unbounded.
 
 ## State And Ownership
 
@@ -78,7 +80,8 @@ multi-topic behavior without duplicate delivery.
 
 ## Security Boundary
 
-NUTS authenticates to NATS; it does not authenticate browser subscribers.
-Subscriber identity, sessions, and tenant policy belong in Caddy route policy,
-`forward_auth`, an upstream reverse proxy, separate route blocks, or separate
-streams/prefixes. CORS is a browser read policy, not authorization.
+NUTS authenticates to NATS separately from browser subscriber access. Subscriber
+identity and tenant policy can live in Caddy route policy, `forward_auth`, an
+upstream reverse proxy, separate route blocks, separate streams/prefixes, or the
+optional `subscriber_jwt_key` check with JWT `subscribe` topic claims. CORS is a
+browser read policy, not authorization.

@@ -1,48 +1,9 @@
-// Package nuts implements an HTTP middleware for Caddy that exposes a
-// JetStream stream to browser clients as a Server-Sent Events (SSE) feed.
-//
-// The module registers itself with Caddy as http.handlers.nuts and as the
-// "nuts" Caddyfile directive. A single long-lived NATS connection is opened
-// in Provision() and shared across every request handled by the module
-// instance; per-request subscriptions are ephemeral JetStream consumers that
-// are torn down when the SSE connection closes.
-//
-// Data flow is one-directional — NUTS does not publish:
+// Package nuts exposes a retained NATS JetStream stream to browsers as
+// Server-Sent Events through a Caddy HTTP handler.
 //
 //	Producer ──▶ NATS JetStream ──▶ NUTS (this module) ──▶ Browser (EventSource)
 //
-// External producers write to NATS subjects directly. Every request to the
-// handler opens an ephemeral JetStream consumer scoped to the configured
-// stream and the topics extracted from ?topic= (repeatable) or from the
-// request path as a shorthand ("/a/b" → topic "a.b"). Incoming messages are
-// wrapped as JSON ({topic, payload, time}) and written to the client as SSE
-// events with the JetStream sequence number as the SSE id. Clients reconnect
-// with either the browser-managed Last-Event-ID header or an explicit
-// ?last-id= query parameter to resume from a specific sequence; if that
-// sequence has already been purged from the stream NUTS uses the configured
-// fallback replay strategy (bounded by replay_max_messages / replay_window
-// when configured).
-//
-// Source files:
-//   - handler.go   — Package godoc, Handler struct (config + runtime state),
-//     module registration, Caddy interface guards.
-//   - provision.go — Provision/Validate/Cleanup: defaults, NATS dial,
-//     JetStream context, stream existence check, TLS config,
-//     teardown.
-//   - serve.go     — ServeHTTP and its helpers: liveness/readiness probes, CORS
-//     preflight, topic extraction and validation, last-id
-//     parsing, connection-slot reservation, JetStream
-//     subscription (with purged-sequence fallback), the SSE
-//     streaming select loop, slow-client disconnect, and
-//     heartbeat.
-//   - caddyfile.go — Caddyfile directive parser (UnmarshalCaddyfile).
-//   - helpers.go   — Small utilities: JSON marshalling, topic validation,
-//     SSE frame writer, URL credential redaction.
-//   - metrics.go   — Prometheus counters and gauges registered via promauto
-//     (nuts_* namespace).
-//
-// See cmd/caddy/main.go for the build entry point that compiles Caddy with
-// this module baked in.
+// External producers write to NATS directly; NUTS is a read-only bridge.
 package nuts
 
 import (
@@ -56,58 +17,43 @@ import (
 	"go.uber.org/zap"
 )
 
-// init runs automatically when the package is imported. It tells Caddy about
-// our module so that Caddy can create instances of it, and it registers the
-// "nuts" keyword so users can use it in their Caddyfile.
 func init() {
-	// RegisterModule makes Caddy aware of our Handler type.
 	caddy.RegisterModule(&Handler{})
-
-	// RegisterHandlerDirective tells Caddy's config parser that when it sees
-	// a "nuts" block it should call parseCaddyfile (defined in caddyfile.go)
-	// to turn the text into a Handler.
 	httpcaddyfile.RegisterHandlerDirective("nuts", parseCaddyfile)
 }
 
 // Handler implements an HTTP handler that bridges NATS.io JetStream
 // messages to Server-Sent Events (SSE) for browser clients.
 //
-// Fields tagged with `json:"..."` are user-configurable — they come
-// from the Caddyfile (via UnmarshalCaddyfile) or from Caddy's JSON API.
-// The unexported fields at the bottom are runtime state set during
-// Provision() and should never be set manually.
+// Exported fields are user-configurable through Caddyfile or JSON config.
 type Handler struct {
-	// ── Required ──────────────────────────────────────────────────
-
 	// NatsURL is the connection string for the NATS server.
-	// Example: "nats://localhost:4222"
 	NatsURL string `json:"nats_url,omitempty"`
 
-	// StreamName is the JetStream stream to subscribe to (e.g., "EVENTS").
-	// The stream must already exist — NUTS does not create streams.
+	// StreamName is the existing JetStream stream to subscribe to.
 	StreamName string `json:"stream_name,omitempty"`
 
-	// ── Authentication (pick at most one method) ─────────────────
-
-	// NatsCredentials is the filesystem path to a .creds file.
-	// Used with NATS account-based security (JWT + NKey).
+	// NatsCredentials is the filesystem path to a NATS .creds file.
 	NatsCredentials string `json:"nats_credentials,omitempty"`
 
-	// NatsToken is a simple shared-secret token for NATS authentication.
+	// NatsToken is a shared-secret token for NATS authentication.
 	NatsToken string `json:"nats_token,omitempty"`
 
-	// NatsUser is the username for basic NATS authentication.
-	// Must be paired with NatsPassword.
+	// NatsUser is the username for NATS user/password authentication.
 	NatsUser string `json:"nats_user,omitempty"`
 
-	// NatsPassword is the password for basic NATS authentication.
-	// Must be paired with NatsUser.
+	// NatsPassword must be paired with NatsUser.
 	NatsPassword string `json:"nats_password,omitempty"`
 
-	// ── Optional tuning ──────────────────────────────────────────
+	// SubscriberJWTKey enables first-party subscriber JWT auth using HMAC-signed
+	// tokens. Tokens must include a subscribe claim with allowed topics/filters.
+	SubscriberJWTKey string `json:"subscriber_jwt_key,omitempty"`
+
+	// SubscriberJWTCookie optionally names the cookie that carries the JWT for
+	// browser EventSource clients. Authorization: Bearer is always accepted.
+	SubscriberJWTCookie string `json:"subscriber_jwt_cookie,omitempty"`
 
 	// TopicPrefix is prepended to every topic name before subscribing.
-	// For example, prefix "events." + client topic "orders" = NATS subject "events.orders".
 	TopicPrefix string `json:"topic_prefix,omitempty"`
 
 	// AllowedOrigins lists the browser origins allowed by CORS.
@@ -178,21 +124,19 @@ type Handler struct {
 	// Default: 64.
 	ClientBufferSize int `json:"client_buffer_size,omitempty"`
 
-	// ReplayMaxMessages caps how many messages a single client can receive
-	// during replay fallback (triggered when the requested sequence
-	// has been purged from the stream). 0 (default) disables the cap. When
-	// the cap is reached the SSE connection is closed cleanly; the client
-	// may reconnect with a fresher Last-Event-ID.
+	// DispatchTimeout caps how long the NATS callback waits to signal a blocked
+	// SSE client after its queue is full. Value is in seconds; 0 disables it.
+	DispatchTimeout int `json:"dispatch_timeout,omitempty"`
+
+	// WriteTimeout caps each SSE frame write/flush. Value is in seconds; 0
+	// leaves write deadlines to the surrounding HTTP server configuration.
+	WriteTimeout int `json:"write_timeout,omitempty"`
+
+	// ReplayMaxMessages caps replay delivery per reconnect. 0 disables the cap.
 	ReplayMaxMessages int `json:"replay_max_messages,omitempty"`
 
-	// ReplayWindow caps how far back in time replay fallback reaches.
-	// Value is in seconds. When > 0 the fallback subscribes with
-	// StartTime(now - ReplayWindow) instead of DeliverAll, so the client
-	// only sees recent retained messages. 0 (default) preserves the
-	// "replay everything retained" behaviour.
+	// ReplayWindow caps replay by time in seconds. 0 preserves retained replay.
 	ReplayWindow int `json:"replay_window,omitempty"`
-
-	// ── NATS TLS ─────────────────────────────────────────────────
 
 	// NatsTLSCA is a path to a PEM-encoded CA bundle used to verify the
 	// NATS server certificate.
@@ -210,33 +154,22 @@ type Handler struct {
 	// Use only for development against self-signed certs.
 	NatsTLSInsecureSkipVerify bool `json:"nats_tls_insecure_skip_verify,omitempty"`
 
-	// ── Runtime state (not user-configurable) ────────────────────
-
-	// conn is the long-lived TCP connection to the NATS server.
-	// Opened during Provision(), shared across all HTTP requests.
+	// conn is opened during Provision and shared across HTTP requests.
 	conn *nats.Conn
 
-	// js is a JetStream context derived from conn. It provides
-	// Subscribe() and StreamInfo() used by ServeHTTP and Provision.
+	// js is the JetStream context derived from conn.
 	js nats.JetStreamContext
 
-	// logger is a structured logger scoped to this handler instance.
+	// logger is scoped to this handler instance.
 	logger *zap.Logger
 
-	// mu protects conn and js. Request goroutines read-lock (RLock);
-	// Provision and Cleanup write-lock (Lock).
+	// mu protects conn, js, and shutdown.
 	mu sync.RWMutex
 
-	// connCount is the live SSE connection counter used to enforce
-	// MaxConnections. Updated atomically.
+	// connCount enforces MaxConnections.
 	connCount int64
 
-	// shutdown is closed by Cleanup() to wake in-flight SSE handlers
-	// immediately instead of letting them linger until the next heartbeat
-	// tick or NATS-side error. Created in Provision(), closed and nilled
-	// in Cleanup(). Protected by mu. When nil (e.g. tests that bypass
-	// Provision), the serve loop's select case is a never-firing nil
-	// channel — harmless.
+	// shutdown wakes in-flight SSE handlers during Cleanup.
 	shutdown chan struct{}
 }
 

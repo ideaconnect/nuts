@@ -24,12 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nuts_connections_rejected_total{reason}` Prometheus counter.
 - New Caddyfile directive `client_buffer_size` for the per-connection send
   buffer (default `64`).
+- New Caddyfile directives `dispatch_timeout` and `write_timeout` (default
+  `0`, disabled) to bound saturated slow-client signaling and per-frame SSE
+  writes when supported by the HTTP response writer.
 - New Caddyfile directive `replay_max_messages` (default `0`, unlimited)
-  to cap how many events a single client receives on a replay fallback,
+  to cap how many historical events a single client receives on replay,
   with a new `nuts_replay_cap_reached_total` Prometheus counter.
 - New Caddyfile directive `replay_window` (default `0`, all retained) to
-  bound the replay fallback to the last N seconds via NATS `StartTime`
-  instead of `DeliverAll`.
+  bound old replay cursors to the last N seconds via NATS `StartTime`.
+- New Caddyfile directives `subscriber_jwt_key` and `subscriber_jwt_cookie`
+  for optional first-party subscriber JWT auth and per-topic `subscribe` claim
+  authorization before any JetStream consumer is created.
 - Replay fallback now fires when the requested `last-id` is below the
   stream's retained range (previously the JetStream subscribe only
   silently started at `FirstSeq`; this flag-lit fallback enables the cap
@@ -99,6 +104,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stream lifecycle logs now include consistent structured fields for requested
   topics, full subjects, replay mode, replay start/fallback context, and
   disconnect reason.
+- `replay_max_messages` now caps all retained replay requests, not only
+  purged-cursor fallback replay. `replay_window` now also bounds retained
+  cursors older than the configured window while preserving exact sequence
+  replay for cursors still inside the window.
 
 ### Fixed
 - [`Caddyfile`](Caddyfile) and [`Dockerfile.test`](Dockerfile.test) each had

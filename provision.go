@@ -293,11 +293,23 @@ func (h *Handler) validateConfigValues() error {
 	if h.ClientBufferSize < 0 {
 		return fmt.Errorf("client_buffer_size must be >= 0")
 	}
+	if h.DispatchTimeout < 0 {
+		return fmt.Errorf("dispatch_timeout must be >= 0")
+	}
+	if h.WriteTimeout < 0 {
+		return fmt.Errorf("write_timeout must be >= 0")
+	}
 	if h.ReplayMaxMessages < 0 {
 		return fmt.Errorf("replay_max_messages must be >= 0")
 	}
 	if h.ReplayWindow < 0 {
 		return fmt.Errorf("replay_window must be >= 0")
+	}
+	if h.SubscriberJWTCookie != "" && h.SubscriberJWTKey == "" {
+		return fmt.Errorf("subscriber_jwt_cookie requires subscriber_jwt_key")
+	}
+	if h.SubscriberJWTCookie != "" && !isValidCookieName(h.SubscriberJWTCookie) {
+		return fmt.Errorf("subscriber_jwt_cookie contains invalid characters")
 	}
 	for _, method := range h.AllowedMethods {
 		switch strings.ToUpper(method) {

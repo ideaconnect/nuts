@@ -66,6 +66,18 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.NatsPassword = d.Val()
 
+			case "subscriber_jwt_key":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.SubscriberJWTKey = d.Val()
+
+			case "subscriber_jwt_cookie":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.SubscriberJWTCookie = d.Val()
+
 			// --- NATS TLS ---
 
 			case "nats_tls_ca":
@@ -170,6 +182,26 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("client_buffer_size must be >= 0")
 				}
 				h.ClientBufferSize = v
+
+			case "dispatch_timeout":
+				v, err := parseInt("dispatch_timeout")
+				if err != nil {
+					return err
+				}
+				if v < 0 {
+					return d.Errf("dispatch_timeout must be >= 0")
+				}
+				h.DispatchTimeout = v
+
+			case "write_timeout":
+				v, err := parseInt("write_timeout")
+				if err != nil {
+					return err
+				}
+				if v < 0 {
+					return d.Errf("write_timeout must be >= 0")
+				}
+				h.WriteTimeout = v
 
 			case "replay_max_messages":
 				v, err := parseInt("replay_max_messages")

@@ -40,6 +40,8 @@ one mode and must be configured together.
 | `allowed_origins <origins...>` | `allowed_origins` | `*` | One or more origins or `*` | Explicit origins allow credentialed CORS. Wildcard allows anonymous browser reads but does not advertise credentials. |
 | `allowed_headers <headers...>` | `allowed_headers` | `Cache-Control Last-Event-ID` | One or more request header names | Used for CORS preflight responses. Add custom headers only if a non-native SSE client sends them. |
 | `allowed_methods <methods...>` | `allowed_methods` | `GET OPTIONS` | Only `GET` and `OPTIONS` | Other methods are rejected during validation because NUTS only serves SSE and preflight requests. |
+| `subscriber_jwt_key <secret>` | `subscriber_jwt_key` | Empty | HMAC secret for HS256/HS384/HS512 JWTs | Enables first-party subscriber auth. Tokens must include a `subscribe` claim with allowed topic filters. |
+| `subscriber_jwt_cookie <name>` | `subscriber_jwt_cookie` | Empty | Valid HTTP cookie name | Optional cookie source for browser EventSource clients. Requires `subscriber_jwt_key`; `Authorization: Bearer` is always accepted when JWT auth is enabled. |
 | `health_path <path>` | `health_path` | `/healthz` | Path with or without leading `/` | Legacy readiness-style endpoint. Checks NATS and stream availability. |
 | `live_path <path>` | `live_path` | `/livez` | Path with or without leading `/` | Process liveness only; does not check NATS or JetStream. |
 | `ready_path <path>` | `ready_path` | `/readyz` | Path with or without leading `/` | Readiness endpoint. Checks NATS connection and configured stream. |
@@ -59,8 +61,10 @@ NUTS as `/readyz`.
 | `max_event_size <bytes>` | `max_event_size` | `1048576` when `0` or omitted | Positive cap, `0` for default, negative for unlimited | Caps the formatted SSE frame. Oversized events are dropped and counted. |
 | `max_connections <count>` | `max_connections` | `0` | Integer `>= 0` | `0` disables the cap. Rejected clients receive `503` and `Retry-After: 5`. |
 | `client_buffer_size <count>` | `client_buffer_size` | `64` when `0` or omitted | Integer `>= 0` | Per-connection queue length. A full queue disconnects the slow client. |
-| `replay_max_messages <count>` | `replay_max_messages` | `0` | Integer `>= 0` | `0` is unlimited. When reached during fallback replay, NUTS closes the stream cleanly. |
-| `replay_window <seconds>` | `replay_window` | `0` | Integer `>= 0` | `0` replays all retained fallback messages. Positive values use `StartTime(now - replay_window)`. |
+| `dispatch_timeout <seconds>` | `dispatch_timeout` | `0` | Integer `>= 0` | `0` disables the cap. Positive values bound how long a NATS callback waits to signal a slow client after its queue is already full. |
+| `write_timeout <seconds>` | `write_timeout` | `0` | Integer `>= 0` | `0` leaves write deadlines to Caddy/server config. Positive values set per-frame SSE write deadlines when the response writer supports them. |
+| `replay_max_messages <count>` | `replay_max_messages` | `0` | Integer `>= 0` | `0` is unlimited. When reached during replay, NUTS closes the stream cleanly. |
+| `replay_window <seconds>` | `replay_window` | `0` | Integer `>= 0` | `0` preserves retained replay. Positive values bound old replay cursors to `StartTime(now - replay_window)` while preserving exact sequence replay inside the window. |
 
 ## Production Defaults To Revisit
 
@@ -70,8 +74,10 @@ multi-tenant routes should usually set these explicitly:
 | Directive | Why revisit it |
 | --- | --- |
 | `allowed_origins` | Replace `*` with explicit origins when cookies or credentials are used. |
+| `subscriber_jwt_key` / `subscriber_jwt_cookie` | Enable first-party subscriber authentication and topic claims when Caddy/upstream policy is not enough. |
 | `max_connections` | Bound total concurrent streams per instance. |
 | `max_event_size` | Lower from 1 MiB when payloads are known to be smaller. |
 | `client_buffer_size` | Lower from 64 when memory per connection matters. |
-| `replay_max_messages` / `replay_window` | Bound fallback replay on large retained streams. |
+| `dispatch_timeout` / `write_timeout` | Bound NATS callback waits and blocked SSE writes for slow or stalled downstream connections. |
+| `replay_max_messages` / `replay_window` | Bound replay on large retained streams. |
 | `nats_tls_*` | Use TLS and mTLS where NATS is not on a trusted private network. |

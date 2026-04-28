@@ -44,36 +44,39 @@ Production deployments should:
 
 - Enable NATS TLS via `nats_tls_ca` / `nats_tls_cert` / `nats_tls_key`.
 - Protect the NUTS HTTP route with Caddy `basic_auth`, `forward_auth`, a
-  reverse proxy, or application policy when subscriber authentication or
-  per-topic authorization is needed. NATS auth directives only authenticate
-  NUTS to NATS; they do not authenticate browser subscribers.
+  reverse proxy, application policy, or `subscriber_jwt_key` when subscriber
+  authentication or per-topic authorization is needed. NATS auth directives
+  only authenticate NUTS to NATS; they do not authenticate browser subscribers.
 - Set `max_connections` to a value appropriate for the host.
 - Set `max_event_size` to bound memory per event.
+- Set `write_timeout` and `dispatch_timeout` where blocked downstream writes
+  or saturated slow-client signals should be bounded by the handler itself.
 - Set `replay_max_messages` or `replay_window` when a large retained stream
-  could make fallback replay too expensive.
+  could make replay too expensive.
 - Restrict `allowed_origins` to your trusted front-ends.
 - Run the container as a non-root user (already the default).
 
 ### Subscriber access boundary
 
-Any client that can reach a NUTS route can request any valid topic under that
-handler's `topic_prefix`. CORS is not authorization; it only controls browser
-read access by origin. Put authentication and subscriber policy in front of
-NUTS using Caddy route policy, `forward_auth`, a reverse proxy, application
-cookies, or separate NUTS route blocks with separate streams/prefixes per
-tenant.
+Without `subscriber_jwt_key` or an upstream auth layer, any client that can
+reach a NUTS route can request any valid topic under that handler's
+`topic_prefix`. CORS is not authorization; it only controls browser read access
+by origin.
 
-The README contains copy-pasteable examples for Caddy `basic_auth`,
-`forward_auth`, and per-tenant route isolation. Keep auth checks before the
-`nuts` handler so unauthorized requests are rejected before an ephemeral
-JetStream consumer is created.
+Use one or more of these controls when tenant or private-topic isolation
+matters:
 
-Current decision: NUTS does not include a first-party subscriber authorization
-hook in this release. The safer default is to compose with Caddy and existing
-identity gateways rather than maintain two independent policy systems. Future
-first-party subscriber JWT/private-topic support is tracked in `ROADMAP.md` and
-should be opt-in, reject before subscription, and preserve the read-only bridge
-model.
+- `subscriber_jwt_key` with a JWT `subscribe` claim for first-party topic
+  authorization inside NUTS.
+- Caddy route policy, `forward_auth`, a reverse proxy, or application cookies.
+- Separate NUTS route blocks with separate streams/prefixes per tenant.
+
+NUTS subscriber JWTs use HMAC signatures (`HS256`, `HS384`, or `HS512`) and
+must include a `subscribe` claim. Supported filters are exact topic names,
+single-token wildcards such as `orders.*`, tail wildcards such as `tenant-a.>`,
+or `*` / `>` for all topics on the route. Missing, expired, badly signed, or
+unauthorized tokens are rejected before an ephemeral JetStream consumer is
+created.
 
 ### Rate limits and replay bounds
 
@@ -87,7 +90,7 @@ limit request churn by IP, user, or tenant. Recommended buckets are:
 
 `max_connections` caps concurrent streams, but it is not a request-rate limit.
 On retained streams with a large backlog, set `replay_window` and/or
-`replay_max_messages` so one reconnect cannot force an unbounded fallback
+`replay_max_messages` so one reconnect cannot force an unbounded
 replay. The default `0` values preserve compatibility by allowing all retained
-fallback replay; production public routes should choose explicit bounds that
-match their retention and client recovery budget.
+replay; production public routes should choose explicit bounds that match their
+retention and client recovery budget.

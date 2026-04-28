@@ -33,7 +33,7 @@ make test-performance
 | Concurrent live delivery | 16 SSE clients, 40 JSON messages at 100 messages/second, final message visible to every client within 5 seconds | `TestPerformance_ConcurrentSSEClientsReceiveRealisticMessageRate` |
 | Slow readers | A replaying client with a saturated 4-message queue disconnects within 3 seconds and handler goroutines return to baseline plus 20 | `TestPerformance_SlowReaderDisconnectsWithoutGoroutineLeak` |
 | Replay without fallback caps | 160 retained messages replay within 5 seconds when the queue is sized for that replay | `TestPerformance_ReplayLoadWithAndWithoutFallbackCaps` |
-| Replay with fallback caps | `replay_max_messages 25` closes the fallback stream after exactly 25 message events within 5 seconds | `TestPerformance_ReplayLoadWithAndWithoutFallbackCaps` |
+| Replay with caps | `replay_max_messages 25` closes the replaying stream after exactly 25 historical message events within 5 seconds | `TestPerformance_ReplayLoadWithAndWithoutFallbackCaps` |
 | Large payload memory | Repeated 64 KiB payload formatting retains less than 32 MiB of extra heap after GC | `TestPerformance_MemoryGrowthLargePayloadFormattingWithinBudget` |
 | Replay memory | Large retained replay scenarios grow heap by less than 32 MiB during the CI-sized run | `TestPerformance_ReplayLoadWithAndWithoutFallbackCaps` |
 
@@ -65,8 +65,12 @@ Use these as release gates before increasing traffic or connection limits:
   load run meets the latency and memory budgets above.
 - **Replay safety:** configure at least one of `replay_max_messages` or
   `replay_window` for public or multi-tenant routes. Size `client_buffer_size`
-  for the largest replay burst you are willing to serve without treating the
-  client as slow.
+  for the largest retained replay burst you are willing to serve without
+  treating the client as slow.
+- **Downstream stalls:** set `write_timeout` for public routes where blocked
+  client/proxy writes must not hold a handler goroutine indefinitely. Pair it
+  with `dispatch_timeout` when callback latency under a saturated client queue
+  matters.
 
 Record benchmark output and load-test parameters with release artifacts when
 changing formatter code, replay behavior, client buffering, or NATS versions.

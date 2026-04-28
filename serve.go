@@ -42,6 +42,7 @@ type replayPlan struct {
 	HasLastID      bool
 	Mode           replayMode
 	StartSequence  uint64
+	CapSequence    uint64
 	FallbackReason string
 }
 
@@ -79,8 +80,11 @@ func appendStreamLogFields(plan streamPlan, fields ...zap.Field) []zap.Field {
 }
 
 type streamInfoSnapshot struct {
-	FirstSeq uint64
-	Subjects []string
+	FirstSeq             uint64
+	LastSeq              uint64
+	Subjects             []string
+	StartSequenceTime    time.Time
+	HasStartSequenceTime bool
 }
 
 type streamRuntime struct {
@@ -95,22 +99,26 @@ type streamRequestError struct {
 }
 
 func (e *streamRequestError) write(w http.ResponseWriter) {
+	if e.status == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="nuts"`)
+	}
 	http.Error(w, e.message, e.status)
 }
 
 type subscriptionResult struct {
-	Subscriptions  []*nats.Subscription
-	FailedTopics   []string
-	ReplayFellBack bool
+	Subscriptions []*nats.Subscription
+	FailedTopics  []string
 }
 
 type formattedMessageEvent struct {
-	Frame       string
-	Subject     string
-	Dropped     bool
-	DropReason  string
-	DropSize    int
-	MetadataErr error
+	Frame             string
+	Subject           string
+	StreamSequence    uint64
+	HasStreamSequence bool
+	Dropped           bool
+	DropReason        string
+	DropSize          int
+	MetadataErr       error
 }
 
 func isReplayStartSequenceError(err error, hasLastID bool) bool {
@@ -134,6 +142,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	plan, requestErr := h.parseStreamRequest(r)
 	if requestErr != nil {
 		requestErr.write(w)
+		return nil
+	}
+	if authErr := h.authorizeStreamRequest(r, plan); authErr != nil {
+		authErr.write(w)
 		return nil
 	}
 
@@ -203,7 +215,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	defer h.cleanupStream(done, result.Subscriptions)
 
-	return h.serveStream(w, flusher, r, plan, msgChan, slowClient, runtime.shutdown, result.ReplayFellBack)
+	return h.serveStream(w, flusher, r, plan, msgChan, slowClient, runtime.shutdown)
 }
 
 func (h *Handler) handleControlRequest(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) (bool, error) {
@@ -314,6 +326,7 @@ func (h *Handler) newMessageQueue() (chan *nats.Msg, chan string, chan struct{},
 	if bufSize <= 0 {
 		bufSize = defaultClientBufferSize
 	}
+	dispatchTimeout := time.Duration(h.DispatchTimeout) * time.Second
 	msgChan := make(chan *nats.Msg, bufSize)
 	done := make(chan struct{})
 	slowClient := make(chan string, 1)
@@ -324,23 +337,34 @@ func (h *Handler) newMessageQueue() (chan *nats.Msg, chan string, chan struct{},
 			return
 		case msgChan <- msg:
 		default:
-			// msgChan is full — this client is slow. The consumer loop
-			// reads slowClient at the top of its select and disconnects
-			// as soon as it sees a signal; the client then reconnects and
-			// JetStream replays anything we did not forward. We must not
-			// silently discard the signal: a lost signal would leave the
-			// client connected with a full buffer, seeing no progress and
-			// no disconnect. Block (typically microseconds) until either
-			// the signal is accepted or the handler tears down and closes
-			// done, so every overflow ends in a disconnect, never a
-			// silent stall.
-			select {
-			case slowClient <- msg.Subject:
-			case <-done:
-			}
+			h.signalSlowClient(slowClient, msg.Subject, done, dispatchTimeout)
 		}
 	}
 	return msgChan, slowClient, done, enqueueMessage
+}
+
+func (h *Handler) signalSlowClient(slowClient chan<- string, subject string, done <-chan struct{}, timeout time.Duration) {
+	if timeout <= 0 {
+		select {
+		case slowClient <- subject:
+		case <-done:
+		}
+		return
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case slowClient <- subject:
+	case <-done:
+	case <-timer.C:
+		if h.logger != nil {
+			h.logger.Warn("timed out signaling slow SSE client",
+				zap.String("subject", subject),
+				zap.Int("dispatch_timeout_seconds", h.DispatchTimeout),
+			)
+		}
+	}
 }
 
 func (p streamPlan) requestedMessageHandler(enqueueMessage nats.MsgHandler) nats.MsgHandler {
@@ -355,11 +379,28 @@ func (p streamPlan) requestedMessageHandler(enqueueMessage nats.MsgHandler) nats
 func (h *Handler) readStreamSnapshot(js nats.JetStreamContext, plan streamPlan) streamInfoSnapshot {
 	if plan.Replay.HasLastID || len(plan.FullSubjects) > 1 {
 		if info, infoErr := js.StreamInfo(h.StreamName); infoErr == nil {
-			return streamInfoSnapshot{FirstSeq: info.State.FirstSeq, Subjects: info.Config.Subjects}
+			snapshot := streamInfoSnapshot{
+				FirstSeq: info.State.FirstSeq,
+				LastSeq:  info.State.LastSeq,
+				Subjects: info.Config.Subjects,
+			}
+			if plan.Replay.HasLastID && h.ReplayWindow > 0 && plan.Replay.StartSequence >= info.State.FirstSeq {
+				if msg, err := js.GetMsg(h.StreamName, plan.Replay.StartSequence); err == nil {
+					snapshot.StartSequenceTime = msg.Time
+					snapshot.HasStartSequenceTime = true
+				} else if h.logger != nil {
+					h.logger.Debug("failed to read replay start sequence timestamp",
+						appendStreamLogFields(plan, zap.Error(err))...,
+					)
+				}
+			}
+			return snapshot
 		} else {
-			h.logger.Debug("failed to read StreamInfo for request pre-check",
-				appendStreamLogFields(plan, zap.Error(infoErr))...,
-			)
+			if h.logger != nil {
+				h.logger.Debug("failed to read StreamInfo for request pre-check",
+					appendStreamLogFields(plan, zap.Error(infoErr))...,
+				)
+			}
 		}
 	}
 	return streamInfoSnapshot{}
@@ -376,10 +417,26 @@ func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot)
 	if len(plan.FailedTopics) > 0 {
 		return plan
 	}
-	if plan.Replay.HasLastID && snapshot.FirstSeq > 0 && plan.Replay.StartSequence < snapshot.FirstSeq {
-		plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence below retention")
+	if plan.Replay.HasLastID {
+		plan.Replay.CapSequence = snapshot.LastSeq
+		if snapshot.FirstSeq > 0 && plan.Replay.StartSequence < snapshot.FirstSeq {
+			plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence below retention")
+		} else if h.shouldUseReplayWindow(plan.Replay, snapshot) {
+			plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence outside replay window")
+		}
 	}
 	return plan
+}
+
+func (h *Handler) shouldUseReplayWindow(replay replayPlan, snapshot streamInfoSnapshot) bool {
+	if h.ReplayWindow <= 0 || !replay.HasLastID || snapshot.LastSeq < replay.StartSequence {
+		return false
+	}
+	if !snapshot.HasStartSequenceTime {
+		return true
+	}
+	windowStart := time.Now().Add(-time.Duration(h.ReplayWindow) * time.Second)
+	return snapshot.StartSequenceTime.Before(windowStart)
 }
 
 func (h *Handler) fallbackReplayPlan(replay replayPlan, reason string) replayPlan {
@@ -457,8 +514,7 @@ func (h *Handler) executeSubscriptionPlan(js nats.JetStreamContext, conn *nats.C
 		h.logger.Debug("subscribed to topics", streamLogFields(activePlan)...)
 	}
 	return subscriptionResult{
-		Subscriptions:  []*nats.Subscription{sub},
-		ReplayFellBack: activePlan.Replay.Mode.isFallback(),
+		Subscriptions: []*nats.Subscription{sub},
 	}
 }
 
@@ -481,9 +537,10 @@ func (h *Handler) cleanupStream(done chan struct{}, subscriptions []*nats.Subscr
 	}
 }
 
-func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *http.Request, plan streamPlan, msgChan <-chan *nats.Msg, slowClient <-chan string, shutdown <-chan struct{}, replayFellBack bool) error {
+func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *http.Request, plan streamPlan, msgChan <-chan *nats.Msg, slowClient <-chan string, shutdown <-chan struct{}) error {
 	metricsActiveConnections.Inc()
 	defer metricsActiveConnections.Dec()
+	writeTimeout := time.Duration(h.WriteTimeout) * time.Second
 
 	h.setCORSHeaders(w, r)
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -494,10 +551,11 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 		w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"nuts\"", h.HubURL))
 	}
 
-	if err := writeSSEChunk(w, flusher, formatConnectedEvent(plan.Topics)); err != nil {
+	if err := writeSSEChunkWithTimeout(w, flusher, formatConnectedEvent(plan.Topics), writeTimeout); err != nil {
 		h.logger.Debug("failed to write connected event",
 			appendStreamLogFields(plan,
 				zap.String("disconnect_reason", "write_error"),
+				zap.Int("write_timeout_seconds", h.WriteTimeout),
 				zap.Error(err),
 			)...,
 		)
@@ -557,11 +615,12 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 				continue
 			}
 
-			if err := writeSSEChunk(w, flusher, formatted.Frame); err != nil {
+			if err := writeSSEChunkWithTimeout(w, flusher, formatted.Frame, writeTimeout); err != nil {
 				h.logger.Debug("failed to write message event",
 					appendStreamLogFields(plan,
 						zap.String("disconnect_reason", "write_error"),
 						zap.String("message_subject", msg.Subject),
+						zap.Int("write_timeout_seconds", h.WriteTimeout),
 						zap.Error(err),
 					)...,
 				)
@@ -569,7 +628,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 			}
 			metricsMessagesDelivered.Inc()
 
-			if replayFellBack && h.ReplayMaxMessages > 0 {
+			if h.countsTowardReplayCap(plan, formatted) {
 				replayDelivered++
 				if replayDelivered >= h.ReplayMaxMessages {
 					metricsReplayCapReached.Inc()
@@ -585,10 +644,11 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 			}
 
 		case <-heartbeat.C:
-			if err := writeSSEChunk(w, flusher, formatHeartbeatEvent(time.Now())); err != nil {
+			if err := writeSSEChunkWithTimeout(w, flusher, formatHeartbeatEvent(time.Now()), writeTimeout); err != nil {
 				h.logger.Debug("failed to write heartbeat",
 					appendStreamLogFields(plan,
 						zap.String("disconnect_reason", "heartbeat_write_error"),
+						zap.Int("write_timeout_seconds", h.WriteTimeout),
 						zap.Error(err),
 					)...,
 				)
@@ -596,6 +656,16 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 			}
 		}
 	}
+}
+
+func (h *Handler) countsTowardReplayCap(plan streamPlan, formatted formattedMessageEvent) bool {
+	if h.ReplayMaxMessages <= 0 || !plan.Replay.HasLastID {
+		return false
+	}
+	if plan.Replay.CapSequence == 0 || !formatted.HasStreamSequence {
+		return true
+	}
+	return formatted.StreamSequence <= plan.Replay.CapSequence
 }
 
 func formatConnectedEvent(topics []string) string {
@@ -629,6 +699,8 @@ func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMess
 		payload.Time = meta.Timestamp.UTC().Format(time.RFC3339)
 		eventID = meta.Sequence.Stream
 		hasEventID = true
+		formatted.StreamSequence = eventID
+		formatted.HasStreamSequence = true
 	}
 
 	var event strings.Builder
