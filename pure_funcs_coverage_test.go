@@ -1,0 +1,287 @@
+package nuts
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"hash"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestJWTHMACHash_AllAlgs(t *testing.T) {
+	cases := []struct {
+		alg    string
+		factor func() hash.Hash
+		ok     bool
+	}{
+		{alg: "HS256", factor: sha256.New, ok: true},
+		{alg: "HS384", factor: sha512.New384, ok: true},
+		{alg: "HS512", factor: sha512.New, ok: true},
+		{alg: "RS256", ok: false},
+		{alg: "", ok: false},
+	}
+	for _, c := range cases {
+		t.Run(c.alg, func(t *testing.T) {
+			got, err := jwtHMACHash(c.alg)
+			if c.ok {
+				if err != nil {
+					t.Fatalf("err = %v", err)
+				}
+				if got().Size() != c.factor().Size() {
+					t.Fatalf("hash size = %d, want %d", got().Size(), c.factor().Size())
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected error for unsupported algorithm")
+			}
+		})
+	}
+}
+
+func TestJWTNumericDate_Cases(t *testing.T) {
+	t.Run("nil returns absent", func(t *testing.T) {
+		ts, ok, err := jwtNumericDate(nil)
+		if err != nil || ok || !ts.IsZero() {
+			t.Fatalf("got (%v, %v, %v)", ts, ok, err)
+		}
+	})
+	t.Run("valid number", func(t *testing.T) {
+		ts, ok, err := jwtNumericDate(json.Number("1700000000"))
+		if err != nil || !ok || ts.Unix() != 1700000000 {
+			t.Fatalf("got (%v, %v, %v)", ts, ok, err)
+		}
+	})
+	t.Run("non-numeric value rejected", func(t *testing.T) {
+		if _, _, err := jwtNumericDate("not-a-number"); err == nil {
+			t.Fatal("expected error for non-numeric value")
+		}
+	})
+	t.Run("oversize integer rejected", func(t *testing.T) {
+		if _, _, err := jwtNumericDate(json.Number("99999999999999999999")); err == nil {
+			t.Fatal("expected Int64 error for oversize value")
+		}
+	})
+}
+
+func TestValidateJWTTimeClaims_ErrorPaths(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	t.Run("invalid exp surfaces wrapped error", func(t *testing.T) {
+		err := validateJWTTimeClaims(map[string]interface{}{"exp": "not-a-number"}, now)
+		if err == nil || !strings.Contains(err.Error(), "exp") {
+			t.Fatalf("err = %v, want wrapped exp error", err)
+		}
+	})
+	t.Run("invalid nbf surfaces wrapped error", func(t *testing.T) {
+		err := validateJWTTimeClaims(map[string]interface{}{"nbf": "not-a-number"}, now)
+		if err == nil || !strings.Contains(err.Error(), "nbf") {
+			t.Fatalf("err = %v, want wrapped nbf error", err)
+		}
+	})
+	t.Run("nbf in future rejects", func(t *testing.T) {
+		nbf := json.Number("1700003600")
+		if err := validateJWTTimeClaims(map[string]interface{}{"nbf": nbf}, now); err == nil {
+			t.Fatal("expected nbf-in-future error")
+		}
+	})
+	t.Run("nil claims pass", func(t *testing.T) {
+		if err := validateJWTTimeClaims(map[string]interface{}{}, now); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestParseSubscribeClaim_NonStringEntryRejected(t *testing.T) {
+	if _, err := parseSubscribeClaim([]interface{}{"orders.>", 42}); err == nil {
+		t.Fatal("expected error for non-string subscribe entry")
+	}
+}
+
+func TestIsValidTopicFilter_Cases(t *testing.T) {
+	cases := []struct {
+		filter string
+		want   bool
+	}{
+		{filter: "", want: false},
+		{filter: strings.Repeat("a", 257), want: false},
+		{filter: "$JS.api.>", want: false},
+		{filter: "*", want: true},
+		{filter: ">", want: true},
+		{filter: "orders.>", want: true},
+		{filter: "tenant.*.events", want: true},
+		{filter: "..bad", want: false},
+		{filter: ".bad", want: false},
+		{filter: "bad.", want: false},
+		{filter: "orders.>.created", want: false},
+		{filter: "orders.bad/path", want: false},
+		{filter: "orders.under_score-1", want: true},
+	}
+	for _, c := range cases {
+		t.Run(c.filter, func(t *testing.T) {
+			if got := isValidTopicFilter(c.filter); got != c.want {
+				t.Fatalf("isValidTopicFilter(%q) = %v, want %v", c.filter, got, c.want)
+			}
+		})
+	}
+}
+
+func TestIsValidCookieName_Cases(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{name: "", want: false},
+		{name: "session", want: true},
+		{name: "Session_Id-2", want: true},
+		{name: "with space", want: false},
+		{name: "with;semicolon", want: false},
+		{name: "non=equal", want: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isValidCookieName(c.name); got != c.want {
+				t.Fatalf("isValidCookieName(%q) = %v, want %v", c.name, got, c.want)
+			}
+		})
+	}
+}
+
+func TestExtractSubscriberToken_InvalidAuthHeaderShapes(t *testing.T) {
+	h := &Handler{}
+	cases := []string{
+		"Token abc.def.ghi",
+		"Bearer",
+		"Bearer  ",
+		"Basic dXNlcjpwYXNz",
+	}
+	for _, raw := range cases {
+		t.Run(raw, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/events?topic=x", nil)
+			req.Header.Set("Authorization", raw)
+			if _, err := h.extractSubscriberToken(req); err == nil {
+				t.Fatalf("expected error for Authorization=%q", raw)
+			}
+		})
+	}
+}
+
+func TestVerifySubscriberJWT_DecodeErrors(t *testing.T) {
+	secret := []byte("test-secret")
+	now := time.Unix(1700000000, 0)
+	validPayload := encodeJWTPartTesting(t, map[string]interface{}{"subscribe": "*", "exp": now.Add(time.Hour).Unix()})
+
+	t.Run("header b64 invalid", func(t *testing.T) {
+		token := "!!!." + validPayload + "." + base64.RawURLEncoding.EncodeToString([]byte("sig"))
+		if _, err := verifySubscriberJWT(token, secret, now); err == nil {
+			t.Fatal("expected header decode error")
+		}
+	})
+	t.Run("header JSON invalid", func(t *testing.T) {
+		badHeader := base64.RawURLEncoding.EncodeToString([]byte("not-json"))
+		token := badHeader + "." + validPayload + "." + base64.RawURLEncoding.EncodeToString([]byte("sig"))
+		if _, err := verifySubscriberJWT(token, secret, now); err == nil {
+			t.Fatal("expected header parse error")
+		}
+	})
+	t.Run("signature b64 invalid", func(t *testing.T) {
+		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		token := header + "." + validPayload + ".!!!"
+		if _, err := verifySubscriberJWT(token, secret, now); err == nil {
+			t.Fatal("expected signature decode error")
+		}
+	})
+	t.Run("payload b64 invalid", func(t *testing.T) {
+		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		badPayload := "!!!"
+		mac := hmac.New(sha256.New, secret)
+		mac.Write([]byte(header + "." + badPayload))
+		token := header + "." + badPayload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		if _, err := verifySubscriberJWT(token, secret, now); err == nil {
+			t.Fatal("expected payload decode error")
+		}
+	})
+	t.Run("payload JSON invalid", func(t *testing.T) {
+		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		badPayload := base64.RawURLEncoding.EncodeToString([]byte("not-json"))
+		mac := hmac.New(sha256.New, secret)
+		mac.Write([]byte(header + "." + badPayload))
+		token := header + "." + badPayload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		if _, err := verifySubscriberJWT(token, secret, now); err == nil {
+			t.Fatal("expected payload parse error")
+		}
+	})
+	t.Run("HS512 token verifies", func(t *testing.T) {
+		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS512", "typ": "JWT"})
+		payload := encodeJWTPartTesting(t, map[string]interface{}{"subscribe": "*"})
+		mac := hmac.New(sha512.New, secret)
+		mac.Write([]byte(header + "." + payload))
+		token := header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		if _, err := verifySubscriberJWT(token, secret, now); err != nil {
+			t.Fatalf("HS512 token rejected: %v", err)
+		}
+	})
+}
+
+// noDeadlineRecorder is a Flusher-capable ResponseWriter whose
+// SetWriteDeadline is wired through http.NewResponseController to return
+// http.ErrNotSupported, exercising the writeSSEChunkWithTimeout fallback.
+type noDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+}
+
+func (n *noDeadlineRecorder) Flush() {}
+
+// errOnSetDeadlineRecorder reports a non-ErrNotSupported error from
+// SetWriteDeadline, so writeSSEChunkWithTimeout must surface it.
+type errOnSetDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	err error
+}
+
+func (e *errOnSetDeadlineRecorder) Flush()                             {}
+func (e *errOnSetDeadlineRecorder) SetWriteDeadline(_ time.Time) error { return e.err }
+
+func TestWriteSSEChunkWithTimeout_FallbackAndErrors(t *testing.T) {
+	t.Run("zero timeout writes through", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		if err := writeSSEChunkWithTimeout(rr, &noDeadlineRecorder{ResponseRecorder: rr}, "data: x\n\n", 0); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if rr.Body.String() != "data: x\n\n" {
+			t.Fatalf("body = %q", rr.Body.String())
+		}
+	})
+	t.Run("falls back when deadline unsupported", func(t *testing.T) {
+		nr := &noDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+		if err := writeSSEChunkWithTimeout(nr, nr, "data: x\n\n", time.Second); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if nr.Body.String() != "data: x\n\n" {
+			t.Fatalf("body = %q", nr.Body.String())
+		}
+	})
+	t.Run("propagates non-not-supported deadline error", func(t *testing.T) {
+		boom := errors.New("boom")
+		er := &errOnSetDeadlineRecorder{ResponseRecorder: httptest.NewRecorder(), err: boom}
+		err := writeSSEChunkWithTimeout(er, er, "data: x\n\n", time.Second)
+		if err == nil || !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want boom", err)
+		}
+	})
+}
+
+func encodeJWTPartTesting(t *testing.T, value interface{}) string {
+	t.Helper()
+	b, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal JWT part: %v", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
