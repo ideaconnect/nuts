@@ -92,7 +92,57 @@ func TestHandler_PlanSubscriptionSelectsReplayModes(t *testing.T) {
 		if plan.Replay.Mode != replayModeFallbackStartTime {
 			t.Fatalf("Replay mode = %s, want fallback_start_time", plan.Replay.Mode)
 		}
+		if plan.Replay.StartTime.IsZero() {
+			t.Fatal("StartTime was not set for replay-window fallback")
+		}
 	})
+
+	t.Run("valid retained sequence outside replay window falls back", func(t *testing.T) {
+		h := &Handler{ReplayWindow: 30}
+		plan := h.planSubscription(basePlan, streamInfoSnapshot{
+			FirstSeq:             5,
+			LastSeq:              20,
+			StartSequenceTime:    time.Now().Add(-time.Minute),
+			HasStartSequenceTime: true,
+		})
+		if plan.Replay.Mode != replayModeFallbackStartTime {
+			t.Fatalf("Replay mode = %s, want fallback_start_time", plan.Replay.Mode)
+		}
+		if plan.Replay.StartTime.IsZero() {
+			t.Fatal("StartTime was not set for replay-window fallback")
+		}
+	})
+
+	t.Run("valid retained sequence inside replay window keeps sequence", func(t *testing.T) {
+		h := &Handler{ReplayWindow: 30}
+		plan := h.planSubscription(basePlan, streamInfoSnapshot{
+			FirstSeq:             5,
+			LastSeq:              20,
+			StartSequenceTime:    time.Now(),
+			HasStartSequenceTime: true,
+		})
+		if plan.Replay.Mode != replayModeStartSequence {
+			t.Fatalf("Replay mode = %s, want start_sequence", plan.Replay.Mode)
+		}
+	})
+}
+
+func TestShouldSkipReplayWindowMessage(t *testing.T) {
+	windowStart := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
+	plan := streamPlan{Replay: replayPlan{Mode: replayModeFallbackStartTime, StartTime: windowStart}}
+
+	if !shouldSkipReplayWindowMessage(plan, formattedMessageEvent{MessageTime: windowStart.Add(-time.Nanosecond), HasMessageTime: true}) {
+		t.Fatal("message before replay window should be skipped")
+	}
+	if shouldSkipReplayWindowMessage(plan, formattedMessageEvent{MessageTime: windowStart, HasMessageTime: true}) {
+		t.Fatal("message at replay window start should be delivered")
+	}
+	if shouldSkipReplayWindowMessage(plan, formattedMessageEvent{MessageTime: windowStart.Add(time.Second), HasMessageTime: true}) {
+		t.Fatal("message inside replay window should be delivered")
+	}
+	if shouldSkipReplayWindowMessage(streamPlan{Replay: replayPlan{Mode: replayModeStartSequence}}, formattedMessageEvent{MessageTime: windowStart.Add(-time.Second), HasMessageTime: true}) {
+		t.Fatal("non-fallback replay should not apply replay-window skip")
+	}
 }
 
 func TestHandler_PlanSubscriptionDetectsMultiTopicStreamMismatch(t *testing.T) {

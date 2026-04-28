@@ -1005,7 +1005,9 @@ make help            # Show all available commands
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for planned features, including JWT authorization, subscription lifecycle events, an HTTP publish endpoint, and more.
+See [ROADMAP.md](ROADMAP.md) for completed milestones and planned features,
+including subscriber JWT authorization, subscription lifecycle events, an HTTP
+publish endpoint, and more.
 
 ## License
 

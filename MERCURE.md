@@ -18,9 +18,10 @@ That split leads to a deliberately different surface area:
 
 - NUTS has no publish endpoint — any NATS client (or anything that can talk
   NATS over its wire protocol) acts as the producer.
-- Subscriber authentication and per-topic authorisation are on the roadmap
-  (see [ROADMAP.md](ROADMAP.md)) but not implemented today; anonymous
-  subscribers are the default.
+- Subscriber authentication and per-topic authorisation can be handled with
+  Caddy/upstream policy or NUTS' optional HMAC-signed subscriber JWT support;
+  anonymous subscribers remain the default when no subscriber auth is
+  configured.
 - NUTS is not aiming for protocol-level interoperability with Mercure clients.
   Clients are expected to speak plain SSE with `Last-Event-ID` (or the
   `?last-id=` query param).

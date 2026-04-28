@@ -1478,10 +1478,17 @@ func TestHandler_ReplayWindow_BoundsValidRetainedReplay(t *testing.T) {
 	h.mu.Unlock()
 
 	jsPub, _ := nc.JetStream()
-	if _, err := jsPub.Publish("events.window-valid", []byte(`{"age":"old"}`)); err != nil {
+	oldAck, err := jsPub.Publish("events.window-valid", []byte(`{"age":"old"}`))
+	if err != nil {
 		t.Fatalf("publish old: %v", err)
 	}
-	time.Sleep(time.Duration(replayWindow+2) * time.Second)
+	oldMsg, err := jsPub.GetMsg("EVENTS", oldAck.Sequence)
+	if err != nil {
+		t.Fatalf("get old message: %v", err)
+	}
+	if wait := time.Until(oldMsg.Time.Add(time.Duration(replayWindow+3) * time.Second)); wait > 0 {
+		time.Sleep(wait)
+	}
 	if _, err := jsPub.Publish("events.window-valid", []byte(`{"age":"new"}`)); err != nil {
 		t.Fatalf("publish new: %v", err)
 	}

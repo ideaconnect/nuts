@@ -24,7 +24,7 @@ Run the unit tests:
 ```bash
 make test-unit
 # or
-go test ./...
+go test -timeout 120s .
 ```
 
 Run the functional (Godog) suite:

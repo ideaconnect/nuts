@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	iopm "github.com/prometheus/client_model/go"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // safeFlushRecorder is an http.ResponseWriter + http.Flusher whose body
@@ -1006,5 +1008,112 @@ func TestHandler_JetStreamPersistence_MessagesSurviveHandlerLifetime(t *testing.
 		if !strings.Contains(body, needle) {
 			t.Errorf("expected body to contain %s, got:\n%s", needle, body)
 		}
+	}
+}
+
+// TestHandler_SubscribeToMultipleTopics_MultiFilterPath drives the modern
+// JetStream multi-filter branch. The embedded NATS server pinned in go.mod
+// is 2.8.4 and does not implement ConsumerFilterSubjects, so the SDK
+// surfaces "multiple consumer filter subjects not supported"; that's
+// exactly the contract we want — when useMultiFilter is true we hand the
+// full subject list to the SDK, and any server-side rejection is returned
+// to the caller verbatim rather than silently degrading.
+func TestHandler_SubscribeToMultipleTopics_MultiFilterPath(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	plan := streamPlan{
+		Topics:       []string{"alpha", "beta"},
+		FullSubjects: []string{"events.alpha", "events.beta"},
+		Replay:       replayPlan{Mode: replayModeDeliverNew},
+	}
+
+	cb := func(*nats.Msg) {}
+
+	sub, err := h.subscribeToMultipleTopics(h.js, plan, h.subscriptionOptions(plan), cb, true, "2.10.0")
+	if err == nil {
+		_ = sub.Unsubscribe()
+		// If the embedded server is upgraded past 2.10, prove we did go
+		// through the multi-filter branch by inspecting the consumer.
+		info, infoErr := sub.ConsumerInfo()
+		if infoErr != nil {
+			t.Fatalf("ConsumerInfo: %v", infoErr)
+		}
+		if !reflect.DeepEqual(info.Config.FilterSubjects, plan.FullSubjects) {
+			t.Fatalf("FilterSubjects = %#v, want %#v", info.Config.FilterSubjects, plan.FullSubjects)
+		}
+		return
+	}
+	if !strings.Contains(err.Error(), "multiple consumer filter subjects not supported") {
+		t.Fatalf("err = %v, want SDK rejection from multi-filter branch", err)
+	}
+}
+
+// TestHandler_SubscribeToMultipleTopics_WildcardFallbackPath drives the
+// older-server fallback: the function must subscribe to the common-prefix
+// wildcard, log a warning that names the wildcard and the server version,
+// and still deliver the requested subjects.
+func TestHandler_SubscribeToMultipleTopics_WildcardFallbackPath(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	core, obs := observer.New(zap.WarnLevel)
+	h.logger = zap.New(core)
+
+	plan := streamPlan{
+		Topics:       []string{"alpha", "beta"},
+		FullSubjects: []string{"events.alpha", "events.beta"},
+		Replay:       replayPlan{Mode: replayModeDeliverNew},
+	}
+
+	received := make(chan *nats.Msg, 8)
+	cb := func(msg *nats.Msg) { received <- msg }
+
+	sub, err := h.subscribeToMultipleTopics(h.js, plan, h.subscriptionOptions(plan), cb, false, "2.9.25")
+	if err != nil {
+		t.Fatalf("subscribeToMultipleTopics: %v", err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	info, err := sub.ConsumerInfo()
+	if err != nil {
+		t.Fatalf("ConsumerInfo: %v", err)
+	}
+	wantWildcard := commonSubjectFilter(plan.FullSubjects)
+	if info.Config.FilterSubject != wantWildcard {
+		t.Fatalf("FilterSubject = %q, want %q", info.Config.FilterSubject, wantWildcard)
+	}
+	if len(info.Config.FilterSubjects) != 0 {
+		t.Fatalf("FilterSubjects = %#v, want empty on fallback path", info.Config.FilterSubjects)
+	}
+
+	if !hasLogContaining(obs, "NATS server does not support multi-filter consumers") {
+		t.Fatalf("expected fallback warning log, got: %#v", obs.All())
+	}
+	if !hasLogField(obs, "wildcard_subject", wantWildcard) {
+		t.Fatalf("expected wildcard_subject=%q in log fields, got: %#v", wantWildcard, obs.All())
+	}
+	if !hasLogField(obs, "server_version", "2.9.25") {
+		t.Fatalf("expected server_version=2.9.25 in log fields, got: %#v", obs.All())
+	}
+
+	jsPub, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("JetStream pub: %v", err)
+	}
+	if _, err := jsPub.Publish("events.alpha", []byte(`{}`)); err != nil {
+		t.Fatalf("publish alpha: %v", err)
+	}
+	select {
+	case msg := <-received:
+		if msg.Subject != "events.alpha" {
+			t.Fatalf("got subject %q, want events.alpha", msg.Subject)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("did not receive published message via wildcard fallback")
 	}
 }

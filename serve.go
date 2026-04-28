@@ -42,6 +42,7 @@ type replayPlan struct {
 	HasLastID      bool
 	Mode           replayMode
 	StartSequence  uint64
+	StartTime      time.Time
 	CapSequence    uint64
 	FallbackReason string
 }
@@ -115,6 +116,8 @@ type formattedMessageEvent struct {
 	Subject           string
 	StreamSequence    uint64
 	HasStreamSequence bool
+	MessageTime       time.Time
+	HasMessageTime    bool
 	Dropped           bool
 	DropReason        string
 	DropSize          int
@@ -443,10 +446,15 @@ func (h *Handler) fallbackReplayPlan(replay replayPlan, reason string) replayPla
 	replay.FallbackReason = reason
 	if h.ReplayWindow > 0 {
 		replay.Mode = replayModeFallbackStartTime
+		replay.StartTime = h.replayWindowStart()
 	} else {
 		replay.Mode = replayModeFallbackDeliverAll
 	}
 	return replay
+}
+
+func (h *Handler) replayWindowStart() time.Time {
+	return time.Now().Add(-time.Duration(h.ReplayWindow) * time.Second)
 }
 
 func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
@@ -459,13 +467,17 @@ func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
 		)
 	case replayModeFallbackStartTime:
 		metricsReplayFallbacks.Inc()
-		start := time.Now().Add(-time.Duration(h.ReplayWindow) * time.Second)
+		start := plan.Replay.StartTime
+		if start.IsZero() {
+			start = h.replayWindowStart()
+		}
 		opts = append(opts, nats.StartTime(start))
 		h.logger.Warn("replay fallback: using time-bounded window",
 			appendStreamLogFields(plan,
 				zap.Uint64("requested_sequence", plan.Replay.StartSequence),
 				zap.String("reason", plan.Replay.FallbackReason),
 				zap.Int("replay_window_seconds", h.ReplayWindow),
+				zap.Time("replay_window_start", start),
 			)...,
 		)
 	case replayModeFallbackDeliverAll:
@@ -523,7 +535,7 @@ func (h *Handler) subscribeWithPlan(js nats.JetStreamContext, conn *nats.Conn, p
 	if len(plan.FullSubjects) == 1 {
 		return js.Subscribe(plan.FullSubjects[0], enqueueMessage, opts...)
 	}
-	return h.subscribeToMultipleTopics(js, conn, plan, opts, enqueueRequestedMessage)
+	return h.subscribeToMultipleTopics(js, plan, opts, enqueueRequestedMessage, supportsMultiFilterSubjects(conn), connectedServerVersion(conn))
 }
 
 func (h *Handler) cleanupStream(done chan struct{}, subscriptions []*nats.Subscription) {
@@ -614,6 +626,9 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 				h.recordDroppedMessage(formatted)
 				continue
 			}
+			if shouldSkipReplayWindowMessage(plan, formatted) {
+				continue
+			}
 
 			if err := writeSSEChunkWithTimeout(w, flusher, formatted.Frame, writeTimeout); err != nil {
 				h.logger.Debug("failed to write message event",
@@ -656,6 +671,13 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 			}
 		}
 	}
+}
+
+func shouldSkipReplayWindowMessage(plan streamPlan, formatted formattedMessageEvent) bool {
+	return plan.Replay.Mode == replayModeFallbackStartTime &&
+		!plan.Replay.StartTime.IsZero() &&
+		formatted.HasMessageTime &&
+		formatted.MessageTime.Before(plan.Replay.StartTime)
 }
 
 func (h *Handler) countsTowardReplayCap(plan streamPlan, formatted formattedMessageEvent) bool {
@@ -701,6 +723,8 @@ func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMess
 		hasEventID = true
 		formatted.StreamSequence = eventID
 		formatted.HasStreamSequence = true
+		formatted.MessageTime = meta.Timestamp
+		formatted.HasMessageTime = true
 	}
 
 	var event strings.Builder
@@ -743,8 +767,8 @@ func (h *Handler) recordDroppedMessage(formatted formattedMessageEvent) {
 	}
 }
 
-func (h *Handler) subscribeToMultipleTopics(js nats.JetStreamContext, conn *nats.Conn, plan streamPlan, opts []nats.SubOpt, cb nats.MsgHandler) (*nats.Subscription, error) {
-	if supportsMultiFilterSubjects(conn) {
+func (h *Handler) subscribeToMultipleTopics(js nats.JetStreamContext, plan streamPlan, opts []nats.SubOpt, cb nats.MsgHandler, useMultiFilter bool, serverVersion string) (*nats.Subscription, error) {
+	if useMultiFilter {
 		filterOpts := append([]nats.SubOpt{}, opts...)
 		filterOpts = append(filterOpts, nats.ConsumerFilterSubjects(plan.FullSubjects...))
 		return js.Subscribe("", cb, filterOpts...)
@@ -754,7 +778,7 @@ func (h *Handler) subscribeToMultipleTopics(js nats.JetStreamContext, conn *nats
 	h.logger.Warn("NATS server does not support multi-filter consumers; using common wildcard subscription",
 		appendStreamLogFields(plan,
 			zap.String("wildcard_subject", wildcardSubject),
-			zap.String("server_version", connectedServerVersion(conn)),
+			zap.String("server_version", serverVersion),
 		)...,
 	)
 	return js.Subscribe(wildcardSubject, cb, opts...)
