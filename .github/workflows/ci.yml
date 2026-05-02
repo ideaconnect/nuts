@@ -269,4 +269,4 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: idcttech/nuts
-          readme-filepath: ./README.md
+          readme-filepath: ./DOCKERHUB_README.md

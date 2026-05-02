@@ -191,7 +191,7 @@ Pushes to `main`/`master` and `v*` tags additionally:
    `idcttech/nuts` image with provenance and SBOM attestations.
 2. On tag: scan the pushed image by digest with Trivy and sign all tags
    keyless via Cosign + GitHub OIDC.
-3. Update the Docker Hub description from [README.md](README.md).
+3. Update the Docker Hub description from [DOCKERHUB_README.md](DOCKERHUB_README.md).
 4. GoReleaser publishes archives and SBOMs for the tag.
 
 Release surfaces and verification commands are documented in

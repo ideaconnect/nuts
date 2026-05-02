@@ -54,6 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diagrams, a complete configuration matrix, troubleshooting guide, production
   deployment examples, a CI-aligned contribution checklist, and operator release
   note guidance.
+- Docker Hub description now uses `DOCKERHUB_README.md`, a shorter Docker-focused
+  README tailored for Docker Hub's description limits.
 - `CONTRIBUTING.md`, `docs/SECURITY.md`, and this `CHANGELOG.md`.
 - Docker image now runs as non-root user `nuts` (uid 10001).
 
