@@ -29,8 +29,8 @@ readinessProbe:
 
 ## Metrics And Dashboards
 
-- Example alert rules: [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml)
-- Example Grafana dashboard: [ops/grafana-dashboard.json](ops/grafana-dashboard.json)
+- Example alert rules: [ops/prometheus-alerts.yml](../ops/prometheus-alerts.yml)
+- Example Grafana dashboard: [ops/grafana-dashboard.json](../ops/grafana-dashboard.json)
 
 The dashboard expects Caddy's Prometheus metrics scrape to include the `nuts_*`
 series. The NATS connectivity panel is designed for a blackbox-exporter scrape

@@ -18,24 +18,74 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 - **Heartbeat**: Keep-alive mechanism to prevent connection timeouts
 - **[No Silent Drops For Slow Clients](#slow-clients-and-replay)**: When a client falls behind, NUTS disconnects that SSE session before dropping queued messages so the client can resume from the last delivered event ID. Oversized events can still be rejected by `max_event_size`.
 - **[NATS Authentication](#with-nats-authentication)**: Credentials file, token, or user/password auth for the NUTS-to-NATS connection
+- **NATS TLS / mTLS**: Optional `nats_tls_ca`, `nats_tls_cert`, `nats_tls_key` directives for an encrypted and mutually authenticated NATS connection
+- **[Subscriber JWT Authorization](#subscriber-authentication-and-topic-authorization)**: Optional HMAC-signed JWT auth with per-topic `subscribe` claims, accepted from `Authorization: Bearer` or a configurable cookie
+- **[Connection Caps](#max_connections)**: `max_connections` bounds concurrent SSE streams; rejected clients receive `503` with `Retry-After`
+- **[Per-frame Write Bounds](#dispatch_timeout-and-write_timeout)**: Optional `dispatch_timeout` and `write_timeout` keep slow downstream connections from tying up a handler indefinitely
 - **Topic Prefixing**: Optional prefix for all NATS subscriptions
 - **[Prometheus Metrics](#prometheus-metrics)**: Built-in `nuts_*` counters and gauges (active connections, messages delivered, slow-client disconnects, replay stats)
 - **[Liveness And Readiness Checks](#liveness-and-readiness-checks)**: `/livez`, `/readyz`, and legacy `/healthz` probe endpoints
 - **[Hub Discovery](#hub-discovery)**: Optional `Link` header with `rel="nuts"` for automatic hub detection
 
-## Documentation Map
+## Table of Contents
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) explains the Caddy, NUTS, NATS JetStream,
-  subscriber, producer, and replay flow.
-- [CONFIGURATION.md](CONFIGURATION.md) is the directive matrix with defaults,
-  JSON field names, valid values, and operational notes.
-- [DEPLOYMENT.md](DEPLOYMENT.md) has copy-paste Compose, Kubernetes, and
-  reverse-proxy-protected deployment examples.
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) covers common EventSource, CORS,
-  replay, Docker, and functional-test issues.
-- [OPERATIONS.md](OPERATIONS.md), [PERFORMANCE.md](PERFORMANCE.md), and
-  [RELEASE.md](RELEASE.md) cover production operations, performance budgets,
-  and release/supply-chain policy.
+- [Features](#features)
+- [Installation](#installation)
+  - [Using xcaddy (Recommended)](#using-xcaddy-recommended)
+  - [Building from Source](#building-from-source)
+  - [Using the Docker Image](#using-the-docker-image)
+  - [Docker Compose](#docker-compose)
+  - [Environment variables](#environment-variables)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+  - [Caddyfile Syntax](#caddyfile-syntax)
+  - [Path-shorthand and `route`](#path-shorthand-and-route)
+  - [`max_event_size`](#max_event_size)
+  - [`max_connections`](#max_connections)
+  - [`dispatch_timeout` and `write_timeout`](#dispatch_timeout-and-write_timeout)
+  - [`replay_max_messages` and `replay_window`](#replay_max_messages-and-replay_window)
+  - [CORS and `allowed_origins`](#cors-and-allowed_origins)
+  - [Subscriber authentication and topic authorization](#subscriber-authentication-and-topic-authorization)
+  - [Liveness And Readiness Checks](#liveness-and-readiness-checks)
+  - [Prometheus Metrics](#prometheus-metrics)
+  - [Hub Discovery](#hub-discovery)
+- [JetStream Setup](#jetstream-setup)
+- [Client Usage](#client-usage)
+  - [JavaScript EventSource](#javascript-eventsource)
+  - [Slow Clients And Replay](#slow-clients-and-replay)
+  - [Message Replay with `last-id` or `Last-Event-ID`](#message-replay-with-last-id-or-last-event-id)
+  - [Message Format](#message-format)
+- [Example Scenarios](#example-scenarios)
+- [Inspired by Mercure](#inspired-by-mercure)
+- [Development](#development)
+- [Roadmap](#roadmap)
+- [License](#license)
+- [Contributing](#contributing)
+
+## Further Documentation
+
+In-depth reference and operations material lives in the [`docs/`](docs/)
+directory:
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system, replay flow, and
+  ownership boundaries.
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — full directive matrix with
+  defaults, JSON field names, valid values, and operational notes.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — copy-paste Compose, Kubernetes,
+  and reverse-proxy-protected deployment examples.
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — common EventSource,
+  CORS, replay, Docker, and functional-test issues.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — probes, metrics, structured log
+  fields, and incident runbooks.
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — load-test coverage and
+  production performance budgets.
+- [docs/RELEASE.md](docs/RELEASE.md) — release validation, SBOMs, vulnerability
+  scans, and signing policy.
+- [docs/ROADMAP.md](docs/ROADMAP.md) — completed milestones and planned
+  features.
+- [docs/STRUCTURE.md](docs/STRUCTURE.md) — Go source file map.
+- [docs/MERCURE.md](docs/MERCURE.md) — short note on Mercure, which inspired
+  NUTS.
 
 ## Installation
 
@@ -238,7 +288,8 @@ itself does not read environment variables directly.
 ## Configuration
 
 For the complete directive matrix, including JSON field names, defaults,
-validation rules, and production notes, see [CONFIGURATION.md](CONFIGURATION.md).
+validation rules, and production notes, see
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ### Caddyfile Syntax
 
@@ -325,9 +376,9 @@ worst-case ceiling before slow-client disconnects kick in. Lower
 `max_event_size -1` (unlimited) removes the per-event bound entirely and
 makes the ceiling unbounded.
 
-See [PERFORMANCE.md](PERFORMANCE.md) for latency, memory, and per-instance
-client-count budgets plus the load and benchmark commands used to validate
-them.
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for latency, memory, and
+per-instance client-count budgets plus the load and benchmark commands used to
+validate them.
 
 #### `dispatch_timeout` and `write_timeout`
 
@@ -578,7 +629,7 @@ availability:
 ```
 
 Operational runbooks and Kubernetes probe examples are in
-[OPERATIONS.md](OPERATIONS.md).
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ### Prometheus Metrics
 
@@ -623,7 +674,7 @@ Example alert rules and a Grafana dashboard are available in
 Streaming logs include structured fields such as `topics`, `subjects`,
 `subject_label`, `replay_mode`, `replay_start_sequence`,
 `replay_fallback_reason`, and `disconnect_reason`; see
-[OPERATIONS.md](OPERATIONS.md) for incident-response guidance.
+[docs/OPERATIONS.md](docs/OPERATIONS.md) for incident-response guidance.
 
 ### Hub Discovery
 
@@ -863,18 +914,11 @@ browser subscriber credentials.
 }
 ```
 
-## Relationship to Mercure
+## Inspired by Mercure
 
-NUTS is inspired by [Mercure.rocks](https://mercure.rocks) — we share the idea of a
-Caddy-native SSE hub with `Last-Event-ID` replay and `Link`-header hub discovery,
-and we're grateful for the groundwork Mercure laid in that space.
-
-NUTS is a separate project with different goals: it's a read-only bridge that
-delegates persistence, clustering, and authentication to NATS JetStream rather
-than implementing its own transport. If your stack already uses NATS, NUTS
-plugs into it; if not, Mercure is a well-established alternative worth
-evaluating on its own terms. See [MERCURE.md](MERCURE.md) for a short note on
-the inspiration.
+NUTS was inspired by [Mercure.rocks](https://mercure.rocks); we're grateful for
+the groundwork they laid in this space and we respect their work. See
+[docs/MERCURE.md](docs/MERCURE.md) for a short note on the inspiration.
 
 ## Development
 
@@ -919,7 +963,7 @@ make test-performance
 ```
 
 The current budgets and raw benchmark commands are documented in
-[PERFORMANCE.md](PERFORMANCE.md).
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 #### Functional/BDD Tests
 
@@ -1005,9 +1049,9 @@ make help            # Show all available commands
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for completed milestones and planned features,
-including subscriber JWT authorization, subscription lifecycle events, an HTTP
-publish endpoint, and more.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for completed milestones and planned
+features, including subscription lifecycle events, an HTTP publish endpoint,
+and more.
 
 ## License
 
