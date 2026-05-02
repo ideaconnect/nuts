@@ -319,6 +319,7 @@ nuts {
     max_reconnects <count>       # Max reconnects, 0=none, -1=infinite (default: -1)
     max_event_size <bytes>       # Max SSE event size (0=default 1 MiB, <0=unlimited)
     max_connections <count>      # Global concurrent-stream cap (default: 0 = unlimited)
+    max_topics_per_subscription <count>  # Per-request topic cap (0=default 32, <0=unlimited)
     client_buffer_size <count>   # Per-connection send buffer (0=default 64)
     dispatch_timeout <seconds>   # Cap slow-client signal wait in NATS callbacks (default: 0 = disabled)
     write_timeout <seconds>      # Cap each SSE write/flush when supported (default: 0 = disabled)
@@ -666,6 +667,7 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
 | `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` labels the cause (e.g. `max_connections`). |
 | `nuts_replay_cap_reached_total` | Counter | Replaying SSE connections closed after `replay_max_messages` was reached |
+| `nuts_dispatch_timeout_total` | Counter | NATS callbacks that timed out signalling a slow SSE client (set when `dispatch_timeout` fires before the SSE loop observes the signal) |
 
 Example alert rules and a Grafana dashboard are available in
 [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml) and

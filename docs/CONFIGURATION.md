@@ -60,6 +60,7 @@ NUTS as `/readyz`.
 | `max_reconnects <count>` | `max_reconnects` | `-1` when omitted | Integer; `0` means no reconnects, `-1` means unlimited | JSON uses a pointer internally so explicit `0` is preserved. |
 | `max_event_size <bytes>` | `max_event_size` | `1048576` when `0` or omitted | Positive cap, `0` for default, negative for unlimited | Caps the formatted SSE frame. Oversized events are dropped and counted. |
 | `max_connections <count>` | `max_connections` | `0` | Integer `>= 0` | `0` disables the cap. Rejected clients receive `503` and `Retry-After: 5`. |
+| `max_topics_per_subscription <count>` | `max_topics_per_subscription` | `32` when `0` or omitted | Positive cap, `0` for default, negative for unlimited | Caps the distinct `?topic=` filters allowed per SSE request after deduplication. Requests over the cap receive `400`. |
 | `client_buffer_size <count>` | `client_buffer_size` | `64` when `0` or omitted | Integer `>= 0` | Per-connection queue length. A full queue disconnects the slow client. |
 | `dispatch_timeout <seconds>` | `dispatch_timeout` | `0` | Integer `>= 0` | `0` disables the cap. Positive values bound how long a NATS callback waits to signal a slow client after its queue is already full. |
 | `write_timeout <seconds>` | `write_timeout` | `0` | Integer `>= 0` | `0` leaves write deadlines to Caddy/server config. Positive values set per-frame SSE write deadlines when the response writer supports them. |

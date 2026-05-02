@@ -1666,3 +1666,187 @@ func TestHandler_Cleanup_WakesInFlightHandlers(t *testing.T) {
 // ── Sanity: make sure io.Discard reference is retained for vet/imports ──
 
 var _ = io.Discard
+
+// counterPlainValue reads the current value of a plain (non-labelled) counter.
+func counterPlainValue(c prometheus.Counter) float64 {
+	pb := &iopm.Metric{}
+	if err := c.Write(pb); err != nil {
+		return 0
+	}
+	return pb.GetCounter().GetValue()
+}
+
+// ── M1: MaxTopicsPerSubscription cap ──────────────────────────────────────
+
+func TestHandler_MaxTopicsPerSubscription_RejectsExcess(t *testing.T) {
+	h := &Handler{MaxTopicsPerSubscription: 4, logger: zap.NewNop()}
+
+	url := "/events?topic=a&topic=b&topic=c&topic=d&topic=e"
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+	if !strings.Contains(rr.Body.String(), "Too many topics") {
+		t.Fatalf("body = %q, want too-many-topics error", rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "event: connected") {
+		t.Fatalf("excess-topic request reached streaming path: %q", rr.Body.String())
+	}
+}
+
+func TestHandler_MaxTopicsPerSubscription_DefaultIs32(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	h := &Handler{
+		NatsURL:    ns.ClientURL(),
+		StreamName: "EVENTS",
+	}
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer h.Cleanup()
+
+	if h.MaxTopicsPerSubscription != 32 {
+		t.Fatalf("MaxTopicsPerSubscription = %d, want 32", h.MaxTopicsPerSubscription)
+	}
+}
+
+func TestHandler_MaxTopicsPerSubscription_NegativeDisablesCap(t *testing.T) {
+	h := &Handler{MaxTopicsPerSubscription: -1, logger: zap.NewNop()}
+
+	parts := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		parts = append(parts, "topic=t"+strconv.Itoa(i))
+	}
+	req := httptest.NewRequest(http.MethodGet, "/events?"+strings.Join(parts, "&"), nil)
+	plan, requestErr := h.parseStreamRequest(req)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest returned %#v with cap disabled", requestErr)
+	}
+	if len(plan.Topics) != 100 {
+		t.Fatalf("plan.Topics len = %d, want 100", len(plan.Topics))
+	}
+}
+
+func TestHandler_MaxTopicsPerSubscription_DedupBeforeCap(t *testing.T) {
+	// Cap of 2 with three duplicate topics that collapse to one — must pass.
+	h := &Handler{MaxTopicsPerSubscription: 2, logger: zap.NewNop()}
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=a&topic=a&topic=a", nil)
+	plan, requestErr := h.parseStreamRequest(req)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest: %#v (dedup should bring topics under cap)", requestErr)
+	}
+	if len(plan.Topics) != 1 {
+		t.Fatalf("plan.Topics len = %d, want 1 (deduped)", len(plan.Topics))
+	}
+}
+
+// ── L3: Oversized last-id ─────────────────────────────────────────────────
+
+func TestHandler_LastEventID_RejectsOversizedQuery(t *testing.T) {
+	h := &Handler{logger: zap.NewNop()}
+	overlong := strings.Repeat("1", 30)
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=x&last-id="+overlong, nil)
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+	if !strings.Contains(rr.Body.String(), "too long") {
+		t.Fatalf("body = %q, want too-long error", rr.Body.String())
+	}
+}
+
+func TestHandler_LastEventID_OversizedHeaderFallsBackToDeliverNew(t *testing.T) {
+	core, obs := observer.New(zap.WarnLevel)
+	h := &Handler{logger: zap.New(core)}
+	overlong := strings.Repeat("9", 30)
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=x", nil)
+	req.Header.Set("Last-Event-ID", overlong)
+	plan, requestErr := h.parseStreamRequest(req)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest returned %#v; want fall-back to DeliverNew", requestErr)
+	}
+	if plan.Replay.HasLastID {
+		t.Fatal("plan.Replay.HasLastID = true; want false (header should be ignored)")
+	}
+	if !hasLogContaining(obs, "oversized Last-Event-ID") {
+		t.Errorf("expected oversized-header warning, entries=%+v", obs.All())
+	}
+}
+
+// ── M2: dispatch_timeout metric ───────────────────────────────────────────
+
+func TestMessageQueue_DispatchTimeout_IncrementsMetric(t *testing.T) {
+	before := counterPlainValue(metricsDispatchTimeouts)
+
+	h := &Handler{ClientBufferSize: 1, DispatchTimeout: 1, logger: zap.NewNop()}
+	msgChan, slowClient, done, enqueueMessage := h.newMessageQueue()
+	defer close(done)
+
+	msgChan <- &nats.Msg{Subject: "events.pending"}
+	slowClient <- "events.already-slow"
+
+	returned := make(chan struct{})
+	go func() {
+		enqueueMessage(&nats.Msg{Subject: "events.blocked"})
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2500 * time.Millisecond):
+		t.Fatal("enqueueMessage did not return after dispatch_timeout")
+	}
+
+	after := counterPlainValue(metricsDispatchTimeouts)
+	if delta := after - before; delta < 1 {
+		t.Fatalf("metricsDispatchTimeouts delta = %v, want >= 1", delta)
+	}
+}
+
+// ── L1: Short subscriber_jwt_key warning ──────────────────────────────────
+
+func TestHandler_Validate_WarnsShortJWTKey(t *testing.T) {
+	core, obs := observer.New(zap.WarnLevel)
+	h := &Handler{
+		NatsURL:          "tls://nats.example.com:4222",
+		StreamName:       "EVENTS",
+		SubscriberJWTKey: strings.Repeat("a", 16),
+		logger:           zap.New(core),
+	}
+	if err := h.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !hasLogContaining(obs, "subscriber_jwt_key is shorter than recommended") {
+		t.Errorf("expected short-key warning, entries=%+v", obs.All())
+	}
+}
+
+func TestHandler_Validate_NoWarningForLongJWTKey(t *testing.T) {
+	core, obs := observer.New(zap.WarnLevel)
+	h := &Handler{
+		NatsURL:          "tls://nats.example.com:4222",
+		StreamName:       "EVENTS",
+		SubscriberJWTKey: strings.Repeat("a", 64),
+		logger:           zap.New(core),
+	}
+	if err := h.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if hasLogContaining(obs, "subscriber_jwt_key is shorter") {
+		t.Errorf("did not expect short-key warning, entries=%+v", obs.All())
+	}
+}

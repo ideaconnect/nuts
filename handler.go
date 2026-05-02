@@ -118,6 +118,12 @@ type Handler struct {
 	// would exceed the cap receive HTTP 503 with a Retry-After header.
 	MaxConnections int `json:"max_connections,omitempty"`
 
+	// MaxTopicsPerSubscription caps how many distinct topics a single SSE
+	// request may subscribe to. 0 (or unset) uses the default. A negative
+	// value disables the limit. Requests exceeding the cap receive HTTP 400.
+	// Default: 32.
+	MaxTopicsPerSubscription int `json:"max_topics_per_subscription,omitempty"`
+
 	// ClientBufferSize is the size of the per-connection NATS message buffer.
 	// 0 (or unset) uses the default.
 	// When the buffer fills, the slow client is disconnected to avoid drops.

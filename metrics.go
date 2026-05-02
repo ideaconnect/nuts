@@ -81,4 +81,15 @@ var (
 		Name:      "replay_cap_reached_total",
 		Help:      "Total number of replaying SSE connections closed after replay_max_messages was reached.",
 	})
+
+	// nuts_dispatch_timeout_total counts how often the NATS callback gave up
+	// waiting to signal a slow SSE client because dispatch_timeout fired.
+	// Distinct from nuts_slow_client_disconnects_total: that counter ticks
+	// when the SSE loop observed the slow-client signal and disconnected;
+	// this one ticks when the signal itself could not be delivered.
+	metricsDispatchTimeouts = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "dispatch_timeout_total",
+		Help:      "Total number of NATS callbacks that timed out signalling a slow SSE client.",
+	})
 )

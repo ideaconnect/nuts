@@ -31,6 +31,18 @@ const defaultLivePath = "/livez"
 // defaultReadyPath is used when no ready_path directive is configured.
 const defaultReadyPath = "/readyz"
 
+// defaultMaxTopicsPerSubscription bounds how many distinct ?topic= filters
+// a single SSE request may carry when MaxTopicsPerSubscription is 0. A
+// strict default protects NATS from consumer-creation amplification by an
+// attacker passing thousands of `?topic=` parameters.
+const defaultMaxTopicsPerSubscription = 32
+
+// minRecommendedJWTKeyLen is the floor below which Validate() warns that
+// the configured subscriber_jwt_key is shorter than the SHA-256 output
+// size assumed by HS256. Keys shorter than this still verify correctly
+// but provide less than the algorithm's nominal security margin.
+const minRecommendedJWTKeyLen = 32
+
 // Provision sets up the handler.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
@@ -85,6 +97,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	if h.ReadyPath == "" {
 		h.ReadyPath = defaultReadyPath
+	}
+	// MaxTopicsPerSubscription semantics mirror MaxEventSize:
+	//   0  → use defaultMaxTopicsPerSubscription (apply the cap)
+	//   <0 → unlimited (sentinel preserved as-is)
+	//   >0 → user-defined limit
+	if h.MaxTopicsPerSubscription == 0 {
+		h.MaxTopicsPerSubscription = defaultMaxTopicsPerSubscription
 	}
 
 	// Create the shutdown signal before opening any sockets so that if
@@ -351,6 +370,12 @@ func (h *Handler) Validate() error {
 
 	if h.logger != nil && h.NatsTLSInsecureSkipVerify {
 		h.logger.Warn("nats_tls_insecure_skip_verify is enabled — server certificate is not verified")
+	}
+
+	if h.logger != nil && h.SubscriberJWTKey != "" && len(h.SubscriberJWTKey) < minRecommendedJWTKeyLen {
+		h.logger.Warn("subscriber_jwt_key is shorter than recommended; HS256 assumes a key of at least 32 bytes",
+			zap.Int("key_length", len(h.SubscriberJWTKey)),
+			zap.Int("recommended_minimum", minRecommendedJWTKeyLen))
 	}
 
 	return nil

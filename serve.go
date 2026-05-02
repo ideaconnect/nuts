@@ -430,6 +430,13 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 		plan.FullSubjects = append(plan.FullSubjects, fullSubject)
 	}
 
+	// Cap the topic count after dedup so a client cannot pin large NATS-side
+	// state by sending thousands of distinct ?topic= parameters. A negative
+	// MaxTopicsPerSubscription disables the cap (operator opt-out).
+	if h.MaxTopicsPerSubscription > 0 && len(plan.Topics) > h.MaxTopicsPerSubscription {
+		return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Too many topics requested"}
+	}
+
 	// Query parameter takes precedence over the header so a client can
 	// override what the browser auto-attaches on EventSource reconnect.
 	lastIDStr := r.URL.Query().Get("last-id")
@@ -438,6 +445,18 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 		lastIDStr = r.Header.Get("Last-Event-ID")
 	}
 	if lastIDStr != "" {
+		// Cap the input length before strconv.ParseUint so a multi-MB numeric
+		// string can't cause large allocations. uint64 max is 20 digits.
+		if len(lastIDStr) > 20 {
+			if queryProvided {
+				return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Invalid last-id value: too long"}
+			}
+			if h.logger != nil {
+				h.logger.Warn("ignoring oversized Last-Event-ID header; resuming with DeliverNew",
+					zap.Int("length", len(lastIDStr)))
+			}
+			return plan, nil
+		}
 		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
 		if err != nil || parsedID == maxReplayCursor {
 			// Explicit ?last-id= is a client error (bad request); a header
@@ -537,6 +556,7 @@ func (h *Handler) signalSlowClient(slowClient chan<- string, subject string, don
 	case slowClient <- subject:
 	case <-done:
 	case <-timer.C:
+		metricsDispatchTimeouts.Inc()
 		if h.logger != nil {
 			h.logger.Warn("timed out signaling slow SSE client",
 				zap.String("subject", subject),

@@ -173,6 +173,13 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.MaxConnections = v
 
+			case "max_topics_per_subscription":
+				v, err := parseInt("max_topics_per_subscription")
+				if err != nil {
+					return err
+				}
+				h.MaxTopicsPerSubscription = v
+
 			case "client_buffer_size":
 				v, err := parseInt("client_buffer_size")
 				if err != nil {
