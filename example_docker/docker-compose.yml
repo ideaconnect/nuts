@@ -33,7 +33,7 @@ services:
     restart: "no"
 
   nuts:
-    image: idcttech/nuts
+    image: idcttech/nuts:latest
     container_name: nuts-docker-server
     ports:
       - "8080:8080"
@@ -45,7 +45,7 @@ services:
         condition: service_completed_successfully
     restart: on-failure
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/events/healthz"]
       interval: 2s
       timeout: 5s
       retries: 10

@@ -52,11 +52,11 @@ var (
 	})
 
 	// nuts_replay_fallbacks_total counts how many times the requested
-	// sequence was purged and NUTS fell back to DeliverAll().
+	// sequence was purged and NUTS used the configured fallback strategy.
 	metricsReplayFallbacks = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "replay_fallbacks_total",
-		Help:      "Total number of replay requests that fell back to DeliverAll due to purged sequences.",
+		Help:      "Total number of replay requests that used fallback replay due to purged sequences.",
 	})
 
 	// nuts_subscription_errors_total counts failed JetStream subscribe attempts.
@@ -64,5 +64,32 @@ var (
 		Namespace: "nuts",
 		Name:      "subscription_errors_total",
 		Help:      "Total number of failed JetStream subscription attempts.",
+	})
+
+	// nuts_connections_rejected_total counts SSE connections rejected before
+	// streaming started, labelled by reason (e.g. "max_connections").
+	metricsConnectionsRejected = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "connections_rejected_total",
+		Help:      "Total number of SSE connections rejected before streaming started.",
+	}, []string{"reason"})
+
+	// nuts_replay_cap_reached_total counts replaying SSE connections closed
+	// after delivering replay_max_messages historical events.
+	metricsReplayCapReached = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "replay_cap_reached_total",
+		Help:      "Total number of replaying SSE connections closed after replay_max_messages was reached.",
+	})
+
+	// nuts_dispatch_timeout_total counts how often the NATS callback gave up
+	// waiting to signal a slow SSE client because dispatch_timeout fired.
+	// Distinct from nuts_slow_client_disconnects_total: that counter ticks
+	// when the SSE loop observed the slow-client signal and disconnected;
+	// this one ticks when the signal itself could not be delivered.
+	metricsDispatchTimeouts = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "dispatch_timeout_total",
+		Help:      "Total number of NATS callbacks that timed out signalling a slow SSE client.",
 	})
 )

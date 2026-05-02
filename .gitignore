@@ -7,6 +7,7 @@
 *.dll
 *.so
 *.dylib
+/caddy
 
 # Test binary, built with `go test -c`
 *.test
@@ -16,6 +17,9 @@
 coverage.*
 *.coverprofile
 profile.cov
+
+# Release artifacts
+dist/
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -30,6 +34,7 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+.claude/
 
 # Example PHP dependencies
 example/vendor/

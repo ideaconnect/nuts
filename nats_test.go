@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -196,19 +197,31 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				reconnect_wait 5
 				max_reconnects 10
 				max_event_size 524288
+				dispatch_timeout 2
+				write_timeout 3
+				live_path /live
+				ready_path /ready
 				hub_url https://example.com/events
+				subscriber_jwt_key secret-key
+				subscriber_jwt_cookie nuts_session
 				allowed_origins https://example.com https://other.com
 			}`,
 			expected: &Handler{
-				NatsURL:           "nats://localhost:4222",
-				StreamName:        "EVENTS",
-				TopicPrefix:       "events.",
-				HeartbeatInterval: 15,
-				ReconnectWait:     5,
-				MaxReconnects:     10,
-				MaxEventSize:      524288,
-				HubURL:            "https://example.com/events",
-				AllowedOrigins:    []string{"https://example.com", "https://other.com"},
+				NatsURL:             "nats://localhost:4222",
+				StreamName:          "EVENTS",
+				TopicPrefix:         "events.",
+				HeartbeatInterval:   15,
+				ReconnectWait:       5,
+				MaxReconnects:       intPtr(10),
+				MaxEventSize:        524288,
+				DispatchTimeout:     2,
+				WriteTimeout:        3,
+				LivePath:            "/live",
+				ReadyPath:           "/ready",
+				HubURL:              "https://example.com/events",
+				SubscriberJWTKey:    "secret-key",
+				SubscriberJWTCookie: "nuts_session",
+				AllowedOrigins:      []string{"https://example.com", "https://other.com"},
 			},
 			expectError: false,
 		},
@@ -372,8 +385,13 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 			if h.ReconnectWait != tt.expected.ReconnectWait {
 				t.Errorf("ReconnectWait: expected %d, got %d", tt.expected.ReconnectWait, h.ReconnectWait)
 			}
-			if h.MaxReconnects != tt.expected.MaxReconnects {
-				t.Errorf("MaxReconnects: expected %d, got %d", tt.expected.MaxReconnects, h.MaxReconnects)
+			switch {
+			case tt.expected.MaxReconnects == nil && h.MaxReconnects != nil:
+				t.Errorf("MaxReconnects: expected nil, got %d", *h.MaxReconnects)
+			case tt.expected.MaxReconnects != nil && h.MaxReconnects == nil:
+				t.Errorf("MaxReconnects: expected %d, got nil", *tt.expected.MaxReconnects)
+			case tt.expected.MaxReconnects != nil && h.MaxReconnects != nil && *tt.expected.MaxReconnects != *h.MaxReconnects:
+				t.Errorf("MaxReconnects: expected %d, got %d", *tt.expected.MaxReconnects, *h.MaxReconnects)
 			}
 			if h.NatsToken != tt.expected.NatsToken {
 				t.Errorf("NatsToken: expected %q, got %q", tt.expected.NatsToken, h.NatsToken)
@@ -390,8 +408,26 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 			if h.MaxEventSize != tt.expected.MaxEventSize {
 				t.Errorf("MaxEventSize: expected %d, got %d", tt.expected.MaxEventSize, h.MaxEventSize)
 			}
+			if h.DispatchTimeout != tt.expected.DispatchTimeout {
+				t.Errorf("DispatchTimeout: expected %d, got %d", tt.expected.DispatchTimeout, h.DispatchTimeout)
+			}
+			if h.WriteTimeout != tt.expected.WriteTimeout {
+				t.Errorf("WriteTimeout: expected %d, got %d", tt.expected.WriteTimeout, h.WriteTimeout)
+			}
 			if h.HubURL != tt.expected.HubURL {
 				t.Errorf("HubURL: expected %q, got %q", tt.expected.HubURL, h.HubURL)
+			}
+			if h.SubscriberJWTKey != tt.expected.SubscriberJWTKey {
+				t.Errorf("SubscriberJWTKey: expected %q, got %q", tt.expected.SubscriberJWTKey, h.SubscriberJWTKey)
+			}
+			if h.SubscriberJWTCookie != tt.expected.SubscriberJWTCookie {
+				t.Errorf("SubscriberJWTCookie: expected %q, got %q", tt.expected.SubscriberJWTCookie, h.SubscriberJWTCookie)
+			}
+			if h.LivePath != tt.expected.LivePath {
+				t.Errorf("LivePath: expected %q, got %q", tt.expected.LivePath, h.LivePath)
+			}
+			if h.ReadyPath != tt.expected.ReadyPath {
+				t.Errorf("ReadyPath: expected %q, got %q", tt.expected.ReadyPath, h.ReadyPath)
 			}
 			if len(tt.expected.AllowedOrigins) > 0 {
 				if len(h.AllowedOrigins) != len(tt.expected.AllowedOrigins) {
@@ -487,11 +523,21 @@ func TestHandler_UnmarshalCaddyfile_MissingArgs(t *testing.T) {
 		{name: "missing nats_token arg", directive: "nats_token"},
 		{name: "missing nats_user arg", directive: "nats_user"},
 		{name: "missing nats_password arg", directive: "nats_password"},
+		{name: "missing subscriber_jwt_key arg", directive: "subscriber_jwt_key"},
+		{name: "missing subscriber_jwt_cookie arg", directive: "subscriber_jwt_cookie"},
 		{name: "missing topic_prefix arg", directive: "topic_prefix"},
 		{name: "missing heartbeat_interval arg", directive: "heartbeat_interval"},
 		{name: "missing reconnect_wait arg", directive: "reconnect_wait"},
 		{name: "missing max_reconnects arg", directive: "max_reconnects"},
 		{name: "missing max_event_size arg", directive: "max_event_size"},
+		{name: "missing dispatch_timeout arg", directive: "dispatch_timeout"},
+		{name: "missing write_timeout arg", directive: "write_timeout"},
+		{name: "missing replay_max_messages arg", directive: "replay_max_messages"},
+		{name: "missing replay_window arg", directive: "replay_window"},
+		{name: "missing health_path arg", directive: "health_path"},
+		{name: "missing live_path arg", directive: "live_path"},
+		{name: "missing ready_path arg", directive: "ready_path"},
+		{name: "missing hub_url arg", directive: "hub_url"},
 	}
 
 	for _, tt := range tests {
@@ -540,8 +586,8 @@ func TestHandler_Provision(t *testing.T) {
 		if h.ReconnectWait != 2 {
 			t.Errorf("expected default reconnect wait 2, got %d", h.ReconnectWait)
 		}
-		if h.MaxReconnects != -1 {
-			t.Errorf("expected default max reconnects -1, got %d", h.MaxReconnects)
+		if h.MaxReconnects == nil || *h.MaxReconnects != -1 {
+			t.Errorf("expected default max reconnects -1, got %v", h.MaxReconnects)
 		}
 		if h.MaxEventSize != 1048576 {
 			t.Errorf("expected default max event size 1048576, got %d", h.MaxEventSize)
@@ -640,7 +686,7 @@ func TestHandler_connectNATS_ReconnectLifecycle(t *testing.T) {
 	h := &Handler{
 		NatsURL:        "nats://127.0.0.1:" + strconv.Itoa(port),
 		ReconnectWait:  1,
-		MaxReconnects:  10,
+		MaxReconnects:  intPtr(10),
 		AllowedOrigins: []string{"*"},
 		logger:         zap.New(observedCore),
 	}
@@ -738,7 +784,7 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
 		logger:            zap.NewNop(),
 	}
@@ -872,6 +918,24 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 		}
 	})
 
+	t.Run("overflowing last-id parameter", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=test&last-id="+strconv.FormatUint(^uint64(0), 10), nil)
+		ctx, cancel := context.WithTimeout(req.Context(), 500*time.Millisecond)
+		defer cancel()
+		req = req.WithContext(ctx)
+		rr := httptest.NewRecorder()
+
+		h.ServeHTTP(rr, req, nil)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("expected status %d for overflowing last-id, got %d", http.StatusBadRequest, rr.Code)
+		}
+
+		if !strings.Contains(rr.Body.String(), "Invalid last-id") {
+			t.Errorf("response should mention invalid last-id, got: %s", rr.Body.String())
+		}
+	})
+
 	t.Run("Last-Event-ID header replays messages", func(t *testing.T) {
 		jsCtx, _ := nc.JetStream()
 		var firstSequence uint64
@@ -916,20 +980,34 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid Last-Event-ID header", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil)
+	t.Run("invalid Last-Event-ID header falls back to DeliverNew", func(t *testing.T) {
+		// A bad Last-Event-ID header must NOT 400 — the browser would loop
+		// forever reconnecting with the same bad value. The handler should
+		// log a warning and resume as a fresh subscriber.
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil).WithContext(ctx)
 		req.Header.Set("Last-Event-ID", "invalid")
 		rr := httptest.NewRecorder()
 
-		if err := h.ServeHTTP(rr, req, nil); err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		done := make(chan error, 1)
+		go func() {
+			done <- h.ServeHTTP(rr, req, nil)
+		}()
+
+		// Give ServeHTTP time to write the connected event, then close.
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("ServeHTTP did not return after context cancel")
 		}
 
-		if rr.Code != http.StatusBadRequest {
-			t.Errorf("expected status %d, got %d", http.StatusBadRequest, rr.Code)
+		if rr.Code == http.StatusBadRequest {
+			t.Errorf("expected streaming fallback, got 400: %s", rr.Body.String())
 		}
-		if !strings.Contains(rr.Body.String(), "Invalid Last-Event-ID") {
-			t.Errorf("response should mention invalid Last-Event-ID, got: %s", rr.Body.String())
+		if !strings.Contains(rr.Body.String(), "event: connected") {
+			t.Errorf("response should contain connected event, got: %s", rr.Body.String())
 		}
 	})
 
@@ -954,7 +1032,7 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 			NatsURL:        ns.ClientURL(),
 			StreamName:     "TEST_EVENTS",
 			ReconnectWait:  2,
-			MaxReconnects:  -1,
+			MaxReconnects:  intPtr(-1),
 			AllowedOrigins: []string{"*"},
 			logger:         zap.NewNop(),
 		}
@@ -981,7 +1059,7 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 			TopicPrefix:       "missing.",
 			HeartbeatInterval: 30,
 			ReconnectWait:     2,
-			MaxReconnects:     -1,
+			MaxReconnects:     intPtr(-1),
 			AllowedOrigins:    []string{"*"},
 			logger:            zap.NewNop(),
 			js:                h.js,
@@ -1009,7 +1087,7 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 			TopicPrefix:       "",
 			HeartbeatInterval: 30,
 			ReconnectWait:     2,
-			MaxReconnects:     -1,
+			MaxReconnects:     intPtr(-1),
 			AllowedOrigins:    []string{"*"},
 			logger:            zap.NewNop(),
 			js:                h.js,
@@ -1116,6 +1194,235 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 	})
 }
 
+func TestHandler_ServeHTTP_PreservesJSONNumberLexemes(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	jsPub, _ := nc.JetStream()
+	largeJSON := `{"id":900719925474099312345,"nested":{"n":12345678901234567890}}`
+	if _, err := jsPub.Publish("events.json", []byte(largeJSON)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=json&last-id=0", nil).WithContext(ctx)
+	rr := newSafeRecorder()
+	done := make(chan error, 1)
+	go func() { done <- h.ServeHTTP(rr, req, nil) }()
+
+	if !waitForSSEBody(rr, `900719925474099312345`, 1500*time.Millisecond) {
+		cancel()
+		<-done
+		t.Fatalf("large JSON number was not delivered; body=%s", rr.Body())
+	}
+	cancel()
+	<-done
+
+	body := rr.Body()
+	if !strings.Contains(body, `900719925474099312345`) || !strings.Contains(body, `12345678901234567890`) {
+		t.Fatalf("JSON number lexemes were not preserved; body=%s", body)
+	}
+	if strings.Contains(body, `9.007199254740993e+20`) || strings.Contains(body, `12345678901234567000`) {
+		t.Fatalf("JSON numbers appear to have been coerced through float64; body=%s", body)
+	}
+}
+
+func TestHandler_ServeHTTP_MultiTopicReplayEmitsIncreasingIDs(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	jsPub, _ := nc.JetStream()
+	for i := 0; i < 40; i++ {
+		subject := "events.alpha"
+		if i%2 == 1 {
+			subject = "events.beta"
+		}
+		if _, err := jsPub.Publish(subject, []byte(`{"i":`+strconv.Itoa(i)+`}`)); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=alpha&topic=beta&last-id=0", nil).WithContext(ctx)
+	rr := newSafeRecorder()
+	done := make(chan error, 1)
+	go func() { done <- h.ServeHTTP(rr, req, nil) }()
+
+	if !waitForSSEBody(rr, `"i":39`, 2*time.Second) {
+		cancel()
+		<-done
+		t.Fatalf("did not receive full replay; body=%s", rr.Body())
+	}
+	cancel()
+	<-done
+
+	ids := parseSSEIDs(t, rr.Body())
+	if len(ids) != 40 {
+		t.Fatalf("expected 40 message ids, got %d; ids=%v body=%s", len(ids), ids, rr.Body())
+	}
+	for i := 1; i < len(ids); i++ {
+		if ids[i] <= ids[i-1] {
+			t.Fatalf("SSE ids must be strictly increasing for a single Last-Event-ID cursor; ids=%v body=%s", ids, rr.Body())
+		}
+	}
+}
+
+func parseSSEIDs(t *testing.T, body string) []uint64 {
+	t.Helper()
+	var ids []uint64
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "id: ") {
+			continue
+		}
+		id, err := strconv.ParseUint(strings.TrimPrefix(line, "id: "), 10, 64)
+		if err != nil {
+			t.Fatalf("parse SSE id from %q: %v", line, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func TestCommonSubjectFilter(t *testing.T) {
+	tests := []struct {
+		name     string
+		subjects []string
+		expect   string
+	}{
+		{
+			name:     "same prefix siblings",
+			subjects: []string{"events.alpha", "events.beta"},
+			expect:   "events.>",
+		},
+		{
+			name:     "nested subject backs up one token",
+			subjects: []string{"events.alpha", "events.alpha.beta"},
+			expect:   "events.>",
+		},
+		{
+			name:     "unrelated subjects use root wildcard",
+			subjects: []string{"alpha", "beta"},
+			expect:   ">",
+		},
+		{
+			name:     "deeper sibling prefix",
+			subjects: []string{"events.alpha.one", "events.alpha.two"},
+			expect:   "events.alpha.>",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := commonSubjectFilter(tt.subjects); got != tt.expect {
+				t.Fatalf("commonSubjectFilter(%v) = %q, want %q", tt.subjects, got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestParseMajorMinorVersion(t *testing.T) {
+	tests := []struct {
+		version string
+		major   int
+		minor   int
+		ok      bool
+	}{
+		{version: "2.10.1", major: 2, minor: 10, ok: true},
+		{version: "v2.12.0", major: 2, minor: 12, ok: true},
+		{version: "2.10.0-beta.1", major: 2, minor: 10, ok: true},
+		{version: "3.0.0+meta", major: 3, minor: 0, ok: true},
+		{version: "2", ok: false},
+		{version: "not-a-version", ok: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.version, func(t *testing.T) {
+			major, minor, ok := parseMajorMinorVersion(tt.version)
+			if ok != tt.ok || major != tt.major || minor != tt.minor {
+				t.Fatalf("parseMajorMinorVersion(%q) = (%d, %d, %v), want (%d, %d, %v)",
+					tt.version, major, minor, ok, tt.major, tt.minor, tt.ok)
+			}
+		})
+	}
+}
+
+func TestSupportsMultiFilterSubjectsVersion(t *testing.T) {
+	tests := []struct {
+		version string
+		want    bool
+	}{
+		{version: "", want: false},
+		{version: "2.8.4", want: false},
+		{version: "2.9.25", want: false},
+		{version: "2.10.0", want: true},
+		{version: "v2.12.0", want: true},
+		{version: "3.0.0", want: true},
+		{version: "not-a-version", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.version, func(t *testing.T) {
+			if got := supportsMultiFilterSubjectsVersion(tt.version); got != tt.want {
+				t.Fatalf("supportsMultiFilterSubjectsVersion(%q) = %v, want %v", tt.version, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSubjectAllowedByStream(t *testing.T) {
+	tests := []struct {
+		name           string
+		subject        string
+		streamSubjects []string
+		want           bool
+	}{
+		{
+			name:           "full wildcard allows nested subject",
+			subject:        "events.alpha.beta",
+			streamSubjects: []string{"events.>"},
+			want:           true,
+		},
+		{
+			name:           "single token wildcard allows one token",
+			subject:        "events.alpha",
+			streamSubjects: []string{"events.*"},
+			want:           true,
+		},
+		{
+			name:           "single token wildcard rejects nested token",
+			subject:        "events.alpha.beta",
+			streamSubjects: []string{"events.*"},
+			want:           false,
+		},
+		{
+			name:           "exact subject match",
+			subject:        "events.alpha",
+			streamSubjects: []string{"events.alpha"},
+			want:           true,
+		},
+		{
+			name:           "unmatched subject",
+			subject:        "orders.alpha",
+			streamSubjects: []string{"events.>"},
+			want:           false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := subjectAllowedByStream(tt.subject, tt.streamSubjects); got != tt.want {
+				t.Fatalf("subjectAllowedByStream(%q, %v) = %v, want %v", tt.subject, tt.streamSubjects, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHandler_StreamNotFound(t *testing.T) {
 	// Start embedded NATS server with JetStream
 	ns := startJetStreamServer(t)
@@ -1128,7 +1435,7 @@ func TestHandler_StreamNotFound(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
 		logger:            zap.NewNop(),
 	}
@@ -1263,7 +1570,7 @@ func TestHandler_Cleanup(t *testing.T) {
 		NatsURL:        ns.ClientURL(),
 		StreamName:     "TEST",
 		ReconnectWait:  1,
-		MaxReconnects:  3,
+		MaxReconnects:  intPtr(3),
 		AllowedOrigins: []string{"*"},
 		logger:         zap.NewNop(),
 	}
@@ -1360,6 +1667,26 @@ func (f *failingFlushRecorder) Flush() {
 	// No-op for testing, actual flushing happens in real HTTP response.
 }
 
+func waitForConsumerCount(t *testing.T, js nats.JetStreamContext, stream string, want int, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if consumerCount(js, stream) == want {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return consumerCount(js, stream) == want
+}
+
+func consumerCount(js nats.JetStreamContext, stream string) int {
+	count := 0
+	for range js.ConsumerNames(stream) {
+		count++
+	}
+	return count
+}
+
 type slowFlushRecorder struct {
 	*httptest.ResponseRecorder
 	writeDelay time.Duration
@@ -1403,6 +1730,30 @@ func TestIsValidTopic(t *testing.T) {
 	}
 }
 
+func TestIsReplayStartSequenceError(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		hasLastID bool
+		want      bool
+	}{
+		{name: "nil", hasLastID: true},
+		{name: "no last id", err: errors.New("start sequence 42 is no longer available"), want: false},
+		{name: "sequence not found api error", err: &nats.APIError{ErrorCode: jsErrCodeSequenceNotFound, Description: "sequence 42 not found"}, hasLastID: true, want: true},
+		{name: "consumer sequence mismatch", err: &nats.ErrConsumerSequenceMismatch{StreamResumeSequence: 42, ConsumerSequence: 1, LastConsumerSequence: 2}, hasLastID: true, want: true},
+		{name: "plain sequence string", err: errors.New("sequence not found"), hasLastID: true, want: false},
+		{name: "unrelated", err: errors.New("stream not found"), hasLastID: true, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isReplayStartSequenceError(tt.err, tt.hasLastID); got != tt.want {
+				t.Fatalf("isReplayStartSequenceError(%v, %v) = %v, want %v", tt.err, tt.hasLastID, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRedactURL(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1437,13 +1788,13 @@ func TestHandler_ServeHTTP_InvalidTopic(t *testing.T) {
 
 	js, _ := nc.JetStream()
 	h := &Handler{
-		StreamName: "EVENTS",
-		TopicPrefix: "events.",
-		AllowedOrigins: []string{"*"},
+		StreamName:        "EVENTS",
+		TopicPrefix:       "events.",
+		AllowedOrigins:    []string{"*"},
 		HeartbeatInterval: 30,
-		conn: nc,
-		js:   js,
-		logger: zap.NewNop(),
+		conn:              nc,
+		js:                js,
+		logger:            zap.NewNop(),
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/events?topic=a%00b", nil)
@@ -1477,8 +1828,9 @@ func TestHandler_ServeHTTP_ConnectedWriteFailure(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
+		MaxConnections:    1,
 		logger:            zap.NewNop(),
 	}
 
@@ -1511,6 +1863,83 @@ func TestHandler_ServeHTTP_ConnectedWriteFailure(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("ServeHTTP did not return after initial write failure")
 	}
+	if got := atomic.LoadInt64(&h.connCount); got != 0 {
+		t.Fatalf("connCount = %d, want 0 after connected write failure", got)
+	}
+	if !waitForConsumerCount(t, js, "TEST_EVENTS", 0, 2*time.Second) {
+		t.Fatalf("ephemeral consumer leaked after connected write failure")
+	}
+}
+
+func TestHandler_ServeHTTP_SubscribeFailureReleasesConnectionSlot(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	h.MaxConnections = 1
+	h.StreamName = "NOPE_DOES_NOT_EXIST"
+
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=err", nil)
+	w := &flushRecorder{httptest.NewRecorder()}
+	if err := h.ServeHTTP(w, req, nil); err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+	if got := atomic.LoadInt64(&h.connCount); got != 0 {
+		t.Fatalf("connCount = %d, want 0 after subscription failure", got)
+	}
+}
+
+func TestHandler_ServeHTTP_SubjectPrecheckReleasesConnectionSlot(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("failed to connect to NATS: %v", err)
+	}
+	defer nc.Close()
+
+	createTestStream(t, nc, "TEST_EVENTS", []string{"events.allowed"})
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "TEST_EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30,
+		MaxConnections:    1,
+		AllowedOrigins:    []string{"*"},
+		logger:            zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("failed to connect handler to NATS: %v", err)
+	}
+	defer h.Cleanup()
+	js, err := h.conn.JetStream()
+	if err != nil {
+		t.Fatalf("failed to create JetStream context: %v", err)
+	}
+	h.mu.Lock()
+	h.js = js
+	h.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=allowed&topic=blocked", nil)
+	w := &flushRecorder{httptest.NewRecorder()}
+	if err := h.ServeHTTP(w, req, nil); err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+	if got := atomic.LoadInt64(&h.connCount); got != 0 {
+		t.Fatalf("connCount = %d, want 0 after subject pre-check failure", got)
+	}
+	if !waitForConsumerCount(t, js, "TEST_EVENTS", 0, 2*time.Second) {
+		t.Fatalf("unexpected consumer after subject pre-check failure")
+	}
 }
 
 func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
@@ -1531,8 +1960,9 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
+		MaxConnections:    1,
 		logger:            zap.NewNop(),
 	}
 
@@ -1573,6 +2003,12 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ServeHTTP did not return after message write failure")
+	}
+	if got := atomic.LoadInt64(&h.connCount); got != 0 {
+		t.Fatalf("connCount = %d, want 0 after message write failure", got)
+	}
+	if !waitForConsumerCount(t, js, "TEST_EVENTS", 0, 2*time.Second) {
+		t.Fatalf("ephemeral consumer leaked after message write failure")
 	}
 }
 
@@ -1644,7 +2080,7 @@ func TestHandler_ServeHTTP_DisconnectsSlowClientBeforeDropping(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
 		logger:            zap.NewNop(),
 	}
@@ -1718,7 +2154,7 @@ func TestHandler_ServeHTTP_OversizedEventDropped(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		ReconnectWait:     2,
-		MaxReconnects:     -1,
+		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},
 		MaxEventSize:      100, // very small limit
 		logger:            zap.NewNop(),
@@ -1783,7 +2219,7 @@ func TestHandler_ServeHTTP_OversizedEventDropped(t *testing.T) {
 	}
 }
 
-// ── Phase 1 feature tests: health check, hub discovery, metrics, Caddyfile ──
+// ── Feature tests: health check, hub discovery, metrics, Caddyfile ──
 
 func TestHandler_HealthCheck(t *testing.T) {
 	ns := startJetStreamServer(t)
@@ -1905,7 +2341,7 @@ func TestHandler_HubDiscovery(t *testing.T) {
 			TopicPrefix:       "events.",
 			HeartbeatInterval: 30,
 			ReconnectWait:     2,
-			MaxReconnects:     -1,
+			MaxReconnects:     intPtr(-1),
 			AllowedOrigins:    []string{"*"},
 			HubURL:            "https://example.com/events",
 			logger:            zap.NewNop(),
@@ -1950,7 +2386,7 @@ func TestHandler_HubDiscovery(t *testing.T) {
 			TopicPrefix:       "events.",
 			HeartbeatInterval: 30,
 			ReconnectWait:     2,
-			MaxReconnects:     -1,
+			MaxReconnects:     intPtr(-1),
 			AllowedOrigins:    []string{"*"},
 			logger:            zap.NewNop(),
 		}

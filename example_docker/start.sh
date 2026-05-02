@@ -1,6 +1,10 @@
 #!/bin/sh
 cd "$(dirname "$0")"
-docker compose up -d --wait
+if docker compose up --help 2>/dev/null | grep -q -- --wait; then
+	docker compose up -d --wait
+else
+	docker compose up -d
+fi
 
 echo ""
 echo "========================================"

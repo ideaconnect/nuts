@@ -1,6 +1,6 @@
 services:
   nats:
-    image: nats:2.12-alpine
+    image: ${NATS_IMAGE:-nats:2.12-alpine}
     container_name: nuts-nats
     ports:
       - "4222:4222"   # Client connections
@@ -51,7 +51,7 @@ services:
         condition: service_completed_successfully
     restart: on-failure
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/events/healthz"]
       interval: 2s
       timeout: 5s
       retries: 10

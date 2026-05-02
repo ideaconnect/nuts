@@ -9,6 +9,9 @@ on:
       - 'v*'
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,8 +27,30 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Check gofmt
+        run: |
+          fmt_out=$(gofmt -l .)
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-clean:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.11.4
+
       - name: Run unit tests with coverage
         run: go test -covermode=atomic -coverprofile=coverage.out -v -timeout 120s .
+
+      - name: Run focused race tests
+        run: go test -race -v -timeout 180s -run 'TestHandler_ServeHTTP_MultiTopicReplayEmitsIncreasingIDs|TestHandler_ServeHTTP_PreservesJSONNumberLexemes|TestMetrics_ActiveConnections_ReflectsLifecycle' .
 
       - name: Print coverage summary
         run: go tool cover -func=coverage.out
@@ -33,14 +58,22 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
-      - name: Start functional test stack
-        run: make docker-up
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
-      - name: Run functional tests
+      - name: Run functional test matrix
         env:
           TEST_BASE_URL: http://localhost:8080
           TEST_NATS_URL: nats://localhost:4222
-        run: cd functional_test && go test -v -timeout 120s ./...
+          NATS_COMPAT_IMAGES: nats:2.9-alpine nats:2.12-alpine
+        run: make test-functional-matrix
+
+      - name: Run functional test stress pass
+        env:
+          TEST_BASE_URL: http://localhost:8080
+          TEST_NATS_URL: nats://localhost:4222
+          NATS_IMAGE: nats:2.12-alpine
+        run: make test-functional-stress FUNCTIONAL_TEST_STRESS_COUNT=3
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
@@ -48,19 +81,117 @@ jobs:
           files: ./coverage.out
           flags: unittests
           name: unit-tests
+          fail_ci_if_error: false
           verbose: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Stop functional test stack
-        if: always()
-        run: make docker-down
+
+  docker-build:
+    needs: test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: idcttech/nuts:ci
+
+      - name: Validate production Caddyfile in image
+        run: docker run --rm idcttech/nuts:ci /app/caddy adapt --config /app/Caddyfile
+
+      - name: Scan production image for vulnerabilities
+        run: |
+          mkdir -p "$HOME/.cache/trivy"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache" \
+            aquasec/trivy:0.59.1 image \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --severity HIGH,CRITICAL \
+            idcttech/nuts:ci
+
+      - name: Generate production image SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: idcttech/nuts:ci
+          format: spdx-json
+          output-file: nuts-image.spdx.json
+
+      - name: Upload production image SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuts-image-sbom
+          path: nuts-image.spdx.json
+
+  goreleaser-snapshot:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Syft for GoReleaser SBOMs
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Detect release configuration changes
+        id: release_changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            release:
+              - '.goreleaser.yml'
+              - '.github/workflows/release.yml'
+              - '.github/workflows/ci.yml'
+              - 'Makefile'
+              - 'Dockerfile'
+
+      - name: Check GoReleaser config
+        if: steps.release_changes.outputs.release == 'true'
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: check
+
+      - name: Run GoReleaser snapshot dry run
+        if: steps.release_changes.outputs.release == 'true'
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --snapshot --clean --skip=publish
 
   docker:
     needs: test
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: Check out repository
@@ -88,6 +219,7 @@ jobs:
             type=ref,event=tag
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -97,9 +229,42 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Scan release image for vulnerabilities
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mkdir -p "$HOME/.cache/trivy"
+          docker run --rm \
+            -v "$HOME/.cache/trivy:/root/.cache" \
+            aquasec/trivy:0.59.1 image \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --severity HIGH,CRITICAL \
+            "idcttech/nuts@${{ steps.build.outputs.digest }}"
+
+      - name: Install Cosign
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign release image
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          images=""
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            images="$images $tag@$DIGEST"
+          done <<EOF
+          $TAGS
+          EOF
+          cosign sign --yes $images
 
       - name: Update Docker Hub description
-        uses: peter-evans/dockerhub-description@v4
+        uses: peter-evans/dockerhub-description@v5
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

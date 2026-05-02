@@ -1,16 +1,15 @@
 // helpers.go — Small utility functions shared across the package.
-//
-// These helpers handle JSON serialization, SSE wire-format writing,
-// topic name validation, and URL redaction for safe logging.
 package nuts
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"unicode"
+	"time"
 )
 
 // toJSON marshals any value to a JSON string. On error it returns "{}".
@@ -23,22 +22,22 @@ func toJSON(v interface{}) string {
 	return string(b)
 }
 
-// tryParseJSON attempts to unmarshal raw bytes as JSON. If the bytes are
-// valid JSON, the parsed value is returned (map, slice, number, etc.).
-// Otherwise the raw bytes are returned as a plain string. This lets
-// messageEventPayload.Payload stay structured when possible.
+// tryParseJSON attempts to preserve raw JSON values without coercing numbers
+// through interface{} / float64. If the bytes are valid JSON, a compacted
+// json.RawMessage is returned so json.Marshal embeds it directly in the SSE
+// envelope. Otherwise the raw bytes are returned as a plain string.
+//
+// Callers MUST bound len(data) before invoking this function — JSON compaction
+// allocates and is unsafe on untrusted unbounded input.
 func tryParseJSON(data []byte) interface{} {
-	var v interface{}
-	if err := json.Unmarshal(data, &v); err != nil {
+	var compacted bytes.Buffer
+	if err := json.Compact(&compacted, data); err != nil {
 		return string(data)
 	}
-	return v
+	return json.RawMessage(compacted.Bytes())
 }
 
 // writeSSEChunk writes a complete SSE frame to the client and flushes it.
-// The SSE protocol requires each event to end with a blank line (\n\n).
-// Flushing after every chunk ensures the browser receives the data
-// immediately instead of waiting for the server's write buffer to fill.
 func writeSSEChunk(w io.Writer, flusher http.Flusher, chunk string) error {
 	if _, err := io.WriteString(w, chunk); err != nil {
 		return err
@@ -47,46 +46,62 @@ func writeSSEChunk(w io.Writer, flusher http.Flusher, chunk string) error {
 	return nil
 }
 
+func writeSSEChunkWithTimeout(w http.ResponseWriter, flusher http.Flusher, chunk string, timeout time.Duration) error {
+	if timeout <= 0 {
+		return writeSSEChunk(w, flusher, chunk)
+	}
+
+	controller := http.NewResponseController(w)
+	if err := controller.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+		return writeSSEChunk(w, flusher, chunk)
+	}
+
+	if err := writeSSEChunk(w, flusher, chunk); err != nil {
+		return err
+	}
+	if err := controller.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	return nil
+}
+
 // isValidTopic rejects topic names that would be problematic as NATS
-// subjects: empty strings, overly long names, wildcard characters,
-// system-reserved prefixes, control characters, or empty segments.
+// subjects. Accepted character set: ASCII letters, digits, dot, dash,
+// underscore. Rejects wildcards (* and >), the system prefix ($),
+// leading/trailing/consecutive dots, and any length over 256 bytes.
 func isValidTopic(topic string) bool {
-	// maxTopicLen caps how long a topic name can be. This prevents
-	// clients from submitting absurdly long subjects that could waste
-	// memory or cause issues with NATS subject limits.
 	const maxTopicLen = 256
 	if topic == "" || len(topic) > maxTopicLen {
 		return false
 	}
-	// Reject NATS wildcards (* and >). Server-side consumers should use
-	// TopicPrefix for broad subscriptions; allowing wildcards here would
-	// let any browser client subscribe to arbitrary subject patterns.
-	if strings.ContainsAny(topic, "*>") {
-		return false
-	}
-	// Reject subjects starting with $ — these are reserved by NATS for
-	// internal use (e.g., $JS.API for JetStream, $SYS for system events).
 	if strings.HasPrefix(topic, "$") {
 		return false
 	}
-	// Reject control characters (ASCII 0x00-0x1F and 0x7F). These can break
-	// the SSE wire format or cause unexpected behaviour in NATS subjects.
-	for _, r := range topic {
-		if unicode.IsControl(r) {
-			return false
-		}
-	}
-	// Reject ".." (consecutive dots). In NATS, dots separate subject tokens,
-	// so ".." means an empty token, which is invalid.
 	if strings.Contains(topic, "..") {
 		return false
+	}
+	if strings.HasPrefix(topic, ".") || strings.HasSuffix(topic, ".") {
+		return false
+	}
+	for i := 0; i < len(topic); i++ {
+		c := topic[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '.' || c == '-' || c == '_':
+		default:
+			return false
+		}
 	}
 	return true
 }
 
 // redactURL strips embedded credentials from a URL string before it is
-// written to logs. Without this, a NATS URL like "nats://user:pass@host"
-// would leak the password into Caddy's log output.
+// written to logs.
 func redactURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.User == nil {
@@ -94,4 +109,22 @@ func redactURL(raw string) string {
 	}
 	u.User = url.User("REDACTED")
 	return u.String()
+}
+
+func isValidCookieName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)):
+		default:
+			return false
+		}
+	}
+	return true
 }

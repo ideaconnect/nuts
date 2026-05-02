@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,13 +20,14 @@ import (
 
 // clientContext holds per-client SSE state for multi-client scenarios
 type clientContext struct {
-	sseResponse            *http.Response
-	sseEvents              []sseEvent
-	allEvents              []sseEvent // accumulated across disconnect/reconnect cycles
-	mu                     sync.Mutex
-	cancelFunc             context.CancelFunc
-	lastEventID            string
+	sseResponse             *http.Response
+	sseEvents               []sseEvent
+	allEvents               []sseEvent // accumulated across disconnect/reconnect cycles
+	mu                      sync.Mutex
+	cancelFunc              context.CancelFunc
+	lastEventID             string
 	lastEventIDAtDisconnect string // snapshot taken at disconnect time
+	readDone                chan struct{}
 }
 
 // testContext holds state for each scenario
@@ -42,6 +45,8 @@ type testContext struct {
 	publishedSeqs  map[int]uint64 // maps message index to JetStream sequence
 	heartbeats     []string
 	clients        map[string]*clientContext
+	streamNames    map[string]struct{}
+	sseReadDone    chan struct{}
 }
 
 type sseEvent struct {
@@ -52,6 +57,13 @@ type sseEvent struct {
 
 var tc *testContext
 
+const (
+	functionalWaitTimeout     = 10 * time.Second
+	functionalPollInterval    = 50 * time.Millisecond
+	functionalQuietWindow     = 500 * time.Millisecond
+	functionalDisconnectLimit = 2 * time.Second
+)
+
 func getEnvOrDefault(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -59,25 +71,324 @@ func getEnvOrDefault(key, defaultValue string) string {
 	return defaultValue
 }
 
+func waitUntil(description string, timeout time.Duration, check func() (bool, string)) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(functionalPollInterval)
+	defer ticker.Stop()
+
+	var detail string
+	for {
+		ok, currentDetail := check()
+		if ok {
+			return nil
+		}
+		if currentDetail != "" {
+			detail = currentDetail
+		}
+		select {
+		case <-deadline.C:
+			if detail != "" {
+				return fmt.Errorf("timed out waiting for %s: %s", description, detail)
+			}
+			return fmt.Errorf("timed out waiting for %s", description)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForNoEvent(description string, quietWindow time.Duration, check func() (bool, string)) error {
+	deadline := time.NewTimer(quietWindow)
+	defer deadline.Stop()
+	ticker := time.NewTicker(functionalPollInterval)
+	defer ticker.Stop()
+
+	for {
+		found, detail := check()
+		if found {
+			if detail != "" {
+				return fmt.Errorf("unexpected %s: %s", description, detail)
+			}
+			return fmt.Errorf("unexpected %s", description)
+		}
+		select {
+		case <-deadline.C:
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForReadDone(done <-chan struct{}, timeout time.Duration) error {
+	if done == nil {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("SSE reader did not stop within %s", timeout)
+	}
+}
+
+func singleEventsSnapshot() ([]sseEvent, []string) {
+	tc.sseEventsMutex.Lock()
+	defer tc.sseEventsMutex.Unlock()
+	events := append([]sseEvent(nil), tc.sseEvents...)
+	heartbeats := append([]string(nil), tc.heartbeats...)
+	return events, heartbeats
+}
+
+func clientEventsSnapshot(cc *clientContext, includeAll bool) []sseEvent {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if !includeAll {
+		return append([]sseEvent(nil), cc.sseEvents...)
+	}
+	events := append([]sseEvent(nil), cc.allEvents...)
+	events = append(events, cc.sseEvents...)
+	return events
+}
+
+func eventContains(events []sseEvent, text string) bool {
+	for _, event := range events {
+		if strings.Contains(event.Data, text) {
+			return true
+		}
+	}
+	return false
+}
+
+func eventHasTopic(event sseEvent, topic string) bool {
+	if event.Event != "message" {
+		return false
+	}
+	return strings.Contains(event.Data, fmt.Sprintf(`"topic":"%s"`, topic)) ||
+		strings.Contains(event.Data, fmt.Sprintf(`"topic": "%s"`, topic))
+}
+
+func waitForSingleEvent(description string, match func(sseEvent) bool) error {
+	return waitUntil(description, functionalWaitTimeout, func() (bool, string) {
+		events, _ := singleEventsSnapshot()
+		for _, event := range events {
+			if match(event) {
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("events=%+v", events)
+	})
+}
+
+func waitForSingleConnectedEvent() error {
+	return waitForSingleEvent("connected SSE event", func(event sseEvent) bool {
+		return event.Event == "connected"
+	})
+}
+
+func splitSubjects(subjectsCSV string) []string {
+	rawSubjects := strings.Split(subjectsCSV, ",")
+	subjects := make([]string, 0, len(rawSubjects))
+	for _, subject := range rawSubjects {
+		subject = strings.TrimSpace(subject)
+		if subject != "" {
+			subjects = append(subjects, subject)
+		}
+	}
+	return subjects
+}
+
+func functionalSupportsMultiFilterSubjects(version string) bool {
+	version = strings.TrimPrefix(version, "v")
+	if cut := strings.IndexAny(version, "-+"); cut >= 0 {
+		version = version[:cut]
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	return major > 2 || (major == 2 && minor >= 10)
+}
+
+func functionalCommonSubjectFilter(subjects []string) string {
+	if len(subjects) == 0 {
+		return ">"
+	}
+	common := strings.Split(subjects[0], ".")
+	for _, subject := range subjects[1:] {
+		parts := strings.Split(subject, ".")
+		limit := len(common)
+		if len(parts) < limit {
+			limit = len(parts)
+		}
+		idx := 0
+		for idx < limit && common[idx] == parts[idx] {
+			idx++
+		}
+		common = common[:idx]
+		if len(common) == 0 {
+			return ">"
+		}
+	}
+	for _, subject := range subjects {
+		if len(strings.Split(subject, ".")) == len(common) {
+			common = common[:len(common)-1]
+			break
+		}
+	}
+	if len(common) == 0 {
+		return ">"
+	}
+	return strings.Join(common, ".") + ".>"
+}
+
+func sameStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	wantSet := make(map[string]int, len(want))
+	for _, value := range want {
+		wantSet[value]++
+	}
+	for _, value := range got {
+		if wantSet[value] == 0 {
+			return false
+		}
+		wantSet[value]--
+	}
+	return true
+}
+
+func consumerUsesExpectedMultiTopicStrategy(info *nats.ConsumerInfo, subjects []string, supportsMultiFilter bool) bool {
+	if supportsMultiFilter {
+		return info.Config.FilterSubject == "" && sameStringSet(info.Config.FilterSubjects, subjects)
+	}
+	return len(info.Config.FilterSubjects) == 0 && info.Config.FilterSubject == functionalCommonSubjectFilter(subjects)
+}
+
+func consumerFilterSummary(infos []*nats.ConsumerInfo) string {
+	parts := make([]string, 0, len(infos))
+	for _, info := range infos {
+		parts = append(parts, fmt.Sprintf("name=%s filter_subject=%q filter_subjects=%v", info.Name, info.Config.FilterSubject, info.Config.FilterSubjects))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func streamShouldHaveActiveConsumerUsingExpectedMultiTopicFilters(streamName, subjectsCSV string) error {
+	subjects := splitSubjects(subjectsCSV)
+	if len(subjects) < 2 {
+		return fmt.Errorf("expected at least two subjects, got %q", subjectsCSV)
+	}
+	version := ""
+	if tc.natsConn != nil {
+		version = tc.natsConn.ConnectedServerVersion()
+	}
+	supportsMultiFilter := functionalSupportsMultiFilterSubjects(version)
+
+	return waitUntil("active multi-topic consumer filter strategy", functionalWaitTimeout, func() (bool, string) {
+		var infos []*nats.ConsumerInfo
+		for info := range tc.js.ConsumersInfo(streamName) {
+			if info != nil {
+				infos = append(infos, info)
+			}
+		}
+		for _, info := range infos {
+			if consumerUsesExpectedMultiTopicStrategy(info, subjects, supportsMultiFilter) {
+				return true, ""
+			}
+		}
+		strategy := "wildcard FilterSubject"
+		if supportsMultiFilter {
+			strategy = "FilterSubjects"
+		}
+		return false, fmt.Sprintf("server_version=%q expected=%s subjects=%v consumers=[%s]", version, strategy, subjects, consumerFilterSummary(infos))
+	})
+}
+
+func waitForClientConnectedEvent(name string, cc *clientContext) error {
+	return waitUntil("client "+name+" connected SSE event", functionalWaitTimeout, func() (bool, string) {
+		events := clientEventsSnapshot(cc, false)
+		for _, event := range events {
+			if event.Event == "connected" {
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("events=%+v", events)
+	})
+}
+
+func waitForStreamAvailable(streamName string, subjects []string) error {
+	return waitUntil("JetStream stream "+streamName, functionalWaitTimeout, func() (bool, string) {
+		info, err := tc.js.StreamInfo(streamName)
+		if err != nil {
+			return false, err.Error()
+		}
+		for _, want := range subjects {
+			found := false
+			for _, got := range info.Config.Subjects {
+				if got == want {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false, fmt.Sprintf("subjects=%v", info.Config.Subjects)
+			}
+		}
+		return true, ""
+	})
+}
+
+func isStreamNotFound(err error) bool {
+	var apiErr *nats.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode == nats.JSErrCodeStreamNotFound
+}
+
+func deleteStreamIfExists(streamName string) error {
+	if tc.js == nil {
+		return nil
+	}
+	return waitUntil("delete JetStream stream "+streamName, functionalWaitTimeout, func() (bool, string) {
+		err := tc.js.DeleteStream(streamName)
+		if err == nil || isStreamNotFound(err) {
+			return true, ""
+		}
+		return false, err.Error()
+	})
+}
+
 func aNATSJetStreamServerIsRunning() error {
-	nc, err := nats.Connect(tc.natsURL)
-	if err != nil {
-		return fmt.Errorf("failed to connect to NATS at %s: %w", tc.natsURL, err)
-	}
-	tc.natsConn = nc
+	return waitUntil("NATS JetStream connection", functionalWaitTimeout, func() (bool, string) {
+		nc, err := nats.Connect(tc.natsURL)
+		if err != nil {
+			return false, fmt.Sprintf("failed to connect to NATS at %s: %v", tc.natsURL, err)
+		}
 
-	js, err := nc.JetStream()
-	if err != nil {
-		return fmt.Errorf("failed to get JetStream context: %w", err)
-	}
-	tc.js = js
+		js, err := nc.JetStream()
+		if err != nil {
+			nc.Close()
+			return false, fmt.Sprintf("failed to get JetStream context: %v", err)
+		}
 
-	return nil
+		tc.natsConn = nc
+		tc.js = js
+		return true, ""
+	})
 }
 
 func theStreamExistsWithSubjects(streamName, subjects string) error {
-	// Delete stream if exists (cleanup from previous runs)
-	_ = tc.js.DeleteStream(streamName)
+	if err := deleteStreamIfExists(streamName); err != nil {
+		return err
+	}
 
 	_, err := tc.js.AddStream(&nats.StreamConfig{
 		Name:     streamName,
@@ -88,7 +399,11 @@ func theStreamExistsWithSubjects(streamName, subjects string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
-	return nil
+	if tc.streamNames == nil {
+		tc.streamNames = make(map[string]struct{})
+	}
+	tc.streamNames[streamName] = struct{}{}
+	return waitForStreamAvailable(streamName, []string{subjects})
 }
 
 func iAmConnectedToSSEEndpoint(endpoint string) error {
@@ -115,13 +430,11 @@ func iConnectToSSEEndpoint(endpoint string) error {
 	tc.sseResponse = resp
 	tc.sseEvents = nil
 	tc.heartbeats = nil
+	tc.sseReadDone = make(chan struct{})
 
-	// Start reading events in background
-	go readSSEEvents(resp.Body)
+	go readSSEEvents(resp.Body, tc.sseReadDone)
 
-	// Wait for connection to establish and receive connected event
-	time.Sleep(300 * time.Millisecond)
-	return nil
+	return waitForSingleConnectedEvent()
 }
 
 func iConnectToSSEEndpointWithLastIdFromMessage(endpoint string, messageIndex int) error {
@@ -134,7 +447,8 @@ func iConnectToSSEEndpointWithLastIdFromMessage(endpoint string, messageIndex in
 	return iConnectToSSEEndpoint(fullEndpoint)
 }
 
-func readSSEEvents(body io.Reader) {
+func readSSEEvents(body io.Reader, done chan<- struct{}) {
+	defer close(done)
 	scanner := bufio.NewScanner(body)
 	var currentEvent sseEvent
 	var dataLines []string
@@ -180,118 +494,101 @@ func iPublishMessageToSubject(message, subject string) error {
 		tc.publishedSeqs = make(map[int]uint64)
 	}
 	tc.publishedSeqs[len(tc.publishedSeqs)+1] = ack.Sequence
-
-	// Wait for message to propagate
-	time.Sleep(100 * time.Millisecond)
 	return nil
 }
 
 func iShouldReceiveAnSSEEventWithTopic(topic string) error {
-	// Wait a bit for events to arrive
-	time.Sleep(500 * time.Millisecond)
+	return waitForSingleEvent("SSE message with topic "+topic, func(event sseEvent) bool {
+		return eventHasTopic(event, topic)
+	})
+}
 
-	tc.sseEventsMutex.Lock()
-	defer tc.sseEventsMutex.Unlock()
-
-	for _, event := range tc.sseEvents {
-		if event.Event == "message" {
-			// Check for topic in the data
-			if strings.Contains(event.Data, fmt.Sprintf(`"topic":"%s"`, topic)) ||
-				strings.Contains(event.Data, fmt.Sprintf(`"topic": "%s"`, topic)) {
-				return nil
+func iShouldNotReceiveAnSSEEventWithTopic(topic string) error {
+	return waitForNoEvent("SSE message with topic "+topic, functionalQuietWindow, func() (bool, string) {
+		events, _ := singleEventsSnapshot()
+		for _, event := range events {
+			if eventHasTopic(event, topic) {
+				return true, fmt.Sprintf("events=%+v", events)
 			}
 		}
+		return false, ""
+	})
+}
+
+func iShouldHaveReceivedSSEMessageEvents(expected int) error {
+	if err := waitUntil(fmt.Sprintf("%d SSE message events", expected), functionalWaitTimeout, func() (bool, string) {
+		events, _ := singleEventsSnapshot()
+		got := countMessages(events)
+		return got == expected, fmt.Sprintf("got %d message events", got)
+	}); err != nil {
+		return err
 	}
-	return fmt.Errorf("no SSE event found with topic %q, got events: %+v", topic, tc.sseEvents)
+	return waitForNoEvent(fmt.Sprintf("more than %d SSE message events", expected), functionalQuietWindow, func() (bool, string) {
+		events, _ := singleEventsSnapshot()
+		got := countMessages(events)
+		if got > expected {
+			return true, fmt.Sprintf("got %d message events", got)
+		}
+		return false, ""
+	})
 }
 
 func theEventPayloadShouldContain(text string) error {
-	tc.sseEventsMutex.Lock()
-	defer tc.sseEventsMutex.Unlock()
-
-	for _, event := range tc.sseEvents {
-		if strings.Contains(event.Data, text) {
-			return nil
-		}
-	}
-	return fmt.Errorf("no event payload contains %q", text)
+	return waitForSingleEvent("event payload containing "+text, func(event sseEvent) bool {
+		return strings.Contains(event.Data, text)
+	})
 }
 
 func theEventShouldHaveAnID() error {
-	tc.sseEventsMutex.Lock()
-	defer tc.sseEventsMutex.Unlock()
-
-	for _, event := range tc.sseEvents {
-		if event.Event == "message" && event.ID != "" {
-			return nil
-		}
-	}
-	return fmt.Errorf("no message event has an ID, events: %+v", tc.sseEvents)
+	return waitForSingleEvent("message event with an ID", func(event sseEvent) bool {
+		return event.Event == "message" && event.ID != ""
+	})
 }
 
 func iShouldReceiveAnSSEEventContaining(text string) error {
-	time.Sleep(500 * time.Millisecond)
-
-	tc.sseEventsMutex.Lock()
-	defer tc.sseEventsMutex.Unlock()
-
-	for _, event := range tc.sseEvents {
-		if strings.Contains(event.Data, text) {
-			return nil
-		}
-	}
-	return fmt.Errorf("no SSE event contains %q, got: %+v", text, tc.sseEvents)
+	return waitForSingleEvent("SSE event containing "+text, func(event sseEvent) bool {
+		return strings.Contains(event.Data, text)
+	})
 }
 
 func iShouldNotReceiveAnSSEEventContaining(text string) error {
-	time.Sleep(500 * time.Millisecond)
-
-	tc.sseEventsMutex.Lock()
-	defer tc.sseEventsMutex.Unlock()
-
-	for _, event := range tc.sseEvents {
-		if strings.Contains(event.Data, text) {
-			return fmt.Errorf("unexpected SSE event containing %q found", text)
+	return waitForNoEvent("SSE event containing "+text, functionalQuietWindow, func() (bool, string) {
+		events, _ := singleEventsSnapshot()
+		if eventContains(events, text) {
+			return true, fmt.Sprintf("events=%+v", events)
 		}
-	}
-	return nil
+		return false, ""
+	})
 }
 
 func iShouldReceiveAEvent(eventType string) error {
-	time.Sleep(300 * time.Millisecond)
-
-	tc.sseEventsMutex.Lock()
-	defer tc.sseEventsMutex.Unlock()
-
-	for _, event := range tc.sseEvents {
-		if event.Event == eventType {
-			return nil
-		}
-	}
-	return fmt.Errorf("no %q event received, got: %+v", eventType, tc.sseEvents)
+	return waitForSingleEvent(eventType+" SSE event", func(event sseEvent) bool {
+		return event.Event == eventType
+	})
 }
 
 func theConnectedEventShouldListTopic(topic string) error {
-	tc.sseEventsMutex.Lock()
-	defer tc.sseEventsMutex.Unlock()
-
-	for _, event := range tc.sseEvents {
-		if event.Event == "connected" {
+	return waitUntil("connected event listing topic "+topic, functionalWaitTimeout, func() (bool, string) {
+		events, _ := singleEventsSnapshot()
+		for _, event := range events {
+			if event.Event != "connected" {
+				continue
+			}
 			var data struct {
 				Topics []string `json:"topics"`
 			}
 			if err := json.Unmarshal([]byte(event.Data), &data); err != nil {
-				return fmt.Errorf("failed to parse connected event data: %w", err)
+				return false, fmt.Sprintf("failed to parse connected event data: %v", err)
 			}
 			for _, t := range data.Topics {
 				if t == topic {
-					return nil
+					return true, ""
 				}
 			}
-			return fmt.Errorf("topic %q not in connected event topics: %v", topic, data.Topics)
+			return false, fmt.Sprintf("topic %q not in connected event topics: %v", topic, data.Topics)
 		}
-	}
-	return fmt.Errorf("no connected event found")
+		return false, fmt.Sprintf("events=%+v", events)
+	})
 }
 
 func iRequestSSEEndpoint(endpoint string) error {
@@ -313,6 +610,7 @@ func iRequestSSEEndpoint(endpoint string) error {
 
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	resp.Body = nil
 	if err != nil {
 		return err
 	}
@@ -368,24 +666,20 @@ func theResponseHeaderShouldBe(header, value string) error {
 	return nil
 }
 
-func iWaitForSeconds(seconds int) error {
-	time.Sleep(time.Duration(seconds) * time.Second)
-	return nil
-}
-
 func iShouldReceiveAHeartbeatComment() error {
-	tc.sseEventsMutex.Lock()
-	defer tc.sseEventsMutex.Unlock()
-
-	if len(tc.heartbeats) > 0 {
-		return nil
-	}
-	return fmt.Errorf("no heartbeat comment received")
+	return waitUntil("heartbeat comment", functionalWaitTimeout, func() (bool, string) {
+		_, heartbeats := singleEventsSnapshot()
+		if len(heartbeats) > 0 {
+			return true, ""
+		}
+		return false, "no heartbeat comments observed"
+	})
 }
 
 // --- Multi-client step implementations ---
 
 func readClientSSEEvents(cc *clientContext, body io.Reader) {
+	defer close(cc.readDone)
 	scanner := bufio.NewScanner(body)
 	var currentEvent sseEvent
 	var dataLines []string
@@ -449,11 +743,11 @@ func clientIsConnectedToSSEEndpoint(name, endpoint string) error {
 	}
 	cc.sseResponse = resp
 	cc.sseEvents = nil
+	cc.readDone = make(chan struct{})
 
 	go readClientSSEEvents(cc, resp.Body)
 
-	time.Sleep(300 * time.Millisecond)
-	return nil
+	return waitForClientConnectedEvent(name, cc)
 }
 
 func clientDisconnects(name string) error {
@@ -477,8 +771,7 @@ func clientDisconnects(name string) error {
 		cc.sseResponse = nil
 	}
 
-	time.Sleep(100 * time.Millisecond)
-	return nil
+	return waitForReadDone(cc.readDone, functionalDisconnectLimit)
 }
 
 func clientReconnectsWithLastEventID(name, endpoint string) error {
@@ -512,11 +805,11 @@ func clientReconnectsWithLastEventID(name, endpoint string) error {
 	}
 	cc.sseResponse = resp
 	cc.sseEvents = nil
+	cc.readDone = make(chan struct{})
 
 	go readClientSSEEvents(cc, resp.Body)
 
-	time.Sleep(300 * time.Millisecond)
-	return nil
+	return waitForClientConnectedEvent(name, cc)
 }
 
 func clientConnectsWithLastEventIDFromClient(name, endpoint, otherName string) error {
@@ -566,25 +859,16 @@ func clientShouldHaveReceivedNMessages(name string, expected int) error {
 		return fmt.Errorf("client %q not found", name)
 	}
 
-	// Poll for up to 5 seconds
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		cc.mu.Lock()
-		got := countMessages(cc.sseEvents)
-		cc.mu.Unlock()
+	return waitUntil(fmt.Sprintf("client %q to receive %d messages", name, expected), functionalWaitTimeout, func() (bool, string) {
+		got := countMessages(clientEventsSnapshot(cc, false))
 		if got >= expected {
 			if got != expected {
-				return fmt.Errorf("client %q: expected %d messages, got %d", name, expected, got)
+				return false, fmt.Sprintf("expected exactly %d messages, got %d", expected, got)
 			}
-			return nil
+			return true, ""
 		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	cc.mu.Lock()
-	got := countMessages(cc.sseEvents)
-	cc.mu.Unlock()
-	return fmt.Errorf("client %q: expected %d messages, got %d (timeout)", name, expected, got)
+		return false, fmt.Sprintf("got %d messages", got)
+	})
 }
 
 func clientShouldHaveReceivedNMessagesInTotal(name string, expected int) error {
@@ -593,28 +877,16 @@ func clientShouldHaveReceivedNMessagesInTotal(name string, expected int) error {
 		return fmt.Errorf("client %q not found", name)
 	}
 
-	// Poll for up to 5 seconds
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		cc.mu.Lock()
-		// allEvents has pre-disconnect events; sseEvents has post-reconnect events
-		all := append(cc.allEvents, cc.sseEvents...)
-		got := countMessages(all)
-		cc.mu.Unlock()
+	return waitUntil(fmt.Sprintf("client %q to receive %d total messages", name, expected), functionalWaitTimeout, func() (bool, string) {
+		got := countMessages(clientEventsSnapshot(cc, true))
 		if got >= expected {
 			if got != expected {
-				return fmt.Errorf("client %q: expected %d total messages, got %d", name, expected, got)
+				return false, fmt.Sprintf("expected exactly %d total messages, got %d", expected, got)
 			}
-			return nil
+			return true, ""
 		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	cc.mu.Lock()
-	all := append(cc.allEvents, cc.sseEvents...)
-	got := countMessages(all)
-	cc.mu.Unlock()
-	return fmt.Errorf("client %q: expected %d total messages, got %d (timeout)", name, expected, got)
+		return false, fmt.Sprintf("got %d total messages", got)
+	})
 }
 
 func clientShouldHaveReceivedEventContaining(name, text string) error {
@@ -623,18 +895,13 @@ func clientShouldHaveReceivedEventContaining(name, text string) error {
 		return fmt.Errorf("client %q not found", name)
 	}
 
-	time.Sleep(500 * time.Millisecond)
-
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
-	all := append(cc.allEvents, cc.sseEvents...)
-	for _, event := range all {
-		if strings.Contains(event.Data, text) {
-			return nil
+	return waitUntil(fmt.Sprintf("client %q event containing %s", name, text), functionalWaitTimeout, func() (bool, string) {
+		events := clientEventsSnapshot(cc, true)
+		if eventContains(events, text) {
+			return true, ""
 		}
-	}
-	return fmt.Errorf("client %q: no event contains %q", name, text)
+		return false, fmt.Sprintf("events=%+v", events)
+	})
 }
 
 func clientShouldNotHaveReceivedEventContaining(name, text string) error {
@@ -643,18 +910,83 @@ func clientShouldNotHaveReceivedEventContaining(name, text string) error {
 		return fmt.Errorf("client %q not found", name)
 	}
 
-	time.Sleep(500 * time.Millisecond)
+	return waitForNoEvent(fmt.Sprintf("client %q event containing %s", name, text), functionalQuietWindow, func() (bool, string) {
+		events := clientEventsSnapshot(cc, true)
+		if eventContains(events, text) {
+			return true, fmt.Sprintf("events=%+v", events)
+		}
+		return false, ""
+	})
+}
 
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
+func cleanupScenarioState() error {
+	var cleanupErrs []string
 
-	all := append(cc.allEvents, cc.sseEvents...)
-	for _, event := range all {
-		if strings.Contains(event.Data, text) {
-			return fmt.Errorf("client %q: unexpected event containing %q", name, text)
+	if tc.cancelFunc != nil {
+		tc.cancelFunc()
+		tc.cancelFunc = nil
+	}
+	if tc.sseResponse != nil {
+		if err := tc.sseResponse.Body.Close(); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Sprintf("close single-client SSE body: %v", err))
+		}
+		tc.sseResponse = nil
+	}
+	if err := waitForReadDone(tc.sseReadDone, functionalDisconnectLimit); err != nil {
+		cleanupErrs = append(cleanupErrs, err.Error())
+	}
+	tc.sseReadDone = nil
+	if tc.httpResponse != nil && tc.httpResponse.Body != nil {
+		if err := tc.httpResponse.Body.Close(); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Sprintf("close HTTP response body: %v", err))
+		}
+		tc.httpResponse = nil
+	}
+
+	for name, cc := range tc.clients {
+		if cc.cancelFunc != nil {
+			cc.cancelFunc()
+			cc.cancelFunc = nil
+		}
+		if cc.sseResponse != nil {
+			if err := cc.sseResponse.Body.Close(); err != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Sprintf("close client %q SSE body: %v", name, err))
+			}
+			cc.sseResponse = nil
+		}
+		if err := waitForReadDone(cc.readDone, functionalDisconnectLimit); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Sprintf("client %q: %v", name, err))
 		}
 	}
+
+	if tc.js != nil {
+		for streamName := range tc.streamNames {
+			if err := deleteStreamIfExists(streamName); err != nil {
+				cleanupErrs = append(cleanupErrs, err.Error())
+			}
+		}
+	}
+	if tc.natsConn != nil {
+		tc.natsConn.Close()
+		tc.natsConn = nil
+	}
+	tc.js = nil
+
+	if len(cleanupErrs) > 0 {
+		return errors.New(strings.Join(cleanupErrs, "; "))
+	}
 	return nil
+}
+
+func resetScenarioState() {
+	tc.sseEvents = nil
+	tc.httpResponse = nil
+	tc.httpBody = ""
+	tc.heartbeats = nil
+	tc.publishedSeqs = make(map[int]uint64)
+	tc.clients = make(map[string]*clientContext)
+	tc.streamNames = make(map[string]struct{})
+	tc.sseReadDone = nil
 }
 
 func InitializeScenario(ctx *godog.ScenarioContext) {
@@ -662,40 +994,20 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 		baseURL:       getEnvOrDefault("TEST_BASE_URL", "http://localhost:8080"),
 		natsURL:       getEnvOrDefault("TEST_NATS_URL", "nats://localhost:4222"),
 		publishedSeqs: make(map[int]uint64),
+		clients:       make(map[string]*clientContext),
+		streamNames:   make(map[string]struct{}),
 	}
 
 	ctx.Before(func(ctx context.Context, sc *godog.Scenario) (context.Context, error) {
-		// Reset state for each scenario
-		tc.sseEvents = nil
-		tc.httpResponse = nil
-		tc.httpBody = ""
-		tc.heartbeats = nil
-		tc.publishedSeqs = make(map[int]uint64)
-		tc.clients = make(map[string]*clientContext)
+		if err := cleanupScenarioState(); err != nil {
+			return ctx, err
+		}
+		resetScenarioState()
 		return ctx, nil
 	})
 
 	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
-		// Cleanup single-client state
-		if tc.cancelFunc != nil {
-			tc.cancelFunc()
-		}
-		if tc.sseResponse != nil {
-			tc.sseResponse.Body.Close()
-		}
-		// Cleanup multi-client state
-		for _, cc := range tc.clients {
-			if cc.cancelFunc != nil {
-				cc.cancelFunc()
-			}
-			if cc.sseResponse != nil {
-				cc.sseResponse.Body.Close()
-			}
-		}
-		if tc.natsConn != nil {
-			tc.natsConn.Close()
-		}
-		return ctx, nil
+		return ctx, cleanupScenarioState()
 	})
 
 	// Background steps
@@ -712,10 +1024,11 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^I publish message '([^']*)' to subject "([^"]*)"$`, iPublishMessageToSubject)
 	ctx.Step(`^I request SSE endpoint "([^"]*)"$`, iRequestSSEEndpoint)
 	ctx.Step(`^I send OPTIONS request to "([^"]*)" with origin "([^"]*)"$`, iSendOPTIONSRequestToWithOrigin)
-	ctx.Step(`^I wait for (\d+) seconds?$`, iWaitForSeconds)
 
 	// Then steps
 	ctx.Step(`^I should receive an SSE event with topic "([^"]*)"$`, iShouldReceiveAnSSEEventWithTopic)
+	ctx.Step(`^I should not receive an SSE event with topic "([^"]*)"$`, iShouldNotReceiveAnSSEEventWithTopic)
+	ctx.Step(`^I should have received (\d+) SSE message events?$`, iShouldHaveReceivedSSEMessageEvents)
 	ctx.Step(`^the event payload should contain "([^"]*)"$`, theEventPayloadShouldContain)
 	ctx.Step(`^the event should have an ID$`, theEventShouldHaveAnID)
 	ctx.Step(`^I should receive an SSE event containing '([^']*)'$`, iShouldReceiveAnSSEEventContaining)
@@ -726,6 +1039,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the response should contain "([^"]*)"$`, theResponseShouldContain)
 	ctx.Step(`^the response header "([^"]*)" should be "([^"]*)"$`, theResponseHeaderShouldBe)
 	ctx.Step(`^I should receive a heartbeat comment$`, iShouldReceiveAHeartbeatComment)
+	ctx.Step(`^the stream "([^"]*)" should have an active consumer using expected multi-topic filters for subjects "([^"]*)"$`, streamShouldHaveActiveConsumerUsingExpectedMultiTopicFilters)
 
 	// Multi-client steps
 	ctx.Step(`^client "([^"]*)" is connected to SSE endpoint "([^"]*)"$`, clientIsConnectedToSSEEndpoint)

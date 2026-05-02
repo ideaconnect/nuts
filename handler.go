@@ -1,22 +1,9 @@
-// Package nuts provides a Caddy module that bridges NATS.io JetStream
-// messages to Server-Sent Events (SSE), similar to Mercure.rocks.
+// Package nuts exposes a retained NATS JetStream stream to browsers as
+// Server-Sent Events through a Caddy HTTP handler.
 //
-// The data flow is one-directional:
+//	Producer ──▶ NATS JetStream ──▶ NUTS (this module) ──▶ Browser (EventSource)
 //
-//	Producer  ──▶  NATS JetStream  ──▶  NUTS (this module)  ──▶  Browser (EventSource)
-//
-// External applications publish messages to NATS subjects. NUTS subscribes
-// to those subjects through JetStream and pushes every message to connected
-// browsers as SSE events in real time. JetStream persists messages, so a
-// client that reconnects can replay everything it missed by providing its
-// last received event ID.
-//
-// Source files:
-//   - handler.go   — Module registration, Handler struct (config + runtime state)
-//   - serve.go     — HTTP/SSE request handling: the main streaming loop
-//   - provision.go — Caddy lifecycle: connect to NATS, create JetStream context, cleanup
-//   - helpers.go   — Small utility functions (JSON, topic validation, SSE writing)
-//   - caddyfile.go — Caddyfile directive parser
+// External producers write to NATS directly; NUTS is a read-only bridge.
 package nuts
 
 import (
@@ -30,58 +17,43 @@ import (
 	"go.uber.org/zap"
 )
 
-// init runs automatically when the package is imported. It tells Caddy about
-// our module so that Caddy can create instances of it, and it registers the
-// "nuts" keyword so users can use it in their Caddyfile.
 func init() {
-	// RegisterModule makes Caddy aware of our Handler type.
 	caddy.RegisterModule(&Handler{})
-
-	// RegisterHandlerDirective tells Caddy's config parser that when it sees
-	// a "nuts" block it should call parseCaddyfile (defined in caddyfile.go)
-	// to turn the text into a Handler.
 	httpcaddyfile.RegisterHandlerDirective("nuts", parseCaddyfile)
 }
 
 // Handler implements an HTTP handler that bridges NATS.io JetStream
 // messages to Server-Sent Events (SSE) for browser clients.
 //
-// Fields tagged with `json:"..."` are user-configurable — they come
-// from the Caddyfile (via UnmarshalCaddyfile) or from Caddy's JSON API.
-// The unexported fields at the bottom are runtime state set during
-// Provision() and should never be set manually.
+// Exported fields are user-configurable through Caddyfile or JSON config.
 type Handler struct {
-	// ── Required ──────────────────────────────────────────────────
-
 	// NatsURL is the connection string for the NATS server.
-	// Example: "nats://localhost:4222"
 	NatsURL string `json:"nats_url,omitempty"`
 
-	// StreamName is the JetStream stream to subscribe to (e.g., "EVENTS").
-	// The stream must already exist — NUTS does not create streams.
+	// StreamName is the existing JetStream stream to subscribe to.
 	StreamName string `json:"stream_name,omitempty"`
 
-	// ── Authentication (pick at most one method) ─────────────────
-
-	// NatsCredentials is the filesystem path to a .creds file.
-	// Used with NATS account-based security (JWT + NKey).
+	// NatsCredentials is the filesystem path to a NATS .creds file.
 	NatsCredentials string `json:"nats_credentials,omitempty"`
 
-	// NatsToken is a simple shared-secret token for NATS authentication.
+	// NatsToken is a shared-secret token for NATS authentication.
 	NatsToken string `json:"nats_token,omitempty"`
 
-	// NatsUser is the username for basic NATS authentication.
-	// Must be paired with NatsPassword.
+	// NatsUser is the username for NATS user/password authentication.
 	NatsUser string `json:"nats_user,omitempty"`
 
-	// NatsPassword is the password for basic NATS authentication.
-	// Must be paired with NatsUser.
+	// NatsPassword must be paired with NatsUser.
 	NatsPassword string `json:"nats_password,omitempty"`
 
-	// ── Optional tuning ──────────────────────────────────────────
+	// SubscriberJWTKey enables first-party subscriber JWT auth using HMAC-signed
+	// tokens. Tokens must include a subscribe claim with allowed topics/filters.
+	SubscriberJWTKey string `json:"subscriber_jwt_key,omitempty"`
+
+	// SubscriberJWTCookie optionally names the cookie that carries the JWT for
+	// browser EventSource clients. Authorization: Bearer is always accepted.
+	SubscriberJWTCookie string `json:"subscriber_jwt_cookie,omitempty"`
 
 	// TopicPrefix is prepended to every topic name before subscribing.
-	// For example, prefix "events." + client topic "orders" = NATS subject "events.orders".
 	TopicPrefix string `json:"topic_prefix,omitempty"`
 
 	// AllowedOrigins lists the browser origins allowed by CORS.
@@ -97,12 +69,17 @@ type Handler struct {
 	// Default: 2.
 	ReconnectWait int `json:"reconnect_wait,omitempty"`
 
-	// MaxReconnects limits total NATS reconnection attempts. -1 means unlimited.
-	// Default: -1.
-	MaxReconnects int `json:"max_reconnects,omitempty"`
+	// MaxReconnects limits total NATS reconnection attempts.
+	// 0 means "no reconnects", -1 means "unlimited". Nil (omitted from
+	// Caddyfile or JSON) defaults to unlimited so the historical "retry
+	// forever" behaviour is preserved. The pointer type lets JSON config
+	// express an explicit "max_reconnects": 0 — a plain int would collide
+	// with Go's zero value and get silently rewritten to the default.
+	MaxReconnects *int `json:"max_reconnects,omitempty"`
 
 	// MaxEventSize caps the size (in bytes) of a single formatted SSE event.
-	// Events exceeding this are dropped with a warning log. 0 disables the limit.
+	// Events exceeding this are dropped with a warning log.
+	// A negative value disables the limit. 0 (or unset) uses the default.
 	// Default: 1048576 (1 MB).
 	MaxEventSize int `json:"max_event_size,omitempty"`
 
@@ -112,22 +89,94 @@ type Handler struct {
 	// Leave empty to disable hub discovery (default).
 	HubURL string `json:"hub_url,omitempty"`
 
-	// ── Runtime state (not user-configurable) ────────────────────
+	// HealthPath is the legacy URL path (relative to the matched route) that
+	// returns NATS / stream readiness as JSON. Empty uses the default.
+	// Default: "/healthz".
+	HealthPath string `json:"health_path,omitempty"`
 
-	// conn is the long-lived TCP connection to the NATS server.
-	// Opened during Provision(), shared across all HTTP requests.
+	// LivePath is the URL path for a process-liveness probe. It returns 200
+	// when the handler can serve HTTP, without checking NATS or JetStream.
+	// Default: "/livez".
+	LivePath string `json:"live_path,omitempty"`
+
+	// ReadyPath is the URL path for a readiness probe. It checks the NATS
+	// connection and configured JetStream stream before returning 200.
+	// Default: "/readyz".
+	ReadyPath string `json:"ready_path,omitempty"`
+
+	// AllowedHeaders lists HTTP headers permitted by CORS preflight responses.
+	// Default: ["Cache-Control", "Last-Event-ID"].
+	AllowedHeaders []string `json:"allowed_headers,omitempty"`
+
+	// AllowedMethods lists HTTP methods permitted by CORS preflight responses.
+	// NUTS only serves GET streams and OPTIONS preflight requests.
+	// Default: ["GET", "OPTIONS"].
+	AllowedMethods []string `json:"allowed_methods,omitempty"`
+
+	// MaxConnections caps the total number of concurrent SSE connections served
+	// by this handler instance. 0 (default) disables the cap. Connections that
+	// would exceed the cap receive HTTP 503 with a Retry-After header.
+	MaxConnections int `json:"max_connections,omitempty"`
+
+	// MaxTopicsPerSubscription caps how many distinct topics a single SSE
+	// request may subscribe to. 0 (or unset) uses the default. A negative
+	// value disables the limit. Requests exceeding the cap receive HTTP 400.
+	// Default: 32.
+	MaxTopicsPerSubscription int `json:"max_topics_per_subscription,omitempty"`
+
+	// ClientBufferSize is the size of the per-connection NATS message buffer.
+	// 0 (or unset) uses the default.
+	// When the buffer fills, the slow client is disconnected to avoid drops.
+	// Default: 64.
+	ClientBufferSize int `json:"client_buffer_size,omitempty"`
+
+	// DispatchTimeout caps how long the NATS callback waits to signal a blocked
+	// SSE client after its queue is full. Value is in seconds; 0 disables it.
+	DispatchTimeout int `json:"dispatch_timeout,omitempty"`
+
+	// WriteTimeout caps each SSE frame write/flush. Value is in seconds; 0
+	// leaves write deadlines to the surrounding HTTP server configuration.
+	WriteTimeout int `json:"write_timeout,omitempty"`
+
+	// ReplayMaxMessages caps replay delivery per reconnect. 0 disables the cap.
+	ReplayMaxMessages int `json:"replay_max_messages,omitempty"`
+
+	// ReplayWindow caps replay by time in seconds. 0 preserves retained replay.
+	ReplayWindow int `json:"replay_window,omitempty"`
+
+	// NatsTLSCA is a path to a PEM-encoded CA bundle used to verify the
+	// NATS server certificate.
+	NatsTLSCA string `json:"nats_tls_ca,omitempty"`
+
+	// NatsTLSCert is a path to a PEM-encoded client certificate for mTLS.
+	// Must be paired with NatsTLSKey.
+	NatsTLSCert string `json:"nats_tls_cert,omitempty"`
+
+	// NatsTLSKey is a path to the PEM-encoded private key for the client
+	// certificate. Must be paired with NatsTLSCert.
+	NatsTLSKey string `json:"nats_tls_key,omitempty"`
+
+	// NatsTLSInsecureSkipVerify disables NATS server certificate verification.
+	// Use only for development against self-signed certs.
+	NatsTLSInsecureSkipVerify bool `json:"nats_tls_insecure_skip_verify,omitempty"`
+
+	// conn is opened during Provision and shared across HTTP requests.
 	conn *nats.Conn
 
-	// js is a JetStream context derived from conn. It provides
-	// Subscribe() and StreamInfo() used by ServeHTTP and Provision.
+	// js is the JetStream context derived from conn.
 	js nats.JetStreamContext
 
-	// logger is a structured logger scoped to this handler instance.
+	// logger is scoped to this handler instance.
 	logger *zap.Logger
 
-	// mu protects conn and js. Request goroutines read-lock (RLock);
-	// Provision and Cleanup write-lock (Lock).
+	// mu protects conn, js, and shutdown.
 	mu sync.RWMutex
+
+	// connCount enforces MaxConnections.
+	connCount int64
+
+	// shutdown wakes in-flight SSE handlers during Cleanup.
+	shutdown chan struct{}
 }
 
 // messageEventPayload is the JSON structure sent inside the "data:" field of
@@ -141,7 +190,7 @@ type Handler struct {
 //	data: {"topic":"orders","payload":{"id":1},"time":"2024-01-01T12:00:00Z"}
 type messageEventPayload struct {
 	Topic   string      `json:"topic"`   // Topic name (without the prefix)
-	Payload interface{} `json:"payload"` // Original message body; parsed as JSON when valid
+	Payload interface{} `json:"payload"` // Original message body; valid JSON is embedded without numeric coercion
 	Time    string      `json:"time"`    // ISO 8601 timestamp (from JetStream metadata when available)
 }
 

@@ -4,7 +4,12 @@
 }
 
 :8080 {
-	route /events* {
+	handle /health {
+		respond 200
+	}
+
+	handle /events* {
+		uri strip_prefix /events
 		nuts {
 			nats_url {$NATS_URL:nats://localhost:4222}
 			stream_name {$STREAM_NAME:EVENTS}
@@ -14,13 +19,13 @@
 		}
 	}
 
-	route /example* {
+	handle /example* {
 		root * /srv/example
 		uri strip_prefix /example
 		file_server browse
 	}
 
-	route /* {
+	handle {
 		nuts {
 			nats_url {$NATS_URL:nats://localhost:4222}
 			stream_name {$STREAM_NAME:EVENTS}
@@ -29,6 +34,4 @@
 			allowed_origins *
 		}
 	}
-
-	respond /health 200
 }

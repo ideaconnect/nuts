@@ -1,0 +1,53 @@
+# NUTS Roadmap
+
+This document outlines planned features for NUTS, organized into phases.
+Completed items are checked off; the rest are candidates for future work.
+
+See [MERCURE.md](MERCURE.md) for a short note on NUTS's relationship to
+Mercure.rocks, which inspired parts of the design.
+
+## Phase 1: Observability & Operations ✅
+
+No breaking changes, immediately useful for production deployments.
+
+- [x] **Prometheus metrics** — `nuts_*` counters and gauges registered via `promauto`, visible on Caddy's `/metrics` endpoint. Tracks active connections, messages delivered/dropped, slow-client disconnects, replay requests/fallbacks, subscription errors, and connections rejected by `max_connections`.
+- [x] **Health check endpoint** — The `health_path` directive (default `/healthz`) returns JSON with NATS connectivity and stream availability status (`200` healthy, `503` degraded).
+- [x] **Hub discovery (`Link` header)** — Optional `hub_url` directive injects a `Link: <url>; rel="nuts"` header on SSE responses for automatic hub detection by clients.
+- [x] **NATS TLS** — `nats_tls_ca`, `nats_tls_cert`, `nats_tls_key`, `nats_tls_insecure_skip_verify` Caddyfile directives for encrypted and mutually authenticated NATS connections.
+- [x] **Connection caps** — `max_connections` global cap returns `503` with `Retry-After` and increments `nuts_connections_rejected_total{reason}`.
+- [x] **Configurable CORS** — `allowed_headers` and `allowed_methods` directives so front-ends can send custom headers (e.g. `Authorization` for Phase 2).
+- [x] **Non-root container** — the published `idcttech/nuts` image runs as uid 10001.
+
+## Phase 2: Authorization & Access Control ✅
+
+Core security features. Prerequisite for private channels and subscription lifecycle.
+
+- [x] **Subscriber JWT auth** — Validate HMAC-signed JWTs on SSE connect with `subscriber_jwt_key`. Anonymous mode remains the default when the directive is omitted.
+- [x] **Private topics / per-topic access control** — JWT `subscribe` claim restricts which topics a client can subscribe to. Unauthorized subscriptions are rejected before JetStream subscription.
+- [x] **Cookie-based auth** — Extract JWT from `subscriber_jwt_cookie` for browser `EventSource` clients, which cannot set custom headers.
+
+## Phase 3: Subscription Lifecycle
+
+Depends on Phase 2 for authenticated subscriber identity.
+
+- [ ] **Subscription notifications** — Publish internal NATS messages when clients subscribe/unsubscribe (e.g. on subject `nuts.subscriptions.{topic}`). Include subscriber identity from JWT when available.
+- [ ] **Active subscriptions REST endpoint** — `GET /subscriptions` listing active SSE connections, their topics, connected-since timestamp, and subscriber identity. Optional topic filter: `GET /subscriptions/{topic}`. In-memory connection registry.
+
+## Phase 4: Publishing & Integration
+
+Broadens NUTS from a read-only bridge to a full event hub.
+
+- [ ] **HTTP POST publish endpoint** — `POST /publish` with topic and data fields (form or JSON). Publisher auth via JWT (separate key from subscriber). Publishes directly to NATS JetStream.
+
+## Phase 5: Advanced Features
+
+Lower priority, can be tackled independently.
+
+- [x] **Dispatch/write timeouts** — Configurable `dispatch_timeout` and `write_timeout` directives to cap how long NUTS waits on slow operations.
+- [ ] **URI template topic selectors** — RFC 6570 `{id}` / `{+path}` wildcard matching for topic subscriptions.
+
+## Out of Scope (for now)
+
+- **End-to-end encryption** — Low demand relative to implementation effort.
+- **Web UI / demo mode** — The `example/` and `example_docker/` directories serve this purpose.
+- **Protocol-level client interoperability** — NUTS speaks plain SSE with `Last-Event-ID`; clients built for other SSE hubs may need minor adjustments (e.g. the optional `?last-id=` query form, `nuts_*` metric names, `rel="nuts"` on the `Link` header) rather than drop-in compatibility.
