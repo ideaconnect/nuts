@@ -487,6 +487,10 @@ Allowed filters use NATS-style tokens: exact topics such as `orders.created`,
 single-token wildcards such as `orders.*`, tail wildcards such as
 `tenant-a.>`, or `*` / `>` to allow every topic on that route. Missing,
 expired, badly signed, or unauthorized tokens are rejected before subscription.
+The `exp` and `nbf` time claims are optional; when present they are enforced.
+For public or browser-facing routes, include `exp` and keep tokens compact:
+NUTS rejects compact JWTs over 8 KiB, decoded JWT segments over 6 KiB, and
+`subscribe` claims with more than 128 filters.
 
 Example:
 

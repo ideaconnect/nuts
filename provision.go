@@ -306,6 +306,9 @@ func (h *Handler) validateRequiredFields() error {
 // validateConfigValues checks semantic constraints that must be identical
 // whether config was supplied through a Caddyfile or Caddy's JSON API.
 func (h *Handler) validateConfigValues() error {
+	if h.MaxReconnects != nil && *h.MaxReconnects < -1 {
+		return fmt.Errorf("max_reconnects must be >= -1")
+	}
 	if h.MaxConnections < 0 {
 		return fmt.Errorf("max_connections must be >= 0")
 	}
@@ -361,7 +364,7 @@ func (h *Handler) Validate() error {
 		}
 	}
 
-	if h.logger != nil && (h.NatsToken != "" || (h.NatsUser != "" && h.NatsPassword != "")) {
+	if h.logger != nil && (h.NatsCredentials != "" || h.NatsToken != "" || (h.NatsUser != "" && h.NatsPassword != "")) {
 		if strings.HasPrefix(h.NatsURL, "nats://") {
 			h.logger.Warn("NATS credentials sent over plaintext nats:// URL; consider tls:// or nats_tls_* directives",
 				zap.String("nats_url", redactURL(h.NatsURL)))

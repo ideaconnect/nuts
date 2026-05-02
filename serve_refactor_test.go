@@ -145,6 +145,15 @@ func TestShouldSkipReplayWindowMessage(t *testing.T) {
 	}
 }
 
+func TestSubjectMatchesFilterRejectsEmptyValues(t *testing.T) {
+	if subjectMatchesFilter("", ">") {
+		t.Fatal("empty subject must not match bare wildcard")
+	}
+	if subjectMatchesFilter("orders.created", "") {
+		t.Fatal("non-empty subject must not match empty filter")
+	}
+}
+
 func TestHandler_PlanSubscriptionDetectsMultiTopicStreamMismatch(t *testing.T) {
 	h := &Handler{}
 	plan := streamPlan{

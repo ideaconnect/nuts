@@ -76,7 +76,10 @@ must include a `subscribe` claim. Supported filters are exact topic names,
 single-token wildcards such as `orders.*`, tail wildcards such as `tenant-a.>`,
 or `*` / `>` for all topics on the route. Missing, expired, badly signed, or
 unauthorized tokens are rejected before an ephemeral JetStream consumer is
-created.
+created. The `exp` and `nbf` time claims are optional; when present they are
+enforced. For public or browser-facing routes, issue short-lived tokens with
+`exp`. NUTS rejects compact JWTs over 8 KiB, decoded JWT segments over 6 KiB,
+and `subscribe` claims with more than 128 filters.
 
 ### Rate limits and replay bounds
 

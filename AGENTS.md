@@ -219,7 +219,7 @@ for sizing memory per connection are in
 
 ## Security boundaries
 
-Read [SECURITY.md](SECURITY.md) before changing anything in `auth.go`,
+Read [docs/SECURITY.md](docs/SECURITY.md) before changing anything in `auth.go`,
 `provision.go`, or the CORS path of `serve.go`. Key invariants:
 
 - NATS auth directives (`nats_credentials`, `nats_token`,

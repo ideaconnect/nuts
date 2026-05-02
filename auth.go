@@ -36,6 +36,12 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	maxSubscriberJWTLen               = 8192
+	maxSubscriberJWTDecodedSegmentLen = 6144
+	maxSubscribeClaimFilters          = 128
+)
+
 // subscriberClaims is the verified, decoded form of a subscriber JWT — only
 // the fields NUTS actually uses. Subject is purely informational (logged on
 // authorization failures); Subscribe drives the per-topic decision in
@@ -136,6 +142,10 @@ func (h *Handler) extractSubscriberToken(r *http.Request) (string, error) {
 // `now` is injected so tests can verify exp/nbf boundary behavior without
 // sleeping. Production callers pass time.Now().
 func verifySubscriberJWT(token string, key []byte, now time.Time) (subscriberClaims, error) {
+	if len(token) > maxSubscriberJWTLen {
+		return subscriberClaims{}, errors.New("token exceeds maximum length")
+	}
+
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return subscriberClaims{}, errors.New("token must have three segments")
@@ -199,7 +209,14 @@ func verifySubscriberJWT(token string, key []byte, now time.Time) (subscriberCla
 // decodeJWTSegment decodes one base64url segment of a JWT. JWT uses the
 // URL-safe alphabet without padding (RawURLEncoding), not standard base64.
 func decodeJWTSegment(segment string) ([]byte, error) {
-	return base64.RawURLEncoding.DecodeString(segment)
+	decoded, err := base64.RawURLEncoding.DecodeString(segment)
+	if err != nil {
+		return nil, err
+	}
+	if len(decoded) > maxSubscriberJWTDecodedSegmentLen {
+		return nil, errors.New("JWT segment exceeds maximum decoded length")
+	}
+	return decoded, nil
 }
 
 // jwtHMACHash returns the hash constructor for a supported JWT algorithm.
@@ -286,6 +303,9 @@ func parseSubscribeClaim(value interface{}) ([]string, error) {
 	}
 	if len(filters) == 0 {
 		return nil, errors.New("subscribe claim must not be empty")
+	}
+	if len(filters) > maxSubscribeClaimFilters {
+		return nil, fmt.Errorf("subscribe claim has too many entries; maximum is %d", maxSubscribeClaimFilters)
 	}
 
 	for _, filter := range filters {

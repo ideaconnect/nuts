@@ -1213,6 +1213,9 @@ func subjectAllowedByStream(subject string, streamSubjects []string) bool {
 // A bare ">" matches any non-empty subject; an empty subject matches no
 // filter.
 func subjectMatchesFilter(subject, filter string) bool {
+	if subject == "" || filter == "" {
+		return false
+	}
 	subjectTokens := strings.Split(subject, ".")
 	filterTokens := strings.Split(filter, ".")
 	for idx, filterToken := range filterTokens {

@@ -54,10 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diagrams, a complete configuration matrix, troubleshooting guide, production
   deployment examples, a CI-aligned contribution checklist, and operator release
   note guidance.
-- `CONTRIBUTING.md`, `SECURITY.md`, and this `CHANGELOG.md`.
+- `CONTRIBUTING.md`, `docs/SECURITY.md`, and this `CHANGELOG.md`.
 - Docker image now runs as non-root user `nuts` (uid 10001).
 
 ### Changed
+- Subscriber JWT verification now rejects compact tokens over 8 KiB, decoded
+  JWT segments over 6 KiB, and `subscribe` claims with more than 128 filters.
+- `Validate()` now rejects `max_reconnects` values below `-1`; `-1` remains
+  the unlimited sentinel and `0` still means no reconnects.
+- `Validate()` now warns when `nats_credentials` is used over plaintext
+  `nats://`, matching the existing warnings for token and user/password auth.
 - `Cleanup()` now signals every in-flight SSE handler via a handler-scoped
   `shutdown` channel, so on Caddy reload or shutdown active clients return
   within milliseconds instead of waiting up to `heartbeat_interval` seconds

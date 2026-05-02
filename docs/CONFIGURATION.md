@@ -51,13 +51,18 @@ Probe paths match exactly or by suffix within the configured route. For example,
 with a public `/events` route that strips its prefix, `/events/readyz` reaches
 NUTS as `/readyz`.
 
+Subscriber JWT `exp` and `nbf` time claims are optional; when present they are
+enforced. For public or browser-facing routes, issue short-lived tokens with
+`exp`. Compact JWTs over 8 KiB, decoded JWT segments over 6 KiB, and
+`subscribe` claims with more than 128 filters are rejected.
+
 ## Streaming And Replay Tuning
 
 | Caddyfile directive | JSON field | Default | Valid values | Notes |
 | --- | --- | --- | --- | --- |
 | `heartbeat_interval <seconds>` | `heartbeat_interval` | `30` | Positive integer; `0` or negative uses default | Sends SSE comments to keep idle proxies and clients alive. |
 | `reconnect_wait <seconds>` | `reconnect_wait` | `2` | Positive integer; `0` or negative uses default | Delay between NATS reconnect attempts. |
-| `max_reconnects <count>` | `max_reconnects` | `-1` when omitted | Integer; `0` means no reconnects, `-1` means unlimited | JSON uses a pointer internally so explicit `0` is preserved. |
+| `max_reconnects <count>` | `max_reconnects` | `-1` when omitted | Integer `>= -1`; `0` means no reconnects, `-1` means unlimited | JSON uses a pointer internally so explicit `0` is preserved. |
 | `max_event_size <bytes>` | `max_event_size` | `1048576` when `0` or omitted | Positive cap, `0` for default, negative for unlimited | Caps the formatted SSE frame. Oversized events are dropped and counted. |
 | `max_connections <count>` | `max_connections` | `0` | Integer `>= 0` | `0` disables the cap. Rejected clients receive `503` and `Retry-After: 5`. |
 | `max_topics_per_subscription <count>` | `max_topics_per_subscription` | `32` when `0` or omitted | Positive cap, `0` for default, negative for unlimited | Caps the distinct `?topic=` filters allowed per SSE request after deduplication. Requests over the cap receive `400`. |

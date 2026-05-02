@@ -9,7 +9,7 @@ This plan turns the current quality review into an execution checklist. It is in
 - Code quality: 8.0/10.
 - Tests quality: 8.3/10.
 - Current strengths: SSE streaming, JetStream replay, multi-topic support, bounded payload handling, slow-client disconnects, health checks, Prometheus metrics, Docker packaging, broad tests, and solid documentation.
-- Current gaps: lifecycle validation ordering, dense request handling, timing-sensitive functional tests, limited stress/load proof, and subscriber authorization being left entirely to deployment policy.
+- Current gaps: the earlier P0/P1 burn-list items have been addressed; remaining work is optional product polish plus any new review findings tracked in the changelog.
 
 ## Status Legend
 

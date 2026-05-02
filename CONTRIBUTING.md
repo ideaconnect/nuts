@@ -96,4 +96,4 @@ and signing policy.
 ## Reporting issues
 
 - Bugs: open a GitHub issue with reproduction steps and your Caddy/NUTS version.
-- Security: **do not open a public issue**. See [SECURITY.md](SECURITY.md).
+- Security: **do not open a public issue**. See [docs/SECURITY.md](docs/SECURITY.md).

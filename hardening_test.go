@@ -377,15 +377,21 @@ func TestHandler_SubscriberJWT_RejectsExpiredToken(t *testing.T) {
 func TestSubscriberJWTVerifier_RejectsInvalidTokens(t *testing.T) {
 	secret := "test-secret"
 	now := time.Now()
+	tooManyFilters := make([]string, maxSubscribeClaimFilters+1)
+	for i := range tooManyFilters {
+		tooManyFilters[i] = "orders"
+	}
 	tests := []struct {
 		name  string
 		token string
 	}{
+		{name: "oversized token", token: strings.Repeat("a", maxSubscriberJWTLen+1)},
 		{name: "malformed", token: "one.two"},
 		{name: "unsupported algorithm", token: unsignedTestJWT(t, "none", map[string]interface{}{"subscribe": "*"})},
 		{name: "bad signature", token: signTestSubscriberJWT(t, "wrong-secret", map[string]interface{}{"subscribe": "*", "exp": now.Add(time.Hour).Unix()})},
 		{name: "missing subscribe", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"exp": now.Add(time.Hour).Unix()})},
 		{name: "empty subscribe", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": []string{}, "exp": now.Add(time.Hour).Unix()})},
+		{name: "too many subscribe entries", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": tooManyFilters, "exp": now.Add(time.Hour).Unix()})},
 		{name: "invalid subscribe filter", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": "orders/created", "exp": now.Add(time.Hour).Unix()})},
 		{name: "not before future", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": "*", "nbf": now.Add(time.Hour).Unix()})},
 	}
@@ -623,6 +629,22 @@ func TestHandler_Validate_WarnsCleartextAuth(t *testing.T) {
 	}
 }
 
+func TestHandler_Validate_WarnsCleartextCredentialsFile(t *testing.T) {
+	core, obs := observer.New(zap.WarnLevel)
+	h := &Handler{
+		NatsURL:         "nats://nats.example.com:4222",
+		StreamName:      "EVENTS",
+		NatsCredentials: "/etc/nats/user.creds",
+		logger:          zap.New(core),
+	}
+	if err := h.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !hasLogContaining(obs, "plaintext") {
+		t.Errorf("expected cleartext credentials warning, entries=%+v", obs.All())
+	}
+}
+
 func TestHandler_Validate_WarnsInsecureSkipVerify(t *testing.T) {
 	core, obs := observer.New(zap.WarnLevel)
 	h := &Handler{
@@ -782,6 +804,12 @@ func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
 		validateErr bool
 	}{
 		{
+			name:        "max reconnects below unlimited sentinel",
+			line:        "max_reconnects -2",
+			wantErr:     "max_reconnects",
+			validateErr: true,
+		},
+		{
 			name:    "negative max connections",
 			line:    "max_connections -1",
 			wantErr: "max_connections",
@@ -883,6 +911,11 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 		wantErr string
 	}{
 		{
+			name:    "max reconnects below unlimited sentinel",
+			mutate:  func(h *Handler) { h.MaxReconnects = intPtr(-2) },
+			wantErr: "max_reconnects",
+		},
+		{
 			name:    "negative max connections",
 			mutate:  func(h *Handler) { h.MaxConnections = -1 },
 			wantErr: "max_connections",
@@ -956,6 +989,11 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 		fragment string
 		wantErr  string
 	}{
+		{
+			name:     "max reconnects below unlimited sentinel",
+			fragment: `"max_reconnects": -2`,
+			wantErr:  "max_reconnects",
+		},
 		{
 			name:     "negative max connections",
 			fragment: `"max_connections": -1`,
