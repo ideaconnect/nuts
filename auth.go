@@ -113,7 +113,7 @@ func (h *Handler) extractSubscriberToken(r *http.Request) (string, error) {
 		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") && parts[1] != "" {
 			return parts[1], nil
 		}
-		return "", errors.New("Invalid Authorization header")
+		return "", errors.New("invalid Authorization header")
 	}
 
 	if h.SubscriberJWTCookie != "" {
@@ -123,7 +123,7 @@ func (h *Handler) extractSubscriberToken(r *http.Request) (string, error) {
 		}
 	}
 
-	return "", errors.New("Subscriber token required")
+	return "", errors.New("subscriber token required")
 }
 
 // verifySubscriberJWT parses and verifies a compact JWT against the

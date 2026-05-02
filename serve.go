@@ -606,12 +606,10 @@ func (h *Handler) readStreamSnapshot(js nats.JetStreamContext, plan streamPlan) 
 				}
 			}
 			return snapshot
-		} else {
-			if h.logger != nil {
-				h.logger.Debug("failed to read StreamInfo for request pre-check",
-					appendStreamLogFields(plan, zap.Error(infoErr))...,
-				)
-			}
+		} else if h.logger != nil {
+			h.logger.Debug("failed to read StreamInfo for request pre-check",
+				appendStreamLogFields(plan, zap.Error(infoErr))...,
+			)
 		}
 	}
 	return streamInfoSnapshot{}
