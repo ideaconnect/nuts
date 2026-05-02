@@ -262,11 +262,3 @@ jobs:
           $TAGS
           EOF
           cosign sign --yes $images
-
-      - name: Update Docker Hub description
-        uses: peter-evans/dockerhub-description@v5
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: idcttech/nuts
-          readme-filepath: ./DOCKERHUB_README.md
