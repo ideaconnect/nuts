@@ -60,6 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docker image now runs as non-root user `nuts` (uid 10001).
 
 ### Changed
+- Updated vulnerable indirect dependencies embedded in the Caddy binary:
+  `github.com/go-jose/go-jose/v3` to `v3.0.5`,
+  `github.com/go-jose/go-jose/v4` to `v4.1.4`, `github.com/jackc/pgx/v5`
+  to `v5.9.0`, and `go.opentelemetry.io/otel/sdk` to `v1.43.0`.
 - Subscriber JWT verification now rejects compact tokens over 8 KiB, decoded
   JWT segments over 6 KiB, and `subscribe` claims with more than 128 filters.
 - `Validate()` now rejects `max_reconnects` values below `-1`; `-1` remains
