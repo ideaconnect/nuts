@@ -8,6 +8,14 @@
 A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Events (SSE), inspired by [Mercure.rocks](https://mercure.rocks).
 
 [![codecov](https://codecov.io/gh/ideaconnect/nuts/graph/badge.svg?token=Z09PBL02A6)](https://codecov.io/gh/ideaconnect/nuts)
+[![CI](https://github.com/ideaconnect/nuts/actions/workflows/ci.yml/badge.svg)](https://github.com/ideaconnect/nuts/actions/workflows/ci.yml)
+[![Go version](https://img.shields.io/github/go-mod/go-version/ideaconnect/nuts)](go.mod)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ideaconnect/nuts)](https://goreportcard.com/report/github.com/ideaconnect/nuts)
+[![Latest release](https://img.shields.io/github/v/release/ideaconnect/nuts)](https://github.com/ideaconnect/nuts/releases/latest)
+[![Docker Pulls](https://img.shields.io/docker/pulls/idcttech/nuts)](https://hub.docker.com/r/idcttech/nuts)
+[![License](https://img.shields.io/badge/license-BSD%204--Clause-blue.svg)](LICENSE)
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/ideaconnect?style=flat&logo=github)](https://github.com/sponsors/ideaconnect)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/idct)
 
 ## Features
 
