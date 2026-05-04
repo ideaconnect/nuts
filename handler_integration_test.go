@@ -1,7 +1,5 @@
-// Tests that close coverage gaps identified against the README Features list:
-// per-metric counter/gauge assertions, buildTLSConfig, explicit heartbeat
-// framing, topic-prefix translation, NATS reconnect → SSE still works, and
-// JetStream persistence across handler lifetimes.
+// Integration-style handler tests for runtime behavior that depends on
+// embedded NATS, JetStream state, metrics, TLS material, or SSE streaming.
 package nuts
 
 import (

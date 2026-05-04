@@ -71,9 +71,11 @@ Tests live alongside the source:
 | --- | --- |
 | [nats_test.go](nats_test.go) | Core unit and integration tests against an embedded NATS server. |
 | [hardening_test.go](hardening_test.go) | Security hardening tests (CORS, JWT, oversized payloads, max connections, timeouts, TLS, replay caps). |
-| [coverage_test.go](coverage_test.go), [pure_funcs_coverage_test.go](pure_funcs_coverage_test.go) | Targeted coverage closers. |
+| [handler_integration_test.go](handler_integration_test.go) | Runtime integration tests for metrics, TLS config, heartbeat, topic prefixing, reconnect, persistence, and multi-topic subscription paths. |
+| [auth_test.go](auth_test.go) | Subscriber JWT parsing, verification, token extraction, and topic-filter validation tests. |
+| [helpers_test.go](helpers_test.go) | Helper edge-case tests for cookie names and SSE write behavior. |
 | [performance_test.go](performance_test.go) | `TestPerformance_*` confidence tests and benchmarks. |
-| [serve_refactor_test.go](serve_refactor_test.go) | Pure planning/formatting unit tests without live NATS. |
+| [serve_test.go](serve_test.go) | Request parsing, replay planning, formatting, and stream helper unit tests without live NATS. |
 | [functional_test/](functional_test/) | [Godog](https://github.com/cucumber/godog) BDD tests against a real Docker Compose stack. |
 | [features/](features/) | Gherkin `.feature` files driving the Godog suite. |
 

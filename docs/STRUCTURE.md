@@ -74,6 +74,22 @@ Core unit and integration tests. Uses an embedded NATS server with JetStream to 
 
 Focused tests for security hardening and related correctness items: configurable CORS headers/methods, subscriber JWT authorization, oversized-raw-payload drop, `max_connections` rejection + metric increment, dispatch/write timeout behavior, cleartext-auth and insecure-TLS warnings, TLS cert/key pairing, `MaxReconnects=0` vs default, integer-directive junk-suffix rejection, custom `health_path`, distinct `live_path` / `ready_path` probe behavior, negative `MaxEventSize` disabling the limit, `replay_max_messages` capping retained replay, `replay_window` switching old cursors to `StartTime`, pre-flight config rejection, and `Cleanup()` waking in-flight SSE handlers.
 
+### handler_integration_test.go
+
+Runtime integration tests for handler behavior that depends on embedded NATS, JetStream state, metrics, TLS material, SSE heartbeat framing, topic-prefix translation, NATS reconnects, retained-message persistence, and multi-topic subscription paths.
+
+### auth_test.go
+
+Unit tests for JWT parsing and validation, subscriber token extraction, and topic-filter validation.
+
+### helpers_test.go
+
+Unit tests for helper edge cases such as cookie-name validation and SSE write deadline behavior.
+
+### serve_test.go
+
+Unit tests for request parsing, replay planning, message formatting, replay cap accounting, subject-filter helpers, readiness responses, and other `serve.go` pure helper behavior.
+
 ### functional_test/main_test.go & steps_test.go
 
 BDD functional tests driven by [Godog](https://github.com/cucumber/godog). Scenarios in `features/*.feature` are executed against a real Docker Compose stack (NATS + Caddy with NUTS).

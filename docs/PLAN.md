@@ -29,7 +29,7 @@ This plan turns the current quality review into an execution checklist. It is in
 - [x] P0: Make fallback replay behavior explicit in tests for both below-retention pre-checks and subscribe-time sequence errors.
 - [x] P0: Verify cleanup behavior after every early return path that creates subscriptions or reserves a connection slot.
 
-## P1: Request-Handling Refactor
+## P1: Request-Handling Structure
 
 - [x] P1: Split `ServeHTTP` into smaller units: health/preflight handling, request parsing, replay cursor parsing, subscription planning, subscription execution, SSE event formatting, and the stream loop.
 - [x] P1: Introduce a small request/stream plan type that captures topics, full subjects, replay mode, start sequence, and fallback strategy.
