@@ -7,6 +7,8 @@
 
 A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Events (SSE), inspired by [Mercure.rocks](https://mercure.rocks).
 
+[![codecov](https://codecov.io/gh/ideaconnect/nuts/graph/badge.svg?token=Z09PBL02A6)](https://codecov.io/gh/ideaconnect/nuts)
+
 ## Features
 
 - **Real-time Updates**: Stream NATS messages to web browsers via SSE/EventSource

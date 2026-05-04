@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -193,35 +194,73 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				nats_url nats://localhost:4222
 				stream_name EVENTS
 				topic_prefix events.
+				nats_tls_ca /path/to/ca.pem
+				nats_tls_cert /path/to/client.crt
+				nats_tls_key /path/to/client.key
+				nats_tls_insecure_skip_verify true
 				heartbeat_interval 15
 				reconnect_wait 5
 				max_reconnects 10
 				max_event_size 524288
+				max_connections 100
+				max_topics_per_subscription 8
+				client_buffer_size 128
 				dispatch_timeout 2
 				write_timeout 3
+				replay_max_messages 25
+				replay_window 300
+				health_path /health
 				live_path /live
 				ready_path /ready
 				hub_url https://example.com/events
 				subscriber_jwt_key secret-key
 				subscriber_jwt_cookie nuts_session
 				allowed_origins https://example.com https://other.com
+				allowed_headers Cache-Control Last-Event-ID Authorization
+				allowed_methods GET OPTIONS
 			}`,
 			expected: &Handler{
-				NatsURL:             "nats://localhost:4222",
-				StreamName:          "EVENTS",
-				TopicPrefix:         "events.",
-				HeartbeatInterval:   15,
-				ReconnectWait:       5,
-				MaxReconnects:       intPtr(10),
-				MaxEventSize:        524288,
-				DispatchTimeout:     2,
-				WriteTimeout:        3,
-				LivePath:            "/live",
-				ReadyPath:           "/ready",
-				HubURL:              "https://example.com/events",
-				SubscriberJWTKey:    "secret-key",
-				SubscriberJWTCookie: "nuts_session",
-				AllowedOrigins:      []string{"https://example.com", "https://other.com"},
+				NatsURL:                   "nats://localhost:4222",
+				StreamName:                "EVENTS",
+				TopicPrefix:               "events.",
+				NatsTLSCA:                 "/path/to/ca.pem",
+				NatsTLSCert:               "/path/to/client.crt",
+				NatsTLSKey:                "/path/to/client.key",
+				NatsTLSInsecureSkipVerify: true,
+				HeartbeatInterval:         15,
+				ReconnectWait:             5,
+				MaxReconnects:             intPtr(10),
+				MaxEventSize:              524288,
+				MaxConnections:            100,
+				MaxTopicsPerSubscription:  8,
+				ClientBufferSize:          128,
+				DispatchTimeout:           2,
+				WriteTimeout:              3,
+				ReplayMaxMessages:         25,
+				ReplayWindow:              300,
+				HealthPath:                "/health",
+				LivePath:                  "/live",
+				ReadyPath:                 "/ready",
+				HubURL:                    "https://example.com/events",
+				SubscriberJWTKey:          "secret-key",
+				SubscriberJWTCookie:       "nuts_session",
+				AllowedOrigins:            []string{"https://example.com", "https://other.com"},
+				AllowedHeaders:            []string{"Cache-Control", "Last-Event-ID", "Authorization"},
+				AllowedMethods:            []string{"GET", "OPTIONS"},
+			},
+			expectError: false,
+		},
+		{
+			name: "bare insecure tls skip verify",
+			caddyfile: `nuts {
+				nats_url nats://localhost:4222
+				stream_name EVENTS
+				nats_tls_insecure_skip_verify
+			}`,
+			expected: &Handler{
+				NatsURL:                   "nats://localhost:4222",
+				StreamName:                "EVENTS",
+				NatsTLSInsecureSkipVerify: true,
 			},
 			expectError: false,
 		},
@@ -332,6 +371,76 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 			expectError: true,
 		},
 		{
+			name: "allowed_headers requires at least one value",
+			caddyfile: `nuts {
+				nats_url nats://localhost:4222
+				stream_name EVENTS
+				allowed_headers
+			}`,
+			expected:    nil,
+			expectError: true,
+		},
+		{
+			name: "allowed_methods requires at least one value",
+			caddyfile: `nuts {
+				nats_url nats://localhost:4222
+				stream_name EVENTS
+				allowed_methods
+			}`,
+			expected:    nil,
+			expectError: true,
+		},
+		{
+			name: "invalid nats_tls_insecure_skip_verify",
+			caddyfile: `nuts {
+				nats_url nats://localhost:4222
+				stream_name EVENTS
+				nats_tls_insecure_skip_verify maybe
+			}`,
+			expected:    nil,
+			expectError: true,
+		},
+		{
+			name: "missing nats_tls_ca argument",
+			caddyfile: `nuts {
+				nats_url nats://localhost:4222
+				stream_name EVENTS
+				nats_tls_ca
+			}`,
+			expected:    nil,
+			expectError: true,
+		},
+		{
+			name: "missing nats_tls_cert argument",
+			caddyfile: `nuts {
+				nats_url nats://localhost:4222
+				stream_name EVENTS
+				nats_tls_cert
+			}`,
+			expected:    nil,
+			expectError: true,
+		},
+		{
+			name: "missing nats_tls_key argument",
+			caddyfile: `nuts {
+				nats_url nats://localhost:4222
+				stream_name EVENTS
+				nats_tls_key
+			}`,
+			expected:    nil,
+			expectError: true,
+		},
+		{
+			name: "invalid max_topics_per_subscription",
+			caddyfile: `nuts {
+				nats_url nats://localhost:4222
+				stream_name EVENTS
+				max_topics_per_subscription invalid
+			}`,
+			expected:    nil,
+			expectError: true,
+		},
+		{
 			name: "unrecognized option",
 			caddyfile: `nuts {
 				nats_url nats://localhost:4222
@@ -405,14 +514,44 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 			if h.NatsCredentials != tt.expected.NatsCredentials {
 				t.Errorf("NatsCredentials: expected %q, got %q", tt.expected.NatsCredentials, h.NatsCredentials)
 			}
+			if h.NatsTLSCA != tt.expected.NatsTLSCA {
+				t.Errorf("NatsTLSCA: expected %q, got %q", tt.expected.NatsTLSCA, h.NatsTLSCA)
+			}
+			if h.NatsTLSCert != tt.expected.NatsTLSCert {
+				t.Errorf("NatsTLSCert: expected %q, got %q", tt.expected.NatsTLSCert, h.NatsTLSCert)
+			}
+			if h.NatsTLSKey != tt.expected.NatsTLSKey {
+				t.Errorf("NatsTLSKey: expected %q, got %q", tt.expected.NatsTLSKey, h.NatsTLSKey)
+			}
+			if h.NatsTLSInsecureSkipVerify != tt.expected.NatsTLSInsecureSkipVerify {
+				t.Errorf("NatsTLSInsecureSkipVerify: expected %v, got %v", tt.expected.NatsTLSInsecureSkipVerify, h.NatsTLSInsecureSkipVerify)
+			}
 			if h.MaxEventSize != tt.expected.MaxEventSize {
 				t.Errorf("MaxEventSize: expected %d, got %d", tt.expected.MaxEventSize, h.MaxEventSize)
+			}
+			if h.MaxConnections != tt.expected.MaxConnections {
+				t.Errorf("MaxConnections: expected %d, got %d", tt.expected.MaxConnections, h.MaxConnections)
+			}
+			if h.MaxTopicsPerSubscription != tt.expected.MaxTopicsPerSubscription {
+				t.Errorf("MaxTopicsPerSubscription: expected %d, got %d", tt.expected.MaxTopicsPerSubscription, h.MaxTopicsPerSubscription)
+			}
+			if h.ClientBufferSize != tt.expected.ClientBufferSize {
+				t.Errorf("ClientBufferSize: expected %d, got %d", tt.expected.ClientBufferSize, h.ClientBufferSize)
 			}
 			if h.DispatchTimeout != tt.expected.DispatchTimeout {
 				t.Errorf("DispatchTimeout: expected %d, got %d", tt.expected.DispatchTimeout, h.DispatchTimeout)
 			}
 			if h.WriteTimeout != tt.expected.WriteTimeout {
 				t.Errorf("WriteTimeout: expected %d, got %d", tt.expected.WriteTimeout, h.WriteTimeout)
+			}
+			if h.ReplayMaxMessages != tt.expected.ReplayMaxMessages {
+				t.Errorf("ReplayMaxMessages: expected %d, got %d", tt.expected.ReplayMaxMessages, h.ReplayMaxMessages)
+			}
+			if h.ReplayWindow != tt.expected.ReplayWindow {
+				t.Errorf("ReplayWindow: expected %d, got %d", tt.expected.ReplayWindow, h.ReplayWindow)
+			}
+			if h.HealthPath != tt.expected.HealthPath {
+				t.Errorf("HealthPath: expected %q, got %q", tt.expected.HealthPath, h.HealthPath)
 			}
 			if h.HubURL != tt.expected.HubURL {
 				t.Errorf("HubURL: expected %q, got %q", tt.expected.HubURL, h.HubURL)
@@ -438,6 +577,12 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 						t.Errorf("AllowedOrigins[%d]: expected %q, got %q", i, origin, h.AllowedOrigins[i])
 					}
 				}
+			}
+			if len(tt.expected.AllowedHeaders) > 0 && !reflect.DeepEqual(h.AllowedHeaders, tt.expected.AllowedHeaders) {
+				t.Errorf("AllowedHeaders: expected %#v, got %#v", tt.expected.AllowedHeaders, h.AllowedHeaders)
+			}
+			if len(tt.expected.AllowedMethods) > 0 && !reflect.DeepEqual(h.AllowedMethods, tt.expected.AllowedMethods) {
+				t.Errorf("AllowedMethods: expected %#v, got %#v", tt.expected.AllowedMethods, h.AllowedMethods)
 			}
 		})
 	}
@@ -1315,6 +1460,16 @@ func TestCommonSubjectFilter(t *testing.T) {
 			subjects: []string{"events.alpha.one", "events.alpha.two"},
 			expect:   "events.alpha.>",
 		},
+		{
+			name:     "empty input uses root wildcard",
+			subjects: nil,
+			expect:   ">",
+		},
+		{
+			name:     "shorter later subject backs up to root wildcard",
+			subjects: []string{"alpha.beta", "alpha"},
+			expect:   ">",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1338,6 +1493,8 @@ func TestParseMajorMinorVersion(t *testing.T) {
 		{version: "2.10.0-beta.1", major: 2, minor: 10, ok: true},
 		{version: "3.0.0+meta", major: 3, minor: 0, ok: true},
 		{version: "2", ok: false},
+		{version: "x.10", ok: false},
+		{version: "2.y", ok: false},
 		{version: "not-a-version", ok: false},
 	}
 

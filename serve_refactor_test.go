@@ -2,6 +2,7 @@ package nuts
 
 import (
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
@@ -145,12 +146,123 @@ func TestShouldSkipReplayWindowMessage(t *testing.T) {
 	}
 }
 
+func TestStreamPlan_RequestedMessageHandlerFiltersSubjects(t *testing.T) {
+	plan := streamPlan{RequestedSubjects: map[string]struct{}{
+		"events.allowed": {},
+	}}
+	var delivered []string
+	handler := plan.requestedMessageHandler(func(msg *nats.Msg) {
+		delivered = append(delivered, msg.Subject)
+	})
+
+	handler(&nats.Msg{Subject: "events.blocked"})
+	handler(&nats.Msg{Subject: "events.allowed"})
+
+	if !reflect.DeepEqual(delivered, []string{"events.allowed"}) {
+		t.Fatalf("delivered subjects = %#v, want only events.allowed", delivered)
+	}
+}
+
+func TestHandler_ShouldUseReplayWindowWithoutStartSequenceTime(t *testing.T) {
+	h := &Handler{ReplayWindow: 60}
+	replay := replayPlan{HasLastID: true, StartSequence: 10}
+	snapshot := streamInfoSnapshot{LastSeq: 20}
+
+	if !h.shouldUseReplayWindow(replay, snapshot) {
+		t.Fatal("missing start-sequence timestamp should force replay-window fallback")
+	}
+}
+
+func TestHandler_SubscriptionOptionsFallbackStartTimeDefaultsWindow(t *testing.T) {
+	h := &Handler{StreamName: "EVENTS", ReplayWindow: 60, logger: zap.NewNop()}
+	plan := streamPlan{
+		Topics:       []string{"alpha"},
+		FullSubjects: []string{"events.alpha"},
+		Replay: replayPlan{
+			HasLastID:     true,
+			Mode:          replayModeFallbackStartTime,
+			StartSequence: 10,
+		},
+	}
+
+	before := counterVal(t, metricsReplayFallbacks)
+	opts := h.subscriptionOptions(plan)
+	if len(opts) < 3 {
+		t.Fatalf("subscriptionOptions returned %d opts, want fallback StartTime option included", len(opts))
+	}
+	if got := counterVal(t, metricsReplayFallbacks); got <= before {
+		t.Fatalf("replay fallback metric did not increment: before=%v got=%v", before, got)
+	}
+}
+
+func TestHandler_CountsTowardReplayCapWithoutSequenceMetadata(t *testing.T) {
+	h := &Handler{ReplayMaxMessages: 2}
+	plan := streamPlan{Replay: replayPlan{HasLastID: true, CapSequence: 20}}
+
+	if !h.countsTowardReplayCap(plan, formattedMessageEvent{}) {
+		t.Fatal("message without stream sequence should conservatively count toward replay cap")
+	}
+}
+
+func TestHandler_RecordDroppedMessageLogsFormattedEvent(t *testing.T) {
+	h := &Handler{MaxEventSize: 64, logger: zap.NewNop()}
+	before := counterVal(t, metricsMessagesDropped)
+
+	h.recordDroppedMessage(formattedMessageEvent{
+		Subject:    "events.big",
+		DropReason: dropReasonFormattedSSEMessage,
+		DropSize:   128,
+	})
+
+	if got := counterVal(t, metricsMessagesDropped); got <= before {
+		t.Fatalf("messages dropped metric did not increment: before=%v got=%v", before, got)
+	}
+}
+
+func TestConnectedServerVersionNil(t *testing.T) {
+	if got := connectedServerVersion(nil); got != "" {
+		t.Fatalf("connectedServerVersion(nil) = %q, want empty string", got)
+	}
+}
+
+func TestHandler_ServeReadinessCheckReportsMissingRuntime(t *testing.T) {
+	h := &Handler{logger: zap.NewNop()}
+	rr := httptest.NewRecorder()
+
+	if err := h.serveReadinessCheck(rr); err != nil {
+		t.Fatalf("serveReadinessCheck: %v", err)
+	}
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+	for _, needle := range []string{`"status":"degraded"`, `"nats":"disconnected"`, `"stream":"unavailable"`} {
+		if !strings.Contains(rr.Body.String(), needle) {
+			t.Fatalf("readiness body missing %s: %s", needle, rr.Body.String())
+		}
+	}
+}
+
 func TestSubjectMatchesFilterRejectsEmptyValues(t *testing.T) {
 	if subjectMatchesFilter("", ">") {
 		t.Fatal("empty subject must not match bare wildcard")
 	}
 	if subjectMatchesFilter("orders.created", "") {
 		t.Fatal("non-empty subject must not match empty filter")
+	}
+	if subjectMatchesFilter("orders", "orders.created") {
+		t.Fatal("short subject must not match a longer exact filter")
+	}
+}
+
+func TestMatchesConfiguredPathNormalizesConfiguredPath(t *testing.T) {
+	if !matchesConfiguredPath("/events/live", "live", defaultLivePath) {
+		t.Fatal("configured path without leading slash should match as a path suffix")
+	}
+}
+
+func TestAllowedMethodsHeaderFallsBackWhenNoServedMethodsConfigured(t *testing.T) {
+	if got := allowedMethodsHeader([]string{"POST", "TRACE"}); got != "GET, OPTIONS" {
+		t.Fatalf("allowedMethodsHeader() = %q, want GET, OPTIONS", got)
 	}
 }
 
