@@ -1024,12 +1024,13 @@ func TestHandler_JetStreamPersistence_MessagesSurviveHandlerLifetime(t *testing.
 }
 
 // TestHandler_SubscribeToMultipleTopics_MultiFilterPath drives the modern
-// JetStream multi-filter branch. The embedded NATS server pinned in go.mod
-// is 2.8.4 and does not implement ConsumerFilterSubjects, so the SDK
-// surfaces "multiple consumer filter subjects not supported"; that's
-// exactly the contract we want — when useMultiFilter is true we hand the
-// full subject list to the SDK, and any server-side rejection is returned
-// to the caller verbatim rather than silently degrading.
+// JetStream multi-filter branch. On nats-server >= 2.10 the subscribe
+// succeeds and the ephemeral consumer is configured with FilterSubjects
+// populated. On older servers (pre-2.10) the SDK surfaces "multiple
+// consumer filter subjects not supported"; that's also a valid outcome
+// — when useMultiFilter is true we hand the full subject list to the
+// SDK and let any server-side rejection bubble up rather than silently
+// degrading.
 func TestHandler_SubscribeToMultipleTopics_MultiFilterPath(t *testing.T) {
 	h, ns, nc := newProvisionedHandler(t)
 	defer ns.Shutdown()
@@ -1046,10 +1047,11 @@ func TestHandler_SubscribeToMultipleTopics_MultiFilterPath(t *testing.T) {
 
 	sub, err := h.subscribeToMultipleTopics(h.js, plan, h.subscriptionOptions(plan), cb, true, "2.10.0")
 	if err == nil {
-		_ = sub.Unsubscribe()
-		// If the embedded server is upgraded past 2.10, prove we did go
-		// through the multi-filter branch by inspecting the consumer.
+		// Inspect the consumer before unsubscribing — Unsubscribe deletes
+		// the ephemeral consumer on the server, after which ConsumerInfo
+		// returns "consumer not found".
 		info, infoErr := sub.ConsumerInfo()
+		_ = sub.Unsubscribe()
 		if infoErr != nil {
 			t.Fatalf("ConsumerInfo: %v", infoErr)
 		}

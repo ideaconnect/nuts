@@ -1183,10 +1183,11 @@ func TestHandler_HealthPath_CustomSuffix(t *testing.T) {
 	createTestStream(t, nc, "EVENTS", []string{"events.>"})
 
 	h := &Handler{
-		NatsURL:    ns.ClientURL(),
-		StreamName: "EVENTS",
-		HealthPath: "/status",
-		logger:     zap.NewNop(),
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
+		HealthPath:        "/status",
+		HeartbeatInterval: 30,
+		logger:            zap.NewNop(),
 	}
 	if err := h.connectNATS(); err != nil {
 		t.Fatalf("connectNATS: %v", err)

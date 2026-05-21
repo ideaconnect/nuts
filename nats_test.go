@@ -1198,10 +1198,14 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 	})
 
 	t.Run("subscription failure returns 503 without connected event", func(t *testing.T) {
+		// Use a stream name that doesn't exist so JetStream.Subscribe fails
+		// synchronously with "stream not found". A topic that simply doesn't
+		// match an existing stream's subject filter is no longer a sync
+		// failure on nats-server >= 2.14 — the server creates a consumer
+		// that silently delivers nothing.
 		broken := &Handler{
 			NatsURL:           ns.ClientURL(),
-			StreamName:        "TEST_EVENTS",
-			TopicPrefix:       "missing.",
+			StreamName:        "NONEXISTENT_STREAM",
 			HeartbeatInterval: 30,
 			ReconnectWait:     2,
 			MaxReconnects:     intPtr(-1),
