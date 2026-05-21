@@ -154,6 +154,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of silently discarded.
 
 ### Security
+- Bumped `go` directive in `go.mod` from `1.26.2` to `1.26.3` to pull in
+  upstream Go standard-library fixes for reachable vulnerabilities flagged
+  by `govulncheck`:
+  - **GO-2026-4982** (`html/template`) — bypass of meta content URL
+    escaping leading to XSS.
+  - **GO-2026-4980** (`html/template`) — escaper bypass leading to XSS.
+  - **GO-2026-4971** (`net`) — `Dial`/`LookupPort` panic on NUL byte on
+    Windows.
+- Bumped `golang.org/x/net` from `v0.52.0` to `v0.53.0` to fix
+  **GO-2026-4918** — infinite loop in the HTTP/2 transport when given a
+  malformed `SETTINGS_MAX_FRAME_SIZE`. Vulnerability was reachable
+  transitively through `caddyhttp.HandlerFunc.ServeHTTP`. After this bump
+  `govulncheck ./...` reports no vulnerabilities.
 - `Validate()` warns when `nats://` is used with credentials (cleartext
   auth over the network) and when `nats_tls_insecure_skip_verify=true`.
 - JSON parse is skipped for oversized payloads to avoid unbounded
