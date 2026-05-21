@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `*nats.js` implementation satisfies it automatically.
 
 ### Security
+- Bumped `github.com/caddyserver/caddy/v2` from `v2.11.2` to `v2.11.3` to
+  fix **CVE-2026-45135** — unsafe Unicode handling in the FastCGI
+  `splitPos` logic that could allow execution of non-PHP files. Flagged
+  by Trivy on the 0.3.0 release image build (HIGH severity).
 - Bumped `go` directive in `go.mod` from `1.26.2` to `1.26.3` to pull in
   upstream Go standard-library fixes for reachable vulnerabilities flagged
   by `govulncheck`:
