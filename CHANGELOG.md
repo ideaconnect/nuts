@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-21
+
+### Added
+- Mutation testing pipeline using
+  [gremlins](https://github.com/go-gremlins/gremlins): pinned version via
+  the Makefile (`make mutate-tools` / `make mutate` /
+  `make mutate-pkg PKG=…`), [`.gremlins.yaml`](.gremlins.yaml) tuning the
+  mutator set and quality gates, and a weekly
+  [`mutation.yml`](.github/workflows/mutation.yml) GitHub Action that
+  uploads each run's JSON report as an artifact and fails the run when
+  the Mutation Score Indicator drops by more than 2 percentage points
+  versus the prior week. Per-PR enforcement for changes touching
+  `auth.go`, `helpers.go`, `handler.go`, `serve.go`, `caddyfile.go`, or
+  `provision.go` is documented in [`AGENTS.md`](AGENTS.md) and
+  [`CONTRIBUTING.md`](CONTRIBUTING.md) (run `make mutate-pkg`, report
+  MSI in the PR, kill / document / flag every new survivor).
+- Mutation-testing documentation under [`docs/mutation/`](docs/mutation/):
+  baseline, per-file MSI targets, accepted-equivalent survivors log,
+  uncovered-code notes, final report, and per-run logs. Current state:
+  test efficacy (MSI) 100%, mutation coverage 99.60%,
+  501 / 503 mutants killed with 2 documented accepted gaps.
+- [`.github/pull_request_template.md`](.github/pull_request_template.md)
+  reflecting the mutation-testing per-file requirement and the
+  refactor / doc-only / dependency-bump waiver path.
+
+### Changed
+- Refactored byte-class predicates in [`auth.go`](auth.go) and
+  [`helpers.go`](helpers.go) into named helpers
+  (`isAllowedFilterTokenByte`, `isAllowedTopicByte`,
+  `isAllowedCookieNameByte`) and extracted `serveStream`'s post-format
+  branch in [`serve.go`](serve.go) into `finalizeStreamedMessage`. Pure
+  refactors driven by mutation-kill targeting — no behaviour change.
+- `Handler.readStreamSnapshot` now takes a narrow
+  `streamMetadataReader` interface (`StreamInfo` + `GetMsg`) instead of
+  the full `nats.JetStreamContext`, so unit tests can stub metadata
+  reads independently of a live JetStream connection. The real
+  `*nats.js` implementation satisfies it automatically.
+
+### Security
+- Bumped `go` directive in `go.mod` from `1.26.2` to `1.26.3` to pull in
+  upstream Go standard-library fixes for reachable vulnerabilities flagged
+  by `govulncheck`:
+  - **GO-2026-4982** (`html/template`) — bypass of meta content URL
+    escaping leading to XSS.
+  - **GO-2026-4980** (`html/template`) — escaper bypass leading to XSS.
+  - **GO-2026-4971** (`net`) — `Dial`/`LookupPort` panic on NUL byte on
+    Windows.
+- Bumped `golang.org/x/net` from `v0.52.0` to `v0.53.0` to fix
+  **GO-2026-4918** — infinite loop in the HTTP/2 transport when given a
+  malformed `SETTINGS_MAX_FRAME_SIZE`. Vulnerability was reachable
+  transitively through `caddyhttp.HandlerFunc.ServeHTTP`. After this bump
+  `govulncheck ./...` reports no vulnerabilities.
+
+## [0.2.0] - 2026-05-05
+
 ### Added
 - New Caddyfile directive `health_path` (default `/healthz`) to customize
   the health-check endpoint.
@@ -154,19 +209,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of silently discarded.
 
 ### Security
-- Bumped `go` directive in `go.mod` from `1.26.2` to `1.26.3` to pull in
-  upstream Go standard-library fixes for reachable vulnerabilities flagged
-  by `govulncheck`:
-  - **GO-2026-4982** (`html/template`) — bypass of meta content URL
-    escaping leading to XSS.
-  - **GO-2026-4980** (`html/template`) — escaper bypass leading to XSS.
-  - **GO-2026-4971** (`net`) — `Dial`/`LookupPort` panic on NUL byte on
-    Windows.
-- Bumped `golang.org/x/net` from `v0.52.0` to `v0.53.0` to fix
-  **GO-2026-4918** — infinite loop in the HTTP/2 transport when given a
-  malformed `SETTINGS_MAX_FRAME_SIZE`. Vulnerability was reachable
-  transitively through `caddyhttp.HandlerFunc.ServeHTTP`. After this bump
-  `govulncheck ./...` reports no vulnerabilities.
 - `Validate()` warns when `nats://` is used with credentials (cleartext
   auth over the network) and when `nats_tls_insecure_skip_verify=true`.
 - JSON parse is skipped for oversized payloads to avoid unbounded
