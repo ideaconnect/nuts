@@ -45,6 +45,49 @@ make test-functional
 - Include unit tests for new behavior. If the change affects the HTTP surface,
   also add a Godog scenario under [features/](features/).
 
+## Mutation testing
+
+We use [gremlins](https://github.com/go-gremlins/gremlins) to measure test
+**strength**, not just presence. Coverage tells you a line was touched;
+mutation testing tells you a regression on that line would have been caught.
+
+Targets per file and the survivor-review policy are in
+[docs/mutation/targets.md](docs/mutation/targets.md).
+
+### When mutation testing is required
+
+Any PR that adds or modifies code in `auth.go`, `helpers.go`, `handler.go`,
+`serve.go`, `caddyfile.go`, or `provision.go` must:
+
+1. Run `make mutate-pkg PKG=<changed-file>` locally and report the MSI in
+   the PR description.
+2. For each new surviving mutant, either kill it with a test, document it
+   as equivalent in
+   [docs/mutation/equivalents.md](docs/mutation/equivalents.md), or flag it
+   for human review in the PR. Don't silently ignore.
+
+The full-module run (`make mutate`) is too slow to gate every PR — that's
+why it runs weekly on a schedule (see the `mutation.yml` workflow). Per-PR
+gating uses the scoped `mutate-pkg` form.
+
+### Waiver process
+
+A maintainer can waive the mutation-coverage requirement for a specific PR
+when:
+
+- The change is a pure refactor with no behaviour change (test suite
+  proves equivalence).
+- The change is doc-only.
+- The change is dependency bumps with no logic edits.
+
+The waiver must be stated explicitly in the PR description so the reason is
+durable.
+
+### Setup
+
+Install the binary once: `make mutate-tools`. The version is pinned in the
+Makefile so contributors and CI agree.
+
 ## Contribution checklist
 
 Use this checklist before opening a PR. It mirrors the main CI gates; run the
@@ -70,6 +113,11 @@ subset that matches the change when a full local pass would be unreasonable.
   snapshot dry run.
 - [ ] Documentation, changelog, and examples are updated for new directives,
   operational behavior, or upgrade-impacting changes.
+- [ ] `make mutate-pkg PKG=<changed-file>` ran for each modified file in
+  `auth.go`, `helpers.go`, `handler.go`, `serve.go`, `caddyfile.go`,
+  `provision.go`. PR description states the resulting MSI and how new
+  survivors were handled (killed / documented as equivalent / flagged).
+  See [Mutation testing](#mutation-testing) for the full policy.
 
 ## Commit messages
 

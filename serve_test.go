@@ -1,6 +1,7 @@
 package nuts
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -360,4 +361,96 @@ func TestHandler_FormatMessageEventRejectsOversizedEvents(t *testing.T) {
 
 func jetStreamAckReply(stream, consumer string, delivered, streamSeq, consumerSeq uint64, timestamp time.Time, pending uint64) string {
 	return fmt.Sprintf("$JS.ACK.%s.%s.%d.%d.%d.%d.%d", stream, consumer, delivered, streamSeq, consumerSeq, timestamp.UnixNano(), pending)
+}
+
+// stubStreamMetadata is a minimal streamMetadataReader for testing the
+// error paths of readStreamSnapshot without standing up a JetStream
+// connection.
+type stubStreamMetadata struct {
+	info      *nats.StreamInfo
+	infoErr   error
+	msg       *nats.RawStreamMsg
+	getMsgErr error
+}
+
+func (s stubStreamMetadata) StreamInfo(stream string, opts ...nats.JSOpt) (*nats.StreamInfo, error) {
+	return s.info, s.infoErr
+}
+
+func (s stubStreamMetadata) GetMsg(name string, seq uint64, opts ...nats.JSOpt) (*nats.RawStreamMsg, error) {
+	return s.msg, s.getMsgErr
+}
+
+func TestHandler_ReadStreamSnapshot_StreamInfoErrorReturnsEmptySnapshot(t *testing.T) {
+	h := &Handler{StreamName: "EVENTS", logger: zap.NewNop()}
+	plan := streamPlan{Replay: replayPlan{HasLastID: true}}
+	stub := stubStreamMetadata{infoErr: errors.New("stream info boom")}
+
+	snapshot := h.readStreamSnapshot(stub, plan)
+
+	if !reflect.DeepEqual(snapshot, streamInfoSnapshot{}) {
+		t.Errorf("readStreamSnapshot with StreamInfo error: got %+v, want zero-value snapshot", snapshot)
+	}
+}
+
+func TestHandler_ReadStreamSnapshot_GetMsgErrorKeepsSnapshotWithoutStartTime(t *testing.T) {
+	h := &Handler{StreamName: "EVENTS", ReplayWindow: 60, logger: zap.NewNop()}
+	plan := streamPlan{Replay: replayPlan{HasLastID: true, StartSequence: 5}}
+	stub := stubStreamMetadata{
+		info: &nats.StreamInfo{
+			State:  nats.StreamState{FirstSeq: 1, LastSeq: 10},
+			Config: nats.StreamConfig{Subjects: []string{"events.>"}},
+		},
+		getMsgErr: errors.New("get msg boom"),
+	}
+
+	snapshot := h.readStreamSnapshot(stub, plan)
+
+	if snapshot.HasStartSequenceTime {
+		t.Errorf("HasStartSequenceTime = true on GetMsg error, want false")
+	}
+	if snapshot.FirstSeq != 1 || snapshot.LastSeq != 10 {
+		t.Errorf("Seq range: got FirstSeq=%d LastSeq=%d, want 1/10", snapshot.FirstSeq, snapshot.LastSeq)
+	}
+}
+
+func TestHandler_FinalizeStreamedMessage(t *testing.T) {
+	h := &Handler{logger: zap.NewNop()}
+
+	cases := []struct {
+		name  string
+		plan  streamPlan
+		event formattedMessageEvent
+		want  bool
+	}{
+		{
+			name:  "normal message delivers",
+			plan:  streamPlan{},
+			event: formattedMessageEvent{Subject: "events.x"},
+			want:  true,
+		},
+		{
+			name:  "dropped message skips",
+			plan:  streamPlan{},
+			event: formattedMessageEvent{Subject: "events.x", Dropped: true, DropReason: "queue_full", DropSize: 100},
+			want:  false,
+		},
+		{
+			name: "out-of-replay-window message skips",
+			plan: streamPlan{Replay: replayPlan{Mode: replayModeFallbackStartTime, StartTime: time.Unix(1_700_000_000, 0)}},
+			event: formattedMessageEvent{
+				Subject:        "events.x",
+				MessageTime:    time.Unix(1_699_999_000, 0),
+				HasMessageTime: true,
+			},
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := h.finalizeStreamedMessage(c.plan, c.event); got != c.want {
+				t.Errorf("finalizeStreamedMessage = %v, want %v", got, c.want)
+			}
+		})
+	}
 }

@@ -1,0 +1,161 @@
+name: Mutation testing
+
+# Runs gremlins against the whole module on a weekly cadence and on demand.
+# This is intentionally NOT a `pull_request` trigger — mutation testing is too
+# slow to gate every PR. PR-level enforcement is per-file via
+# `make mutate-pkg PKG=…` and the policy in CONTRIBUTING.md.
+on:
+  schedule:
+    - cron: '0 3 * * 0'  # Sunday 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read       # required for `gh run download` of the prior run's artifact
+
+jobs:
+  mutate:
+    runs-on: ubuntu-latest
+    # Mutation runs are slow (per-mutant test invocations). Cap at 4 hours;
+    # if it exceeds that, investigate before raising — usually a sign that
+    # tests are flaky or hanging.
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Pinned gremlins version is read from the Makefile so the workflow and
+      # local `make mutate` cannot drift.
+      - name: Read pinned gremlins version
+        id: gremlins_version
+        run: |
+          ver=$(grep -E '^GREMLINS_VERSION \?=' Makefile | awk '{print $3}')
+          if [ -z "$ver" ]; then
+            echo "Could not read GREMLINS_VERSION from Makefile" >&2
+            exit 1
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Cache gremlins binary
+        id: cache_gremlins
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin/gremlins
+          key: gremlins-${{ runner.os }}-${{ steps.gremlins_version.outputs.version }}
+
+      - name: Install gremlins
+        if: steps.cache_gremlins.outputs.cache-hit != 'true'
+        run: go install github.com/go-gremlins/gremlins/cmd/gremlins@${{ steps.gremlins_version.outputs.version }}
+
+      # The mutation run needs the same Docker NATS stack as `make
+      # test-functional` because gremlins runs `go test ./...` to gather
+      # coverage and that walks the godog suite under functional_test/.
+      - name: Bring up NATS stack
+        env:
+          NATS_IMAGE: nats:2.12-alpine
+        run: docker compose up -d --build --wait
+
+      - name: Run mutation testing
+        id: mutate
+        run: |
+          mkdir -p docs/mutation/runs
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          output=docs/mutation/runs/scheduled-$stamp.json
+          echo "output=$output" >> "$GITHUB_OUTPUT"
+          echo "stamp=$stamp" >> "$GITHUB_OUTPUT"
+          # Don't fail this step on threshold violations — we want to upload
+          # the artifact and post the comment even when MSI regresses.
+          gremlins unleash --output "$output" . || true
+          # Sanity-check the file exists and is valid JSON.
+          jq -e '.test_efficacy' "$output" > /dev/null
+          # gremlins reports test_efficacy and mutations_coverage as
+          # percentages already (0–100), not fractions — verified against
+          # internal/report/internal/structure.go in gremlins v0.6.0.
+          msi=$(jq -r '.test_efficacy' "$output")
+          mc=$(jq -r '.mutations_coverage' "$output")
+          killed=$(jq -r '.mutants_killed' "$output")
+          lived=$(jq -r '.mutants_lived' "$output")
+          not_covered=$(jq -r '.mutants_not_covered' "$output")
+          total=$(jq -r '.mutants_total' "$output")
+          {
+            echo "### Mutation testing run"
+            echo
+            echo "| Metric | Value |"
+            echo "| --- | --- |"
+            printf '| Test efficacy (MSI) | %.2f%% |\n' "$msi"
+            printf '| Mutation coverage | %.2f%% |\n' "$mc"
+            echo "| Killed | $killed |"
+            echo "| Lived | $lived |"
+            echo "| Not covered | $not_covered |"
+            echo "| Total | $total |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tear down NATS stack
+        if: always()
+        run: docker compose down -v || true
+
+      - name: Upload mutation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-report-${{ steps.mutate.outputs.stamp }}
+          path: ${{ steps.mutate.outputs.output }}
+          retention-days: 90
+
+      # Compare against the previous scheduled run. If the previous run
+      # didn't post an artifact (first run ever, retention expired), skip
+      # the comparison rather than fail.
+      - name: Fetch previous run artifact
+        id: previous
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prev=$(gh run list \
+            --workflow=mutation.yml \
+            --branch=${{ github.ref_name }} \
+            --status=success \
+            --limit=2 \
+            --json databaseId \
+            --jq '.[1].databaseId' || echo "")
+          if [ -z "$prev" ] || [ "$prev" = "null" ]; then
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p /tmp/prev
+          if ! gh run download "$prev" --dir /tmp/prev --pattern 'mutation-report-*'; then
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          prev_file=$(find /tmp/prev -name '*.json' | head -n1)
+          if [ -z "$prev_file" ]; then
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "has_previous=true" >> "$GITHUB_OUTPUT"
+          echo "previous_file=$prev_file" >> "$GITHUB_OUTPUT"
+          echo "previous_run=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: Detect MSI regression
+        if: steps.previous.outputs.has_previous == 'true'
+        run: |
+          # test_efficacy is reported as a percentage (0–100), so delta is
+          # already in percentage points — -2 pp = drop > 2.
+          current=$(jq -r '.test_efficacy' "${{ steps.mutate.outputs.output }}")
+          previous=$(jq -r '.test_efficacy' "${{ steps.previous.outputs.previous_file }}")
+          delta=$(awk -v c="$current" -v p="$previous" 'BEGIN { printf "%.2f", c - p }')
+          echo "MSI: previous=$previous current=$current delta=$delta pp"
+          {
+            printf '\n**Delta vs. previous run** (run #%s): %+.2f pp\n' \
+              "${{ steps.previous.outputs.previous_run }}" "$delta"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if awk -v d="$delta" 'BEGIN { exit !(d < -2) }'; then
+            echo "::error::MSI dropped by more than 2 percentage points (delta=$delta pp). Investigate before further changes."
+            exit 1
+          fi

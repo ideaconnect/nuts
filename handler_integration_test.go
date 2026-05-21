@@ -565,6 +565,20 @@ func TestBuildTLSConfig_InvalidCertKeyPairReturnsError(t *testing.T) {
 	}
 }
 
+// TestHandler_ConnectNATS_TLSConfigErrorPropagates exercises the error
+// return on the buildTLSConfig() failure branch inside connectNATS, which
+// otherwise sits behind an unreachable code path because the existing
+// TLS tests call buildTLSConfig directly.
+func TestHandler_ConnectNATS_TLSConfigErrorPropagates(t *testing.T) {
+	h := &Handler{
+		NatsTLSCA: filepath.Join(t.TempDir(), "does-not-exist.pem"),
+		logger:    zap.NewNop(),
+	}
+	if err := h.connectNATS(); err == nil {
+		t.Fatal("expected connectNATS to return the TLS-build error when CA file is missing")
+	}
+}
+
 // ── Heartbeat: the SSE stream emits the keep-alive comment ────────────────
 
 func TestHandler_Heartbeat_EmitsFrame(t *testing.T) {

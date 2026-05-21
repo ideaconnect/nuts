@@ -378,16 +378,20 @@ func isValidTopicFilter(filter string) bool {
 			return false
 		}
 		for i := 0; i < len(token); i++ {
-			c := token[i]
-			switch {
-			case c >= 'a' && c <= 'z':
-			case c >= 'A' && c <= 'Z':
-			case c >= '0' && c <= '9':
-			case c == '-' || c == '_':
-			default:
+			if !isAllowedFilterTokenByte(token[i]) {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+// isAllowedFilterTokenByte reports whether c may appear inside a single
+// subscribe-claim filter token. Accepted: ASCII letters, digits, dash,
+// underscore. Dots are segment separators and handled by the caller.
+func isAllowedFilterTokenByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		c == '-' || c == '_'
 }

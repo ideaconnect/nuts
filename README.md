@@ -94,6 +94,8 @@ directory:
 - [docs/ROADMAP.md](docs/ROADMAP.md) — completed milestones and planned
   features.
 - [docs/STRUCTURE.md](docs/STRUCTURE.md) — Go source file map.
+- [docs/mutation/](docs/mutation/) — mutation testing baseline, per-file
+  MSI targets, accepted-survivors log, and run reports.
 - [docs/MERCURE.md](docs/MERCURE.md) — short note on Mercure, which inspired
   NUTS.
 
@@ -1015,6 +1017,46 @@ Feature: SSE Streaming with JetStream
 make test
 ```
 
+#### Mutation Testing
+
+NUTS uses [gremlins](https://github.com/go-gremlins/gremlins) to measure
+**test strength** in addition to coverage. Coverage tells you a line was
+touched; mutation testing tells you a regression on that line would be
+caught.
+
+```bash
+# One-time install of the pinned gremlins binary into $GOPATH/bin.
+make mutate-tools
+
+# Run mutation testing on the whole module (brings the Docker stack up).
+make mutate
+
+# Run scoped to a single file or directory (much faster).
+make mutate-pkg PKG=auth.go
+```
+
+Reports land in [`docs/mutation/runs/`](docs/mutation/runs/) as JSON. The
+weekly [`mutation.yml`](.github/workflows/mutation.yml) GitHub Action
+runs the full module on Sunday 03:00 UTC and fails the run if the
+Mutation Score Indicator (MSI) drops by more than 2 percentage points
+versus the prior week.
+
+Per-PR enforcement is documented in [CONTRIBUTING.md § Mutation
+testing](CONTRIBUTING.md#mutation-testing): contributors run
+`make mutate-pkg` on changed security-critical files and report the MSI
+in the PR description. Per-file targets and the survivor-handling policy
+are in [docs/mutation/targets.md](docs/mutation/targets.md).
+
+Current state (2026-05-21):
+
+- Test efficacy (MSI): **100%**
+- Mutation coverage: **99.60%**
+- 501 of 503 mutants killed; 2 documented accepted gaps in
+  [docs/mutation/equivalents.md](docs/mutation/equivalents.md).
+
+See [docs/mutation/final-report.md](docs/mutation/final-report.md) for
+the end-of-initiative summary.
+
 ### Building
 
 ```bash
@@ -1053,14 +1095,17 @@ docker compose down -v
 ### Makefile Commands
 
 ```bash
-make build           # Build the Caddy binary
-make test            # Run all tests (unit + functional)
-make test-unit       # Run unit tests with embedded NATS
-make test-functional # Run BDD tests with Docker
-make docker-up       # Start Docker services
-make docker-down     # Stop Docker services
-make clean           # Clean build artifacts
-make help            # Show all available commands
+make build              # Build the Caddy binary
+make test               # Run all tests (unit + functional)
+make test-unit          # Run unit tests with embedded NATS
+make test-functional    # Run BDD tests with Docker
+make mutate-tools       # Install the pinned gremlins binary
+make mutate             # Run mutation testing on the whole module
+make mutate-pkg PKG=… # Run mutation testing scoped to one file/dir
+make docker-up          # Start Docker services
+make docker-down        # Stop Docker services
+make clean              # Clean build artifacts
+make help               # Show all available commands
 ```
 
 ## Roadmap

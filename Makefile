@@ -1,10 +1,12 @@
-.PHONY: all build test test-unit test-performance test-functional test-functional-dev test-functional-stress test-functional-matrix release-check docker-up wait-functional-stack docker-down docker-logs clean
+.PHONY: all build test test-unit test-performance test-functional test-functional-dev test-functional-stress test-functional-matrix release-check docker-up wait-functional-stack docker-down docker-logs mutate mutate-pkg mutate-tools clean
 
 DOCKER_COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo docker compose; elif docker-compose version >/dev/null 2>&1; then echo docker-compose; fi)
 FUNCTIONAL_TEST_STRESS_COUNT ?= 3
 NATS_COMPAT_IMAGES ?= nats:2.9-alpine nats:2.12-alpine
 GORELEASER_IMAGE ?= goreleaser/goreleaser:v2.8.2
 GOLANGCI_LINT_IMAGE ?= golangci/golangci-lint:v2.11.4
+GREMLINS_VERSION ?= v0.6.0
+MUTATION_OUTPUT_DIR ?= docs/mutation/runs
 
 # Default target
 all: build test
@@ -115,6 +117,44 @@ test-functional-matrix:
 	done; \
 	exit $$status
 
+# Install the gremlins mutation testing binary into $GOPATH/bin (or $GOBIN).
+# Pinned to GREMLINS_VERSION so contributors and CI agree on the same mutator
+# set and behaviour; bump deliberately and document the diff in CHANGELOG.
+mutate-tools:
+	go install github.com/go-gremlins/gremlins/cmd/gremlins@$(GREMLINS_VERSION)
+
+# Full-module mutation testing run. Brings up the Docker NATS stack because
+# gremlins runs `go test ./...` for coverage (hard-coded in gremlins), which
+# transitively executes the godog suite under functional_test/.
+# Output goes to $(MUTATION_OUTPUT_DIR)/run-<UTC-timestamp>.json.
+mutate: docker-up
+	@command -v gremlins >/dev/null 2>&1 || { echo "gremlins not installed. Run 'make mutate-tools' first."; $(MAKE) docker-down; exit 1; }
+	@mkdir -p $(MUTATION_OUTPUT_DIR)
+	@status=0; \
+	stamp=$$(date -u +%Y%m%dT%H%M%SZ); \
+	output=$(MUTATION_OUTPUT_DIR)/run-$$stamp.json; \
+	echo "Running mutation testing on github.com/ideaconnect/nuts → $$output"; \
+	gremlins unleash --output $$output . || status=$$?; \
+	if [ $$status -ne 0 ]; then $(MAKE) docker-logs; fi; \
+	$(MAKE) docker-down || status=$$?; \
+	exit $$status
+
+# Scoped mutation run. PKG accepts anything gremlins accepts as a path:
+# a Go file (`make mutate-pkg PKG=auth.go`) or a directory.
+mutate-pkg: docker-up
+	@if [ -z "$(PKG)" ]; then echo "Error: PKG is required, e.g. \`make mutate-pkg PKG=auth.go\`"; $(MAKE) docker-down; exit 2; fi
+	@command -v gremlins >/dev/null 2>&1 || { echo "gremlins not installed. Run 'make mutate-tools' first."; $(MAKE) docker-down; exit 1; }
+	@mkdir -p $(MUTATION_OUTPUT_DIR)
+	@status=0; \
+	stamp=$$(date -u +%Y%m%dT%H%M%SZ); \
+	scope=$$(echo "$(PKG)" | tr '/.' '__'); \
+	output=$(MUTATION_OUTPUT_DIR)/run-$$scope-$$stamp.json; \
+	echo "Running mutation testing on $(PKG) → $$output"; \
+	gremlins unleash --output $$output $(PKG) || status=$$?; \
+	if [ $$status -ne 0 ]; then $(MAKE) docker-logs; fi; \
+	$(MAKE) docker-down || status=$$?; \
+	exit $$status
+
 # Run Godog with pretty output
 godog: docker-up
 	@status=0; \
@@ -162,3 +202,6 @@ help:
 	@echo "  clean            - Clean build artifacts"
 	@echo "  fmt              - Format code"
 	@echo "  lint             - Run linter"
+	@echo "  mutate-tools     - Install gremlins (mutation testing binary)"
+	@echo "  mutate           - Run gremlins on the whole module (Docker NATS up/down)"
+	@echo "  mutate-pkg PKG=… - Run gremlins on a single file/dir (e.g. PKG=auth.go)"

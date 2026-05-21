@@ -68,6 +68,15 @@ func writeSSEChunkWithTimeout(w http.ResponseWriter, flusher http.Flusher, chunk
 	return nil
 }
 
+// isAllowedTopicByte reports whether c may appear in a topic name. Accepted
+// characters: ASCII letters, digits, dot, dash, underscore.
+func isAllowedTopicByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		c == '.' || c == '-' || c == '_'
+}
+
 // isValidTopic rejects topic names that would be problematic as NATS
 // subjects. Accepted character set: ASCII letters, digits, dot, dash,
 // underscore. Rejects wildcards (* and >), the system prefix ($),
@@ -87,13 +96,7 @@ func isValidTopic(topic string) bool {
 		return false
 	}
 	for i := 0; i < len(topic); i++ {
-		c := topic[i]
-		switch {
-		case c >= 'a' && c <= 'z':
-		case c >= 'A' && c <= 'Z':
-		case c >= '0' && c <= '9':
-		case c == '.' || c == '-' || c == '_':
-		default:
+		if !isAllowedTopicByte(topic[i]) {
 			return false
 		}
 	}
@@ -111,18 +114,22 @@ func redactURL(raw string) string {
 	return u.String()
 }
 
+// isAllowedCookieNameByte reports whether c may appear in a cookie name per
+// RFC 6265's token rules: ASCII letters, digits, and the RFC's permitted
+// punctuation set.
+func isAllowedCookieNameByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c))
+}
+
 func isValidCookieName(name string) bool {
 	if name == "" {
 		return false
 	}
 	for i := 0; i < len(name); i++ {
-		c := name[i]
-		switch {
-		case c >= 'a' && c <= 'z':
-		case c >= 'A' && c <= 'Z':
-		case c >= '0' && c <= '9':
-		case strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)):
-		default:
+		if !isAllowedCookieNameByte(name[i]) {
 			return false
 		}
 	}

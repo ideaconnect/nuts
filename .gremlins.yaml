@@ -1,0 +1,66 @@
+# Mutation testing configuration for github.com/ideaconnect/nuts.
+#
+# Driven by `make mutate` and `make mutate-pkg PKG=<file>`. See
+# docs/mutation/ for the policy, per-package MSI targets, and the
+# justification log for any accepted (equivalent or intentional) survivors.
+#
+# Mutants on uncovered code are reported as NOT_COVERED and not executed,
+# so improving line coverage directly reduces wasted mutation runs.
+
+silent: false
+
+unleash:
+  # Parallelism: workers defaults to the number of system CPUs. test-cpu
+  # caps each mutant test process to 2 cores so concurrent mutant runs
+  # don't starve each other on machines with limited core counts.
+  workers: 0
+  test-cpu: 2
+
+  # The unit suite has a 120s base timeout (Makefile: test-unit). A
+  # coefficient of 3 gives slow mutants — replay, reconnect, slow-client —
+  # enough headroom without letting infinite-loop mutants block the run.
+  timeout-coefficient: 3
+
+  # Quality gates calibrated from the 2026-05-21 baseline
+  # (docs/mutation/baseline.md): MSI 100%, mutation coverage 88.08%. The
+  # buffers below leave room for legitimate test churn without ratcheting
+  # the bar so high that one equivalent mutant breaks CI. The weekly
+  # GitHub Action adds a ±2pp regression check on top of these.
+  threshold:
+    efficacy: 95
+    mutant-coverage: 80
+
+  # Files excluded from mutation (but still tested). Reasoning:
+  #
+  # - cmd/caddy/main.go is the xcaddy build entrypoint — `caddy.Main()` only.
+  #   There is no NUTS logic to mutate here and no targeted test to kill it.
+  exclude-files:
+    - '^cmd/caddy/.*\.go$'
+
+mutants:
+  # Default set, plus invert-logical and invert-loopctrl which catch real
+  # bugs in this codebase: AND/OR confusion in auth/CORS predicates and
+  # break/continue swaps in the SSE streaming loop. Keep an eye on
+  # equivalence rate when reviewing survivors — disable if noise dominates.
+  arithmetic-base:
+    enabled: true
+  conditionals-boundary:
+    enabled: true
+  conditionals-negation:
+    enabled: true
+  increment-decrement:
+    enabled: true
+  invert-assignments:
+    enabled: false
+  invert-bitwise:
+    enabled: false
+  invert-bwassign:
+    enabled: false
+  invert-negatives:
+    enabled: true
+  invert-logical:
+    enabled: true
+  invert-loopctrl:
+    enabled: true
+  remove-self-assignments:
+    enabled: false

@@ -162,6 +162,15 @@ func appendStreamLogFields(plan streamPlan, fields ...zap.Field) []zap.Field {
 	return append(streamLogFields(plan), fields...)
 }
 
+// streamMetadataReader is the subset of nats.JetStreamContext that
+// readStreamSnapshot depends on. Extracted so tests can stub the metadata
+// reads independently of a live JetStream connection — `*nats.js` (the
+// real implementation) satisfies it automatically.
+type streamMetadataReader interface {
+	StreamInfo(stream string, opts ...nats.JSOpt) (*nats.StreamInfo, error)
+	GetMsg(name string, seq uint64, opts ...nats.JSOpt) (*nats.RawStreamMsg, error)
+}
+
 // streamInfoSnapshot is a frozen view of relevant JetStream stream state at
 // the moment the request was planned. Reading once and reusing avoids racing
 // against background JetStream activity during planning decisions.
@@ -587,7 +596,7 @@ func (p streamPlan) requestedMessageHandler(enqueueMessage nats.MsgHandler) nats
 // skip the round trip entirely. Read failures are logged at debug and
 // return a zero-value snapshot, which downstream code treats as "no
 // snapshot info available".
-func (h *Handler) readStreamSnapshot(js nats.JetStreamContext, plan streamPlan) streamInfoSnapshot {
+func (h *Handler) readStreamSnapshot(js streamMetadataReader, plan streamPlan) streamInfoSnapshot {
 	if plan.Replay.HasLastID || len(plan.FullSubjects) > 1 {
 		if info, infoErr := js.StreamInfo(h.StreamName); infoErr == nil {
 			snapshot := streamInfoSnapshot{
@@ -883,11 +892,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 					)...,
 				)
 			}
-			if formatted.Dropped {
-				h.recordDroppedMessage(formatted)
-				continue
-			}
-			if shouldSkipReplayWindowMessage(plan, formatted) {
+			if !h.finalizeStreamedMessage(plan, formatted) {
 				continue
 			}
 
@@ -932,6 +937,22 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 			}
 		}
 	}
+}
+
+// finalizeStreamedMessage handles the side effects of a formatted message
+// just received from the JetStream subscription, then reports whether it
+// should be written to the SSE response. Returns false when the message
+// was Dropped (and recorded to metrics) or when it falls outside the
+// active replay window.
+func (h *Handler) finalizeStreamedMessage(plan streamPlan, formatted formattedMessageEvent) bool {
+	if formatted.Dropped {
+		h.recordDroppedMessage(formatted)
+		return false
+	}
+	if shouldSkipReplayWindowMessage(plan, formatted) {
+		return false
+	}
+	return true
 }
 
 // shouldSkipReplayWindowMessage filters out messages that JetStream

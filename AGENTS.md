@@ -164,10 +164,55 @@ The full PR checklist is [CONTRIBUTING.md § Contribution checklist](CONTRIBUTIN
   explicit (non-wildcard) origins.
 - **Tests for new behaviour:** unit test under the embedded NATS server when
   possible. Add a Godog scenario under [features/](features/) for changes that
-  are observable over HTTP.
+  are observable over HTTP. See [Mutation testing](#mutation-testing) for the
+  additional bar on test *strength* (not just presence).
 - **Documentation:** when behaviour changes, update the relevant file under
   [docs/](docs/) **and** the matching section of [README.md](README.md).
   Operator-facing impact also belongs in [CHANGELOG.md](CHANGELOG.md).
+
+## Mutation testing
+
+This repository uses [gremlins](https://github.com/go-gremlins/gremlins) to
+measure test *strength* — not just whether tests exist, but whether they
+would catch a regression. Coverage answers "did the test touch this line?";
+mutation testing answers "would the test fail if this line were wrong?"
+
+Per-file MSI (Mutation Score Indicator) targets and the policy on
+surviving mutants are in
+[docs/mutation/targets.md](docs/mutation/targets.md). The current baseline
+is in [docs/mutation/baseline.md](docs/mutation/baseline.md).
+
+### Requirement for agents
+
+Any change that adds or modifies code in **`auth.go`, `helpers.go`,
+`handler.go`, `serve.go`, `caddyfile.go`, or `provision.go`** must:
+
+1. Run `make mutate-pkg PKG=<changed-file>` locally before declaring the
+   task complete.
+2. Report the resulting MSI in the PR description.
+3. For every new survivor introduced by the change, take one of three
+   actions (in order of preference):
+   - **Kill it** — add a test that exercises the affected behaviour with
+     the right boundary or branch. This is the default path.
+   - **Document as equivalent** — record the survivor in
+     [docs/mutation/equivalents.md](docs/mutation/equivalents.md) with
+     `file:line`, mutator, original→mutated diff, and a one-paragraph
+     justification.
+   - **Flag for human review** — call it out explicitly in the PR
+     description. Never silently ignore.
+4. Adding a new exported function without a test that kills at least the
+   boundary and return-value mutants on it is a blocker.
+
+The full module run (`make mutate`) is reserved for the weekly scheduled
+GitHub Action, not per-PR — see
+[.github/workflows/mutation.yml](.github/workflows/mutation.yml).
+
+### Why this is enforced on agents specifically
+
+An AI agent can produce code that compiles and passes the existing tests
+while leaving newly-introduced branches completely unverified. Coverage
+masks this; mutation testing surfaces it. The requirement above closes
+that gap before review starts, instead of leaking it into review load.
 
 ## CI and release surfaces
 
