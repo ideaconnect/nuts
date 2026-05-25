@@ -23,10 +23,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -45,7 +45,7 @@ jobs:
 
       - name: Cache gremlins binary
         id: cache_gremlins
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/go/bin/gremlins
           key: gremlins-${{ runner.os }}-${{ steps.gremlins_version.outputs.version }}
@@ -102,7 +102,7 @@ jobs:
         run: docker compose down -v || true
 
       - name: Upload mutation report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mutation-report-${{ steps.mutate.outputs.stamp }}
           path: ${{ steps.mutate.outputs.output }}
