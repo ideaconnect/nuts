@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags="-s -w" -o /app/caddy ./cmd/caddy
 
 # Runtime stage
-FROM alpine:3.21
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates wget \
     && adduser -D -H -u 10001 nuts
