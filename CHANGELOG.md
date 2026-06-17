@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fix **CVE-2026-45135** — unsafe Unicode handling in the FastCGI
   `splitPos` logic that could allow execution of non-PHP files. Flagged
   by Trivy on the 0.3.0 release image build (HIGH severity).
-- Bumped `go` directive in `go.mod` from `1.26.2` to `1.26.3` to pull in
+- Bumped `go` directive in `go.mod` from `1.26.2` to `1.26.4` to pull in
   upstream Go standard-library fixes for reachable vulnerabilities flagged
   by `govulncheck`:
   - **GO-2026-4982** (`html/template`) — bypass of meta content URL
@@ -58,11 +58,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **GO-2026-4980** (`html/template`) — escaper bypass leading to XSS.
   - **GO-2026-4971** (`net`) — `Dial`/`LookupPort` panic on NUL byte on
     Windows.
+  - **GO-2026-5039** (`net/textproto`) — arbitrary inputs included in
+    errors without escaping (reachable via `nats.Connect` →
+    `textproto.Reader.ReadMIMEHeader`).
+  - **GO-2026-5037** (`crypto/x509`) — inefficient candidate hostname
+    parsing (reachable via `x509.Certificate.Verify` /
+    `VerifyHostname` / `HostnameError.Error`).
+  - **GO-2026-5038** (`mime`) — quadratic complexity in
+    `WordDecoder.DecodeHeader` (present in imports; no reachable call
+    site in this module).
 - Bumped `golang.org/x/net` from `v0.52.0` to `v0.53.0` to fix
   **GO-2026-4918** — infinite loop in the HTTP/2 transport when given a
   malformed `SETTINGS_MAX_FRAME_SIZE`. Vulnerability was reachable
-  transitively through `caddyhttp.HandlerFunc.ServeHTTP`. After this bump
-  `govulncheck ./...` reports no vulnerabilities.
+  transitively through `caddyhttp.HandlerFunc.ServeHTTP`. After all the
+  bumps above `govulncheck ./...` reports no vulnerabilities.
 
 ## [0.2.0] - 2026-05-05
 
