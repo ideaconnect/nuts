@@ -373,6 +373,71 @@ func BenchmarkCommonSubjectFilter(b *testing.B) {
 	}
 }
 
+// BenchmarkEnqueueMessageSteadyState exercises the actual per-message
+// dispatch hot path: the NATS callback hands a message to enqueueMessage,
+// the channel pump accepts it, and a consumer drains. Counter to the
+// pure-function benchmarks (FormatMessageEvent et al.), this one
+// includes the channel send + goroutine scheduling cost that
+// dominates real-world throughput.
+//
+// The consumer goroutine drains as fast as possible; the bench measures
+// the steady-state cost when there is no buffer pressure.
+func BenchmarkEnqueueMessageSteadyState(b *testing.B) {
+	h := &Handler{ClientBufferSize: 256, logger: nil}
+	msgChan, _, done, enqueueMessage := h.newMessageQueue()
+	defer close(done)
+
+	// Drainer.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-msgChan:
+			case <-stop:
+				return
+			}
+		}
+	}()
+	defer close(stop)
+
+	msg := &nats.Msg{Subject: "events.x", Data: []byte(`{"hello":"world"}`)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		enqueueMessage(msg)
+	}
+}
+
+// BenchmarkEnqueueMessageBackpressure measures the cost path WHEN the
+// buffer is saturated and signalSlowClient is invoked. This is the
+// 'sad' path — if it allocates aggressively under back-pressure it
+// would worsen the very situation we're trying to detect.
+func BenchmarkEnqueueMessageBackpressure(b *testing.B) {
+	h := &Handler{ClientBufferSize: 1, DispatchTimeout: 0, logger: nil}
+	msgChan, slowClient, done, enqueueMessage := h.newMessageQueue()
+	defer close(done)
+
+	// Fill the buffer; never drain. signalSlowClient's slowClient send
+	// must also be drained or signalSlowClient would block.
+	go func() {
+		for {
+			select {
+			case <-slowClient:
+			case <-done:
+				return
+			}
+		}
+	}()
+	_ = msgChan // intentionally unread to keep msgChan saturated
+
+	msg := &nats.Msg{Subject: "events.x", Data: []byte(`{"hello":"world"}`)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		enqueueMessage(msg)
+	}
+}
+
 func BenchmarkMultiTopicRequestedMessageHandler(b *testing.B) {
 	requestedSubjects := map[string]struct{}{
 		"events.a": {},

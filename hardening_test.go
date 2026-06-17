@@ -1566,6 +1566,11 @@ func TestHandler_ReplayWindow_BoundsValidRetainedReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get old message: %v", err)
 	}
+	// Sleep is the assertion here, not synchronisation: the test
+	// verifies that NUTS treats a message older than replay_window as
+	// out-of-window. We wait until the old message's publish time has
+	// aged past replay_window (+ a small buffer) so the next-published
+	// "new" message is strictly inside the window.
 	if wait := time.Until(oldMsg.Time.Add(time.Duration(replayWindow+3) * time.Second)); wait > 0 {
 		time.Sleep(wait)
 	}

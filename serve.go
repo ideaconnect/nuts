@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -531,12 +532,28 @@ func (h *Handler) newMessageQueue() (chan *nats.Msg, chan string, chan struct{},
 			// blocking the NATS callback indefinitely.
 			return
 		case msgChan <- msg:
+			return
 		default:
-			// Buffer is full: the client is consuming slower than the stream
-			// is producing. Signal the SSE loop to disconnect (the only safe
-			// option — accumulating would OOM, dropping would silently lose).
-			h.signalSlowClient(slowClient, msg.Subject, done, dispatchTimeout)
 		}
+		// Transient buffer pressure absorption: at small ClientBufferSize
+		// values, a single goroutine scheduling tick can leave msgChan
+		// briefly full even when the SSE writer is keeping up overall.
+		// Yield once and retry before declaring the client slow. A
+		// genuinely-slow client's buffer stays full across the yield and
+		// still gets disconnected via signalSlowClient.
+		runtime.Gosched()
+		select {
+		case <-done:
+			return
+		case msgChan <- msg:
+			return
+		default:
+		}
+		// Buffer is still full after a scheduler tick: the client is
+		// consuming slower than the stream is producing. Signal the SSE
+		// loop to disconnect (the only safe option — accumulating would
+		// OOM, dropping would silently lose).
+		h.signalSlowClient(slowClient, msg.Subject, done, dispatchTimeout)
 	}
 	return msgChan, slowClient, done, enqueueMessage
 }
