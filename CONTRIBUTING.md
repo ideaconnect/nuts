@@ -45,6 +45,52 @@ make test-functional
 - Include unit tests for new behavior. If the change affects the HTTP surface,
   also add a Godog scenario under [features/](features/).
 
+### Test response recorders
+
+Pick the right recorder for the test pattern, otherwise `-race` (run on
+the full unit suite in CI) will flag a data race:
+
+- **`safeFlushRecorder` / `newSafeRecorder()`** (in
+  [handler_integration_test.go](handler_integration_test.go)) — use when
+  the test reads `rr.Body()` **while** the handler goroutine is still
+  writing. Internally serialises Write/Body via a mutex. This is the
+  right choice for polling-style tests that wait for SSE output to
+  appear before cancelling.
+- **`flushRecorder`** (a thin `*httptest.ResponseRecorder` wrapper, in
+  [nats_test.go](nats_test.go)) — use when the test waits for the
+  handler goroutine to finish (`<-done`) **before** reading
+  `rr.Body.String()`. The wait happens-before any read, so there's no
+  race even though `httptest.ResponseRecorder` is not internally
+  synchronised.
+- **`failingFlushRecorder`** / **`newFailingFlushRecorder(allowedWrites
+  int)`** — use to exercise write-error disconnect paths (allow N
+  writes, then return an error on every subsequent write). The
+  underlying state is mutex-protected so concurrent reads of `Body()`
+  during a goroutine write are safe.
+
+If you change the synchronisation contract of a streaming test (e.g.
+remove a `<-done` wait, switch to polling), upgrade the recorder
+accordingly. CI runs `go test -race -timeout 240s .` on every PR and
+will catch a regression here.
+
+### Synchronisation primitives over `time.Sleep`
+
+Prefer channels, `Eventually`-style polling helpers (e.g.
+`waitForSSEBody`, `waitForConsumerCount`), or the existing test helpers
+over bare `time.Sleep(...)` for synchronisation. Sleeps make the suite
+slower at best and flaky under CI load at worst. Sleeps as
+*assertions* (e.g. asserting a heartbeat fires after exactly one
+heartbeat interval) are fine — document why timing is the assertion.
+
+### Subtest fixture isolation
+
+For tests with multiple `t.Run(...)` subtests that share a single
+`*Handler` and `defer h.Cleanup()`, prefer constructing one handler per
+subtest (or use `t.Cleanup` per-subtest). Shared fixtures couple
+subtest order; a regression in subtest A can corrupt subtest B in ways
+that are hard to bisect. The existing pattern is being phased out — new
+tests should be order-independent.
+
 ## Mutation testing
 
 We use [gremlins](https://github.com/go-gremlins/gremlins) to measure test
