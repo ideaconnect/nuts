@@ -49,8 +49,11 @@ jobs:
       - name: Run unit tests with coverage
         run: go test -covermode=atomic -coverprofile=coverage.out -v -timeout 120s .
 
-      - name: Run focused race tests
-        run: go test -race -v -timeout 180s -run 'TestHandler_ServeHTTP_MultiTopicReplayEmitsIncreasingIDs|TestHandler_ServeHTTP_PreservesJSONNumberLexemes|TestMetrics_ActiveConnections_ReflectsLifecycle' .
+      # Run the full unit suite under -race rather than a hand-picked
+      # subset. The previous approach allowlisted only three tests, so
+      # any race introduced outside that allowlist landed silently.
+      - name: Run unit tests with -race (full package)
+        run: go test -race -timeout 240s .
 
       - name: Print coverage summary
         run: go tool cover -func=coverage.out
