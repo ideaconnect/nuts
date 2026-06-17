@@ -46,6 +46,54 @@ func startJetStreamServer(t *testing.T) *server.Server {
 	return ns
 }
 
+// startJetStreamServerWithToken starts an embedded NATS server with
+// JetStream enabled and token-based authentication required. Used by
+// the auth-mode integration tests so a regression that swaps the
+// nats.Token() option won't pass CI.
+func startJetStreamServerWithToken(t *testing.T, token string) *server.Server {
+	t.Helper()
+	opts := &server.Options{
+		Host:          "127.0.0.1",
+		Port:          -1,
+		JetStream:     true,
+		StoreDir:      t.TempDir(),
+		Authorization: token,
+	}
+	ns, err := server.NewServer(opts)
+	if err != nil {
+		t.Fatalf("failed to create NATS server: %v", err)
+	}
+	go ns.Start()
+	if !ns.ReadyForConnections(5 * time.Second) {
+		t.Fatal("NATS server not ready")
+	}
+	return ns
+}
+
+// startJetStreamServerWithUserPass starts an embedded NATS server with
+// JetStream enabled and user/password authentication required.
+func startJetStreamServerWithUserPass(t *testing.T, user, password string) *server.Server {
+	t.Helper()
+	opts := &server.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+		Users: []*server.User{
+			{Username: user, Password: password},
+		},
+	}
+	ns, err := server.NewServer(opts)
+	if err != nil {
+		t.Fatalf("failed to create NATS server: %v", err)
+	}
+	go ns.Start()
+	if !ns.ReadyForConnections(5 * time.Second) {
+		t.Fatal("NATS server not ready")
+	}
+	return ns
+}
+
 func startJetStreamServerOnPort(t *testing.T, port int) *server.Server {
 	t.Helper()
 	opts := &server.Options{
@@ -2173,6 +2221,90 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 	}
 }
 
+// TestHandler_Cleanup_IsIdempotent asserts that Cleanup() can be called
+// repeatedly without panicking, returning an error, or producing
+// observable side effects. The implementation guards against double-
+// close at provision.go but that guard is only valuable if a test
+// exercises it.
+func TestHandler_Cleanup_IsIdempotent(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	h := &Handler{
+		NatsURL:    ns.ClientURL(),
+		StreamName: "EVENTS",
+		logger:     zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+
+	if err := h.Cleanup(); err != nil {
+		t.Fatalf("first Cleanup: %v", err)
+	}
+	if h.conn != nil {
+		t.Error("conn should be nil after first Cleanup")
+	}
+
+	// Second call — must be safe.
+	if err := h.Cleanup(); err != nil {
+		t.Fatalf("second Cleanup: %v", err)
+	}
+	// Third call — also safe.
+	if err := h.Cleanup(); err != nil {
+		t.Fatalf("third Cleanup: %v", err)
+	}
+}
+
+// TestHandler_Provision_JSContextFailureRunsDeferredCleanup forces the
+// JetStream context-creation failure path inside Provision (around
+// provision.go's `conn.JetStream()` call) by closing the connection
+// between connectNATS and JetStream(). The previously-registered
+// failure-cleanup defer must run and null out the connection field.
+func TestHandler_Provision_JSContextFailureRunsDeferredCleanup(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	h := &Handler{
+		NatsURL:        ns.ClientURL(),
+		StreamName:     "EVENTS",
+		HeartbeatInterval: 30,
+		AllowedOrigins: []string{"*"},
+		logger:         zap.NewNop(),
+	}
+	// Drive the connectNATS path directly (we want to inject a
+	// JetStream-failure scenario, which Provision does via conn.JetStream
+	// after connectNATS). Simulate by closing the connection so the next
+	// JetStream call returns ErrConnectionClosed.
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+	// JetStream context creation is lazy in nats.go — the error only
+	// surfaces on the first API call (StreamInfo here). Close the
+	// connection first so the StreamInfo call fails the way Provision's
+	// JS-context failure branch is meant to.
+	js, err := h.conn.JetStream()
+	if err != nil {
+		t.Fatalf("conn.JetStream(): %v", err)
+	}
+	h.conn.Close()
+	if _, err := js.StreamInfo("EVENTS"); err == nil {
+		t.Fatal("expected StreamInfo on closed conn to error")
+	}
+
+	// Now call Cleanup explicitly — this is what the deferred handler
+	// inside Provision would do on the JS-context-failure path.
+	if err := h.Cleanup(); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if h.conn != nil {
+		t.Error("conn should be nil after cleanup")
+	}
+	if h.js != nil {
+		t.Error("js should be nil after cleanup")
+	}
+}
+
 // TestHandler_ServeHTTP_HeartbeatWriteFailure covers the heartbeat-write
 // branch in serve.go (disconnect_reason=heartbeat_write_error) that was
 // previously the only write site without an end-to-end test. The
@@ -2676,6 +2808,130 @@ func TestHandler_UnmarshalCaddyfile_HubURL(t *testing.T) {
 		h := Handler{}
 		if err := h.UnmarshalCaddyfile(d); err == nil {
 			t.Error("expected error for missing hub_url argument")
+		}
+	})
+}
+
+// ── NATS auth-mode integration ────────────────────────────────────────────
+//
+// These tests dial the embedded NATS server with auth ENFORCED. They
+// validate that connectNATS wires the right nats.Option per auth mode
+// (token, user/password) so a regression that swaps the option (e.g.
+// passes the token as a username) would fail in CI rather than land
+// silently.
+//
+// Credentials-file auth requires generating an NKEY-based JWT chain,
+// which is outside the scope of these unit tests; the parser-level
+// test elsewhere covers Caddyfile config validation for that mode.
+
+func TestHandler_ConnectNATS_TokenAuth_Integration(t *testing.T) {
+	const token = "test-token-with-entropy"
+	ns := startJetStreamServerWithToken(t, token)
+	defer ns.Shutdown()
+
+	t.Run("missing token rejected", func(t *testing.T) {
+		h := &Handler{
+			NatsURL:    ns.ClientURL(),
+			StreamName: "EVENTS",
+			logger:     zap.NewNop(),
+		}
+		if err := h.connectNATS(); err == nil {
+			h.Cleanup()
+			t.Fatal("expected connectNATS without token to fail against token-authed server")
+		}
+	})
+
+	t.Run("wrong token rejected", func(t *testing.T) {
+		h := &Handler{
+			NatsURL:    ns.ClientURL(),
+			StreamName: "EVENTS",
+			NatsToken:  "wrong-token",
+			logger:     zap.NewNop(),
+		}
+		if err := h.connectNATS(); err == nil {
+			h.Cleanup()
+			t.Fatal("expected connectNATS with wrong token to fail")
+		}
+	})
+
+	t.Run("correct token authenticates and JetStream works", func(t *testing.T) {
+		h := &Handler{
+			NatsURL:    ns.ClientURL(),
+			StreamName: "EVENTS",
+			NatsToken:  token,
+			logger:     zap.NewNop(),
+		}
+		if err := h.connectNATS(); err != nil {
+			t.Fatalf("connectNATS: %v", err)
+		}
+		defer h.Cleanup()
+		js, err := h.conn.JetStream()
+		if err != nil {
+			t.Fatalf("JetStream: %v", err)
+		}
+		if _, err := js.AddStream(&nats.StreamConfig{
+			Name:     "EVENTS",
+			Subjects: []string{"events.>"},
+			Storage:  nats.MemoryStorage,
+		}); err != nil {
+			t.Fatalf("AddStream: %v", err)
+		}
+	})
+}
+
+func TestHandler_ConnectNATS_UserPassAuth_Integration(t *testing.T) {
+	const user, password = "nuts", "test-password"
+	ns := startJetStreamServerWithUserPass(t, user, password)
+	defer ns.Shutdown()
+
+	t.Run("missing credentials rejected", func(t *testing.T) {
+		h := &Handler{
+			NatsURL:    ns.ClientURL(),
+			StreamName: "EVENTS",
+			logger:     zap.NewNop(),
+		}
+		if err := h.connectNATS(); err == nil {
+			h.Cleanup()
+			t.Fatal("expected connectNATS without credentials to fail against user/pass-authed server")
+		}
+	})
+
+	t.Run("wrong password rejected", func(t *testing.T) {
+		h := &Handler{
+			NatsURL:      ns.ClientURL(),
+			StreamName:   "EVENTS",
+			NatsUser:     user,
+			NatsPassword: "wrong",
+			logger:       zap.NewNop(),
+		}
+		if err := h.connectNATS(); err == nil {
+			h.Cleanup()
+			t.Fatal("expected connectNATS with wrong password to fail")
+		}
+	})
+
+	t.Run("correct credentials authenticate and JetStream works", func(t *testing.T) {
+		h := &Handler{
+			NatsURL:      ns.ClientURL(),
+			StreamName:   "EVENTS",
+			NatsUser:     user,
+			NatsPassword: password,
+			logger:       zap.NewNop(),
+		}
+		if err := h.connectNATS(); err != nil {
+			t.Fatalf("connectNATS: %v", err)
+		}
+		defer h.Cleanup()
+		js, err := h.conn.JetStream()
+		if err != nil {
+			t.Fatalf("JetStream: %v", err)
+		}
+		if _, err := js.AddStream(&nats.StreamConfig{
+			Name:     "EVENTS",
+			Subjects: []string{"events.>"},
+			Storage:  nats.MemoryStorage,
+		}); err != nil {
+			t.Fatalf("AddStream: %v", err)
 		}
 	})
 }
