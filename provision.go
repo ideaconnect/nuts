@@ -197,6 +197,20 @@ func (h *Handler) connectNATS() error {
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			h.logger.Info("NATS connection closed")
 		}),
+		// ErrorHandler captures async failures the nats.go client would
+		// otherwise log to stderr via its default printer — most importantly
+		// ErrSlowConsumer when a subscription's internal buffer overflows
+		// and silently drops messages. Routing through h.logger + a metric
+		// makes that failure mode observable in production.
+		nats.ErrorHandler(func(nc *nats.Conn, sub *nats.Subscription, err error) {
+			kind := classifyNATSAsyncError(err)
+			metricsNATSAsyncErrors.WithLabelValues(kind).Inc()
+			fields := []zap.Field{zap.String("kind", kind), zap.Error(err)}
+			if sub != nil {
+				fields = append(fields, zap.String("subject", sub.Subject))
+			}
+			h.logger.Warn("NATS async error", fields...)
+		}),
 	}
 
 	// Apply auth (Validate ensures only one mode is configured).

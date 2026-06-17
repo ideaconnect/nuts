@@ -834,9 +834,11 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 	}
 
 	if err := writeSSEChunkWithTimeout(w, flusher, formatConnectedEvent(plan.Topics), writeTimeout); err != nil {
-		h.logger.Debug("failed to write connected event",
+		metricsWriteDisconnects.WithLabelValues("connected").Inc()
+		h.logger.Warn("failed to write connected event",
 			appendStreamLogFields(plan,
 				zap.String("disconnect_reason", "write_error"),
+				zap.String("write_site", "connected"),
 				zap.Int("write_timeout_seconds", h.WriteTimeout),
 				zap.Error(err),
 			)...,
@@ -897,9 +899,11 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 			}
 
 			if err := writeSSEChunkWithTimeout(w, flusher, formatted.Frame, writeTimeout); err != nil {
-				h.logger.Debug("failed to write message event",
+				metricsWriteDisconnects.WithLabelValues("message").Inc()
+				h.logger.Warn("failed to write message event",
 					appendStreamLogFields(plan,
 						zap.String("disconnect_reason", "write_error"),
+						zap.String("write_site", "message"),
 						zap.String("message_subject", msg.Subject),
 						zap.Int("write_timeout_seconds", h.WriteTimeout),
 						zap.Error(err),
@@ -926,9 +930,11 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 
 		case <-heartbeat.C:
 			if err := writeSSEChunkWithTimeout(w, flusher, formatHeartbeatEvent(time.Now()), writeTimeout); err != nil {
-				h.logger.Debug("failed to write heartbeat",
+				metricsWriteDisconnects.WithLabelValues("heartbeat").Inc()
+				h.logger.Warn("failed to write heartbeat",
 					appendStreamLogFields(plan,
 						zap.String("disconnect_reason", "heartbeat_write_error"),
+						zap.String("write_site", "heartbeat"),
 						zap.Int("write_timeout_seconds", h.WriteTimeout),
 						zap.Error(err),
 					)...,

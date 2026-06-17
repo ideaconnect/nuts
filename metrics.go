@@ -94,4 +94,26 @@ var (
 		Name:      "dispatch_timeout_total",
 		Help:      "Total number of NATS callbacks that timed out signalling a slow SSE client.",
 	})
+
+	// nuts_nats_async_errors_total counts asynchronous errors reported by
+	// the NATS client (most importantly nats.ErrSlowConsumer, which fires
+	// when nats.go's per-subscription buffer overflows and silently drops
+	// messages). Labelled by kind so operators can distinguish slow-consumer
+	// drops at the library layer from other async error categories.
+	metricsNATSAsyncErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "nats_async_errors_total",
+		Help:      "Total number of asynchronous NATS client errors observed by the registered ErrorHandler.",
+	}, []string{"kind"})
+
+	// nuts_write_disconnects_total counts SSE streams that ended because a
+	// write to the response writer failed (typically the deadline imposed
+	// by write_timeout fired). Labelled by site so operators can tell
+	// whether the failing write was the initial connected event, a regular
+	// message frame, or a heartbeat.
+	metricsWriteDisconnects = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "write_disconnects_total",
+		Help:      "Total number of SSE streams terminated by a response-writer write error.",
+	}, []string{"site"})
 )

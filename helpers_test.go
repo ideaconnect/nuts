@@ -2,9 +2,12 @@ package nuts
 
 import (
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 func TestIsValidCookieName_Cases(t *testing.T) {
@@ -69,4 +72,27 @@ func TestWriteSSEChunkWithTimeout_FallbackAndErrors(t *testing.T) {
 			t.Fatalf("err = %v, want boom", err)
 		}
 	})
+}
+
+func TestClassifyNATSAsyncError(t *testing.T) {
+	cases := []struct {
+		name string
+		in   error
+		want string
+	}{
+		{"nil", nil, "unknown"},
+		{"slow consumer", nats.ErrSlowConsumer, "slow_consumer"},
+		{"slow consumer wrapped", fmt.Errorf("subscribe: %w", nats.ErrSlowConsumer), "slow_consumer"},
+		{"timeout", nats.ErrTimeout, "timeout"},
+		{"connection closed", nats.ErrConnectionClosed, "connection_state"},
+		{"connection draining", nats.ErrConnectionDraining, "connection_state"},
+		{"unknown error", errors.New("some unrelated"), "other"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyNATSAsyncError(tc.in); got != tc.want {
+				t.Errorf("classifyNATSAsyncError(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
 }

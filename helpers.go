@@ -10,7 +10,27 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
+
+// classifyNATSAsyncError maps a nats.go async error to a stable Prometheus
+// label value. Keep the label set small and bounded — Prometheus cardinality
+// matters, and operators triage on kind, not the underlying error string.
+func classifyNATSAsyncError(err error) string {
+	switch {
+	case err == nil:
+		return "unknown"
+	case errors.Is(err, nats.ErrSlowConsumer):
+		return "slow_consumer"
+	case errors.Is(err, nats.ErrTimeout):
+		return "timeout"
+	case errors.Is(err, nats.ErrConnectionClosed), errors.Is(err, nats.ErrConnectionDraining):
+		return "connection_state"
+	default:
+		return "other"
+	}
+}
 
 // toJSON marshals any value to a JSON string. On error it returns "{}".
 // Used primarily to embed payloads inside SSE data lines.
