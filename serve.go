@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -277,6 +278,14 @@ func isReplayStartSequenceError(err error, hasLastID bool) bool {
 // until the client or the server closes the connection. Non-stream requests
 // are passed to the next handler in the Caddy chain when one is configured.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	// Set CORS headers before any short-circuit response path. Otherwise a
+	// browser hitting a 401 (JWT failure), 400 (validation), 405 (method),
+	// or 503 (jetstream unavailable / max_connections) would see an opaque
+	// CORS failure instead of the real status code. setCORSHeaders is a
+	// no-op when the request has no Origin or the Origin is not allow-
+	// listed, so this is safe to call on every request including probes.
+	h.setCORSHeaders(w, r)
+
 	if handled, err := h.handleControlRequest(w, r, next); handled {
 		return err
 	}
@@ -821,7 +830,8 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 	defer metricsActiveConnections.Dec()
 	writeTimeout := time.Duration(h.WriteTimeout) * time.Second
 
-	h.setCORSHeaders(w, r)
+	// CORS headers were already applied at the top of ServeHTTP — repeating
+	// the call here is harmless (idempotent) but unnecessary.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1385,7 +1395,12 @@ func (h *Handler) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	if !explicit && !wildcard {
 		return
 	}
-	w.Header().Add("Vary", "Origin")
+	// Idempotent: serveStream (and any other code path) may also call
+	// setCORSHeaders. Adding Vary only when it's not already present
+	// avoids "Vary: Origin, Origin" on the wire.
+	if !slices.Contains(w.Header().Values("Vary"), "Origin") {
+		w.Header().Add("Vary", "Origin")
+	}
 	w.Header().Set("Access-Control-Allow-Origin", origin)
 	w.Header().Set("Access-Control-Allow-Methods", methods)
 	w.Header().Set("Access-Control-Allow-Headers", headers)

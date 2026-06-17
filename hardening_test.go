@@ -139,6 +139,47 @@ func TestHandler_CORS_ExplicitOriginSetsCredentials(t *testing.T) {
 	}
 }
 
+// TestHandler_CORS_FiresOnErrorResponses asserts that browser-visible
+// error responses (validation 400, method-not-allowed 405) include the
+// configured CORS headers. Without this, browsers translate the failure
+// into an opaque CORS error and the operator never sees the real status.
+func TestHandler_CORS_FiresOnErrorResponses(t *testing.T) {
+	h := &Handler{
+		AllowedOrigins: []string{"https://app.example.com"},
+		StreamName:     "TEST",
+		logger:         zap.NewNop(),
+	}
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		want   int
+	}{
+		{"bad request (no topics)", http.MethodGet, "/", http.StatusBadRequest},
+		{"method not allowed (POST without next)", http.MethodPost, "/events?topic=x", http.StatusMethodNotAllowed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Origin", "https://app.example.com")
+			rr := httptest.NewRecorder()
+			if err := h.ServeHTTP(rr, req, nil); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if rr.Code != tc.want {
+				t.Errorf("status = %d, want %d", rr.Code, tc.want)
+			}
+			if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+				t.Errorf("Access-Control-Allow-Origin: got %q, want %q", got, "https://app.example.com")
+			}
+			if got := rr.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+				t.Errorf("Vary: got %q, want to contain 'Origin'", got)
+			}
+		})
+	}
+}
+
 // TestHandler_CORS_UnlistedOrigin asserts that an unknown origin receives
 // no CORS headers.
 func TestHandler_CORS_UnlistedOrigin(t *testing.T) {
