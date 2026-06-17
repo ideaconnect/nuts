@@ -187,7 +187,7 @@ func verifySubscriberJWT(token string, key []byte, now time.Time) (subscriberCla
 	// timestamps decoded as float64 can round and silently shift the
 	// expiry check by a second or more.
 	decoder.UseNumber()
-	claimsMap := map[string]interface{}{}
+	claimsMap := map[string]any{}
 	if err := decoder.Decode(&claimsMap); err != nil {
 		return subscriberClaims{}, fmt.Errorf("parse JWT payload: %w", err)
 	}
@@ -242,7 +242,7 @@ func jwtHMACHash(alg string) (func() hash.Hash, error) {
 // Both are optional; absence is not an error (the caller can require them
 // at a higher layer if needed). Missing/zero values are treated as "claim
 // not provided" rather than "claim is zero".
-func validateJWTTimeClaims(claims map[string]interface{}, now time.Time) error {
+func validateJWTTimeClaims(claims map[string]any, now time.Time) error {
 	if exp, ok, err := jwtNumericDate(claims["exp"]); err != nil {
 		return fmt.Errorf("invalid exp claim: %w", err)
 	} else if ok && !now.Before(exp) {
@@ -263,7 +263,7 @@ func validateJWTTimeClaims(claims map[string]interface{}, now time.Time) error {
 // caller can distinguish "missing" from "present but invalid". Requires
 // json.Number; a string or boolean disguised as a date is an error rather
 // than silently treated as missing.
-func jwtNumericDate(value interface{}) (time.Time, bool, error) {
+func jwtNumericDate(value any) (time.Time, bool, error) {
 	if value == nil {
 		return time.Time{}, false, nil
 	}
@@ -285,12 +285,12 @@ func jwtNumericDate(value interface{}) (time.Time, bool, error) {
 // — a token without it is rejected — and every entry must pass
 // isValidTopicFilter so authorization decisions are made on a known
 // alphabet.
-func parseSubscribeClaim(value interface{}) ([]string, error) {
+func parseSubscribeClaim(value any) ([]string, error) {
 	var filters []string
 	switch typed := value.(type) {
 	case string:
 		filters = []string{typed}
-	case []interface{}:
+	case []any:
 		for _, item := range typed {
 			filter, ok := item.(string)
 			if !ok {

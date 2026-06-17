@@ -14,7 +14,7 @@ import (
 
 // toJSON marshals any value to a JSON string. On error it returns "{}".
 // Used primarily to embed payloads inside SSE data lines.
-func toJSON(v interface{}) string {
+func toJSON(v any) string {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return "{}"
@@ -23,13 +23,13 @@ func toJSON(v interface{}) string {
 }
 
 // tryParseJSON attempts to preserve raw JSON values without coercing numbers
-// through interface{} / float64. If the bytes are valid JSON, a compacted
+// through any / float64. If the bytes are valid JSON, a compacted
 // json.RawMessage is returned so json.Marshal embeds it directly in the SSE
 // envelope. Otherwise the raw bytes are returned as a plain string.
 //
 // Callers MUST bound len(data) before invoking this function — JSON compaction
 // allocates and is unsafe on untrusted unbounded input.
-func tryParseJSON(data []byte) interface{} {
+func tryParseJSON(data []byte) any {
 	var compacted bytes.Buffer
 	if err := json.Compact(&compacted, data); err != nil {
 		return string(data)

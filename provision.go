@@ -132,7 +132,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 	// Step 2: Open the NATS connection.
 	if err := h.connectNATS(); err != nil {
-		provisionErr = fmt.Errorf("failed to connect to NATS: %v", err)
+		provisionErr = fmt.Errorf("failed to connect to NATS: %w", err)
 		return provisionErr
 	}
 
@@ -147,7 +147,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	js, err := conn.JetStream()
 	h.mu.RUnlock()
 	if err != nil {
-		provisionErr = fmt.Errorf("failed to create JetStream context: %v", err)
+		provisionErr = fmt.Errorf("failed to create JetStream context: %w", err)
 		return provisionErr
 	}
 
@@ -158,7 +158,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// Step 4: Verify that the configured stream actually exists.
 	_, err = js.StreamInfo(h.StreamName)
 	if err != nil {
-		provisionErr = fmt.Errorf("JetStream stream '%s' not found. Please create the stream first. See README for instructions. Error: %v", h.StreamName, err)
+		provisionErr = fmt.Errorf("JetStream stream '%s' not found. Please create the stream first. See README for instructions. Error: %w", h.StreamName, err)
 		return provisionErr
 	}
 
@@ -238,7 +238,7 @@ func (h *Handler) buildTLSConfig() (*tls.Config, error) {
 	if h.NatsTLSCA != "" {
 		pem, err := os.ReadFile(h.NatsTLSCA)
 		if err != nil {
-			return nil, fmt.Errorf("read nats_tls_ca: %v", err)
+			return nil, fmt.Errorf("read nats_tls_ca: %w", err)
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pem) {
@@ -250,7 +250,7 @@ func (h *Handler) buildTLSConfig() (*tls.Config, error) {
 	if h.NatsTLSCert != "" && h.NatsTLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(h.NatsTLSCert, h.NatsTLSKey)
 		if err != nil {
-			return nil, fmt.Errorf("load nats_tls_cert/key: %v", err)
+			return nil, fmt.Errorf("load nats_tls_cert/key: %w", err)
 		}
 		cfg.Certificates = []tls.Certificate{cert}
 	}
