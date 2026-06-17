@@ -31,6 +31,14 @@ const defaultLivePath = "/livez"
 // defaultReadyPath is used when no ready_path directive is configured.
 const defaultReadyPath = "/readyz"
 
+// defaultReadinessProbeTimeout bounds how long the readiness probe will
+// wait on JetStream's StreamInfo call. Without it, a partially-degraded
+// JetStream cluster can stall the probe up to nats.go's library default
+// (5s), which is longer than the readiness budget most orchestrators
+// use. 1s is well above realistic JetStream latency and well below
+// kubelet's default 1s timeout.
+const defaultReadinessProbeTimeout = time.Second
+
 // defaultMaxTopicsPerSubscription bounds how many distinct ?topic= filters
 // a single SSE request may carry when MaxTopicsPerSubscription is 0. A
 // strict default protects NATS from consumer-creation amplification by an
@@ -112,17 +120,21 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.shutdown = make(chan struct{})
 	h.mu.Unlock()
 
-	// Step 2: Open the NATS connection.
-	if err := h.connectNATS(); err != nil {
-		return fmt.Errorf("failed to connect to NATS: %v", err)
-	}
-
+	// Register the failure-cleanup deferred call BEFORE the first step that
+	// can fail. Otherwise an early failure (e.g. connectNATS) returns before
+	// the defer is registered and leaks the shutdown channel created above.
 	var provisionErr error
 	defer func() {
 		if provisionErr != nil {
 			_ = h.Cleanup()
 		}
 	}()
+
+	// Step 2: Open the NATS connection.
+	if err := h.connectNATS(); err != nil {
+		provisionErr = fmt.Errorf("failed to connect to NATS: %v", err)
+		return provisionErr
+	}
 
 	// Step 3: Create a JetStream context.
 	h.mu.RLock()

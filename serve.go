@@ -1435,7 +1435,10 @@ func (h *Handler) serveReadinessCheck(w http.ResponseWriter) error {
 		resp.Stream = "unavailable"
 		statusCode = http.StatusServiceUnavailable
 	} else {
-		_, err := js.StreamInfo(h.StreamName)
+		// Bound the JetStream call so a partially-degraded server can't stall
+		// the probe past the orchestrator's readiness budget. See
+		// defaultReadinessProbeTimeout for rationale.
+		_, err := js.StreamInfo(h.StreamName, nats.MaxWait(defaultReadinessProbeTimeout))
 		if err != nil {
 			resp.Status = "degraded"
 			resp.Stream = "unavailable"

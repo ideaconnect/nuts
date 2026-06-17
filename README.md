@@ -681,6 +681,16 @@ availability:
 Operational runbooks and Kubernetes probe examples are in
 [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
+> **Probe path matching:** the configured probe paths match either as an
+> exact path or as a path suffix on a `/`-segment boundary. So with the
+> default `/healthz`, both `/healthz` and `/events/healthz` are routed
+> to the probe handler. A topic-shorthand path that happens to end with
+> the configured probe path (e.g. a topic named `orders/healthz` reached
+> via path-shorthand) will be intercepted by the probe handler instead of
+> opening an SSE stream. If you use path-shorthand with topic names that
+> could collide, configure unique probe paths via `health_path`,
+> `live_path`, and `ready_path`.
+
 ### Prometheus Metrics
 
 NUTS registers the following metrics via `promauto`, which appear automatically on Caddy's `/metrics` endpoint when the [admin API](https://caddyserver.com/docs/caddyfile/options#admin) or a [metrics handler](https://caddyserver.com/docs/caddyfile/directives/metrics) is enabled.
