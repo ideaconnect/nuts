@@ -2173,6 +2173,72 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 	}
 }
 
+// TestHandler_ServeHTTP_HeartbeatWriteFailure covers the heartbeat-write
+// branch in serve.go (disconnect_reason=heartbeat_write_error) that was
+// previously the only write site without an end-to-end test. The
+// connected event is allowed (1 permitted write); no JetStream messages
+// are published; the next write site to fire is the heartbeat tick.
+func TestHandler_ServeHTTP_HeartbeatWriteFailure(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("failed to connect to NATS: %v", err)
+	}
+	defer nc.Close()
+
+	createTestStream(t, nc, "TEST_EVENTS", []string{"events.>"})
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "TEST_EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 1, // minimum — fire heartbeat as quickly as possible
+		ReconnectWait:     2,
+		MaxReconnects:     intPtr(-1),
+		AllowedOrigins:    []string{"*"},
+		logger:            zap.NewNop(),
+	}
+
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+	defer h.Cleanup()
+
+	js, _ := h.conn.JetStream()
+	h.mu.Lock()
+	h.js = js
+	h.mu.Unlock()
+
+	before := counterValue(metricsWriteDisconnects, "heartbeat")
+
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=hb", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 4*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	w := newFailingFlushRecorder(1) // 1 = allow `event: connected`, fail heartbeat
+	done := make(chan error, 1)
+	go func() { done <- h.ServeHTTP(w, req, nil) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ServeHTTP did not return after heartbeat write failure")
+	}
+
+	if got := counterValue(metricsWriteDisconnects, "heartbeat"); got <= before {
+		t.Fatalf("nuts_write_disconnects_total{site=heartbeat} did not increment: before=%v got=%v", before, got)
+	}
+	if got := atomic.LoadInt64(&h.connCount); got != 0 {
+		t.Fatalf("connCount = %d, want 0 after heartbeat write failure", got)
+	}
+}
+
 func TestHandler_ProvisionCleanupOnFailure(t *testing.T) {
 	// Simulate the provision path: connect succeeds, but StreamInfo fails.
 	// The deferred cleanup should close the connection and nil the fields.

@@ -1930,3 +1930,62 @@ func TestHandler_Validate_NoWarningForLongJWTKey(t *testing.T) {
 		t.Errorf("did not expect short-key warning, entries=%+v", obs.All())
 	}
 }
+
+// TestHandler_SubscriberJWT_RejectionCreatesNoConsumer asserts that a
+// JWT-rejected request short-circuits BEFORE any JetStream consumer is
+// created. A regression that flipped the order (subscribe first, auth
+// later) would silently weaken auth: a forged token would still have
+// caused server-side state to be allocated, leaving room for amplification
+// or resource-exhaustion attacks.
+func TestHandler_SubscriberJWT_RejectionCreatesNoConsumer(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30,
+		AllowedOrigins:    []string{"*"},
+		SubscriberJWTKey:  "test-secret-with-sufficient-length-12345",
+		logger:            zap.NewNop(),
+	}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+	defer h.Cleanup()
+	js, _ := h.conn.JetStream()
+	h.mu.Lock()
+	h.js = js
+	h.mu.Unlock()
+
+	// Baseline: no consumers on the stream.
+	if !waitForConsumerCount(t, js, "EVENTS", 0, 500*time.Millisecond) {
+		t.Fatalf("baseline: expected 0 consumers, got otherwise")
+	}
+
+	// Request with a deliberately invalid JWT.
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=secret", nil)
+	req.Header.Set("Authorization", "Bearer not.a.valid.token")
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+
+	// Post-rejection: still no consumers. waitForConsumerCount sleeps
+	// briefly so any racing consumer-create would have time to surface.
+	if !waitForConsumerCount(t, js, "EVENTS", 0, 1*time.Second) {
+		// Surface the actual count so a future regression is obvious in CI.
+		info, _ := js.StreamInfo("EVENTS")
+		t.Fatalf("post-rejection: expected 0 consumers, stream had %d", info.State.Consumers)
+	}
+}

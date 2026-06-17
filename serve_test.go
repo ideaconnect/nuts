@@ -256,6 +256,73 @@ func TestSubjectMatchesFilterRejectsEmptyValues(t *testing.T) {
 	}
 }
 
+// TestSubjectMatchesFilter_GreaterThanTerminatedFilterTokenCount covers
+// the specific edge case the original example tests missed: a subject
+// with FEWER tokens than a `>`-terminated filter. NATS requires `X.>` to
+// match `X.<one-or-more-tokens>`, so a bare `orders` (no dots) must NOT
+// match `orders.>`. Symmetrically the multi-token case must match.
+func TestSubjectMatchesFilter_GreaterThanTerminatedFilterTokenCount(t *testing.T) {
+	cases := []struct {
+		subject string
+		filter  string
+		want    bool
+	}{
+		{"orders", "orders.>", false},               // FEWER tokens than filter requires
+		{"orders.created", "orders.>", true},        // exactly one trailing token
+		{"orders.created.gold", "orders.>", true},   // multiple trailing tokens
+		{"events.x.y.z", "events.>", true},          // deep nesting
+		{"events", "events.>", false},               // root token only
+		{"events.foo.bar.baz", "events.foo.>", true},
+		{"events.foo", "events.foo.>", false},
+	}
+	for _, c := range cases {
+		t.Run(c.subject+" vs "+c.filter, func(t *testing.T) {
+			if got := subjectMatchesFilter(c.subject, c.filter); got != c.want {
+				t.Errorf("subjectMatchesFilter(%q, %q) = %v, want %v", c.subject, c.filter, got, c.want)
+			}
+		})
+	}
+}
+
+// TestHandler_PlanSubscription_TopicPrefixVariants verifies plan
+// construction across non-`events.` prefix shapes the existing tests
+// never exercised: empty prefix (path-shorthand), no-trailing-dot
+// prefix (legacy operator typo), and multi-segment prefix.
+func TestHandler_PlanSubscription_TopicPrefixVariants(t *testing.T) {
+	cases := []struct {
+		name             string
+		topicPrefix      string
+		topics           []string
+		wantFullSubjects []string
+	}{
+		{"empty prefix yields bare topics", "", []string{"orders.new"}, []string{"orders.new"}},
+		{"trailing-dot prefix concatenates", "events.", []string{"new"}, []string{"events.new"}},
+		{"no-trailing-dot prefix concatenates as-is", "tenant1", []string{"orders.new"}, []string{"tenant1orders.new"}},
+		{"multi-segment prefix is preserved", "team.alpha.", []string{"alerts"}, []string{"team.alpha.alerts"}},
+		{"multiple topics under multi-segment prefix", "team.alpha.", []string{"alerts", "logs.error"}, []string{"team.alpha.alerts", "team.alpha.logs.error"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := &Handler{TopicPrefix: c.topicPrefix, logger: zap.NewNop()}
+			q := ""
+			for _, top := range c.topics {
+				if q != "" {
+					q += "&"
+				}
+				q += "topic=" + top
+			}
+			req := httptest.NewRequest(http.MethodGet, "/events?"+q, nil)
+			plan, reqErr := h.parseStreamRequest(req)
+			if reqErr != nil {
+				t.Fatalf("parseStreamRequest: %#v", reqErr)
+			}
+			if !reflect.DeepEqual(plan.FullSubjects, c.wantFullSubjects) {
+				t.Errorf("FullSubjects = %#v, want %#v", plan.FullSubjects, c.wantFullSubjects)
+			}
+		})
+	}
+}
+
 func TestMatchesConfiguredPathNormalizesConfiguredPath(t *testing.T) {
 	if !matchesConfiguredPath("/events/live", "live", defaultLivePath) {
 		t.Fatal("configured path without leading slash should match as a path suffix")
