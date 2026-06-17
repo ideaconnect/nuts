@@ -31,6 +31,15 @@ const defaultLivePath = "/livez"
 // defaultReadyPath is used when no ready_path directive is configured.
 const defaultReadyPath = "/readyz"
 
+// defaultConsumerInactiveThreshold is how long JetStream waits after the
+// last delivery / activity before reaping an ephemeral NUTS consumer.
+// Without an explicit threshold, nats-server falls back to its own
+// default (5s) and a client disconnect followed by a tight reconnect
+// loop can accumulate server-side consumer state. 30s is conservative
+// enough for legitimate slow disconnect detection while bounding state
+// accumulation under churn.
+const defaultConsumerInactiveThreshold = 30 * time.Second
+
 // defaultReadinessProbeTimeout bounds how long the readiness probe will
 // wait on JetStream's StreamInfo call. Without it, a partially-degraded
 // JetStream cluster can stall the probe up to nats.go's library default

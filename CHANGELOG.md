@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- README `Compatibility` table (Go, Caddy, NATS minimum tested) and a
+  `Versioning policy` section documenting semver discipline, deprecation
+  and removal cadence, and the `:latest` Docker-tag warning.
+- New Prometheus counter `nuts_nats_async_errors_total{kind}` populated
+  by a registered `nats.ErrorHandler`. Kinds: `slow_consumer`, `timeout`,
+  `connection_state`, `other`. Surfaces `nats.ErrSlowConsumer` drops that
+  previously hit nats.go's default stderr printer with no metric or
+  structured log.
+- New Prometheus counter `nuts_write_disconnects_total{site}` labelled
+  by SSE write site (`connected`, `message`, `heartbeat`). All three
+  write-error sites also upgraded from Debug to Warn so default-level
+  log piles surface client-side disconnects driven by `write_timeout`.
+- New Prometheus counter `nuts_wildcard_filter_drops_total` for the
+  multi-topic wildcard fallback's client-side filter. Non-zero means a
+  NATS server older than 2.10 is delivering subjects the client did not
+  request and NUTS is filtering them in-process.
+- Ephemeral JetStream consumers now set an explicit
+  `nats.InactiveThreshold` (default 30s, see
+  `defaultConsumerInactiveThreshold`) so server-side consumer state is
+  reaped promptly under reconnect churn instead of relying on
+  nats-server's 5s default.
+
+### Changed
+- **Breaking metric format.** `nuts_messages_dropped_total` is now a
+  labelled counter `nuts_messages_dropped_total{reason}` so operators
+  can distinguish raw-NATS oversize (`reason=raw_payload`) from SSE-
+  envelope oversize (`reason=formatted_sse_message`). Update PromQL
+  queries (`sum(nuts_messages_dropped_total)` continues to work
+  unchanged; queries that asserted the unlabelled series specifically
+  must add `{reason=~".+"}` or similar).
+- CORS headers (`Access-Control-Allow-Origin`, `Access-Control-Allow-
+  Methods`, `Access-Control-Allow-Headers`, `Access-Control-Allow-
+  Credentials`, `Vary: Origin`) now apply to every response including
+  400, 401, 403, 405, and 503 paths. Previously only the SSE stream
+  and OPTIONS preflight set them, so browsers translated auth and
+  validation failures into opaque CORS errors instead of the real
+  status code.
+- The readiness probe's `StreamInfo` call now passes
+  `nats.MaxWait(1s)` (`defaultReadinessProbeTimeout`) so a partially-
+  degraded JetStream cluster cannot stall the probe past the
+  orchestrator's readiness budget.
+- `Provision()`'s failure-cleanup defer is now registered before
+  `connectNATS` so an early connect failure runs `Cleanup()` instead of
+  leaking the just-created shutdown channel. `connectNATS` errors are
+  promoted to the shared `provisionErr` so the defer fires.
+- Error wrapping discipline: `fmt.Errorf` call sites in `provision.go`
+  use `%w` instead of `%v` so `errors.Is`/`As` work for callers.
+- `interface{}` → `any` in production code (`auth.go`, `helpers.go`,
+  `handler.go`).
+- README `docker-compose` snippet for NATS now includes `-m 8222` in the
+  command so the documented healthcheck on port 8222 actually passes.
+  Without it the depends-on health gate blocked forever.
+- README build-from-source Go version raised from `1.26.2+` to
+  `1.26.4+` to match `go.mod`.
+
+### Fixed
+- README documents the probe-path suffix-match semantic and the
+  topic-shorthand collision risk for topics ending in the configured
+  probe paths. Operators with conflicting topic names should configure
+  unique `health_path`, `live_path`, `ready_path`.
+
 ## [0.3.0] - 2026-05-21
 
 ### Added

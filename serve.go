@@ -591,6 +591,7 @@ func (h *Handler) signalSlowClient(slowClient chan<- string, subject string, don
 func (p streamPlan) requestedMessageHandler(enqueueMessage nats.MsgHandler) nats.MsgHandler {
 	return func(msg *nats.Msg) {
 		if _, ok := p.RequestedSubjects[msg.Subject]; !ok {
+			metricsWildcardFilterDrops.Inc()
 			return
 		}
 		enqueueMessage(msg)
@@ -702,10 +703,17 @@ func (h *Handler) replayWindowStart() time.Time {
 
 // subscriptionOptions translates the resolved replay plan into the SubOpts
 // that JetStream expects. Always pins the consumer to the configured stream
-// (BindStream) and disables acks (AckNone) — NUTS is read-only and replay is
-// driven entirely by start position, not by ack state.
+// (BindStream), disables acks (AckNone) — NUTS is read-only and replay is
+// driven entirely by start position, not by ack state — and sets an
+// explicit InactiveThreshold so server-side consumer state is reaped
+// promptly after a client disconnect (default 30s; see
+// defaultConsumerInactiveThreshold for rationale).
 func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
-	opts := []nats.SubOpt{nats.BindStream(h.StreamName), nats.AckNone()}
+	opts := []nats.SubOpt{
+		nats.BindStream(h.StreamName),
+		nats.AckNone(),
+		nats.InactiveThreshold(defaultConsumerInactiveThreshold),
+	}
 	switch plan.Replay.Mode {
 	case replayModeStartSequence:
 		opts = append(opts, nats.StartSequence(plan.Replay.StartSequence))
@@ -1082,7 +1090,11 @@ func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMess
 // message the formatter decided not to send. Operators rely on these logs
 // to size MaxEventSize correctly without grepping the message payloads.
 func (h *Handler) recordDroppedMessage(formatted formattedMessageEvent) {
-	metricsMessagesDropped.Inc()
+	reason := formatted.DropReason
+	if reason == "" {
+		reason = "unknown"
+	}
+	metricsMessagesDropped.WithLabelValues(reason).Inc()
 	switch formatted.DropReason {
 	case dropReasonRawPayload:
 		h.logger.Warn("dropping oversized NATS payload",

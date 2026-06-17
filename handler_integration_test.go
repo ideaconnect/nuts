@@ -244,7 +244,7 @@ func TestMetrics_MessagesDropped_IncrementsOnOversized(t *testing.T) {
 		t.Fatalf("publish oversized: %v", err)
 	}
 
-	before := counterVal(t, metricsMessagesDropped)
+	before := counterValue(metricsMessagesDropped, dropReasonRawPayload)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -257,7 +257,7 @@ func TestMetrics_MessagesDropped_IncrementsOnOversized(t *testing.T) {
 	// increment the counter. We don't need to wait for ctx to expire.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if counterVal(t, metricsMessagesDropped) > before {
+		if counterValue(metricsMessagesDropped, dropReasonRawPayload) > before {
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -265,9 +265,9 @@ func TestMetrics_MessagesDropped_IncrementsOnOversized(t *testing.T) {
 	cancel()
 	<-done
 
-	got := counterVal(t, metricsMessagesDropped)
+	got := counterValue(metricsMessagesDropped, dropReasonRawPayload)
 	if got <= before {
-		t.Errorf("messages_dropped_total did not increment: before=%v got=%v body=%s", before, got, rr.Body())
+		t.Errorf("messages_dropped_total{reason=raw_payload} did not increment: before=%v got=%v body=%s", before, got, rr.Body())
 	}
 }
 

@@ -719,7 +719,8 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 |--------|------|-------------|
 | `nuts_active_connections` | Gauge | Currently connected SSE clients |
 | `nuts_messages_delivered_total` | Counter | SSE message events successfully written |
-| `nuts_messages_dropped_total` | Counter | Messages dropped (exceeded `max_event_size`) |
+| `nuts_messages_dropped_total{reason}` | Counter (labeled) | Messages dropped during SSE formatting. `reason` is one of `raw_payload` (inbound NATS payload exceeded `max_event_size`) or `formatted_sse_message` (SSE envelope after JSON wrap exceeded `max_event_size`). |
+| `nuts_wildcard_filter_drops_total` | Counter | Messages silently filtered client-side by the multi-topic wildcard fallback (subjects not requested by the client). Non-zero means a server older than NATS 2.10 is wasting bandwidth on unrequested subjects. |
 | `nuts_slow_client_disconnects_total` | Counter | Clients disconnected due to slow consumption |
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
 | `nuts_replay_fallbacks_total` | Counter | Replay requests that used fallback replay (requested sequence was purged or older than `replay_window`) |

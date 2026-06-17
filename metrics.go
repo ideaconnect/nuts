@@ -27,12 +27,29 @@ var (
 		Help:      "Total number of SSE message events delivered to clients.",
 	})
 
-	// nuts_messages_dropped_total counts messages that were dropped
-	// because they exceeded max_event_size.
-	metricsMessagesDropped = promauto.NewCounter(prometheus.CounterOpts{
+	// nuts_messages_dropped_total counts messages that were dropped during
+	// SSE formatting. Labelled by reason so operators can distinguish a
+	// pure-NATS oversize (the inbound JetStream payload exceeded
+	// max_event_size) from a post-envelope oversize (the SSE frame after
+	// JSON wrap exceeded max_event_size). The two are tuned differently:
+	// raw_payload usually points at producer-side issues, formatted_sse_message
+	// at SSE envelope overhead on small but pathological payloads.
+	metricsMessagesDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "messages_dropped_total",
-		Help:      "Total number of messages dropped (oversized events).",
+		Help:      "Total number of messages dropped during SSE formatting. Labelled by drop reason.",
+	}, []string{"reason"})
+
+	// nuts_wildcard_filter_drops_total counts how many JetStream messages
+	// were silently filtered client-side by the multi-topic wildcard
+	// fallback path (servers older than NATS 2.10 that lack
+	// ConsumerFilterSubjects). A non-zero value means the wildcard
+	// subscription is wasting bandwidth on subjects no client requested;
+	// operators can use this to size the move to NATS >= 2.10.
+	metricsWildcardFilterDrops = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "wildcard_filter_drops_total",
+		Help:      "Total number of messages dropped by the multi-topic wildcard fallback's client-side filter (subjects not requested by the client).",
 	})
 
 	// nuts_slow_client_disconnects_total counts clients that were

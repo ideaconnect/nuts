@@ -207,7 +207,7 @@ func TestHandler_CountsTowardReplayCapWithoutSequenceMetadata(t *testing.T) {
 
 func TestHandler_RecordDroppedMessageLogsFormattedEvent(t *testing.T) {
 	h := &Handler{MaxEventSize: 64, logger: zap.NewNop()}
-	before := counterVal(t, metricsMessagesDropped)
+	before := counterValue(metricsMessagesDropped, dropReasonFormattedSSEMessage)
 
 	h.recordDroppedMessage(formattedMessageEvent{
 		Subject:    "events.big",
@@ -215,8 +215,8 @@ func TestHandler_RecordDroppedMessageLogsFormattedEvent(t *testing.T) {
 		DropSize:   128,
 	})
 
-	if got := counterVal(t, metricsMessagesDropped); got <= before {
-		t.Fatalf("messages dropped metric did not increment: before=%v got=%v", before, got)
+	if got := counterValue(metricsMessagesDropped, dropReasonFormattedSSEMessage); got <= before {
+		t.Fatalf("messages dropped metric (reason=formatted_sse_message) did not increment: before=%v got=%v", before, got)
 	}
 }
 
