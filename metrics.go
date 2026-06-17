@@ -51,12 +51,14 @@ var (
 		Help:      "Total number of SSE connections requesting message replay.",
 	})
 
-	// nuts_replay_fallbacks_total counts how many times the requested
-	// sequence was purged and NUTS used the configured fallback strategy.
+	// nuts_replay_fallbacks_total counts how many times NUTS used a fallback
+	// replay strategy: either because the requested sequence was purged
+	// (below retention) or because it was older than the configured
+	// replay_window.
 	metricsReplayFallbacks = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "replay_fallbacks_total",
-		Help:      "Total number of replay requests that used fallback replay due to purged sequences.",
+		Help:      "Total number of replay requests that used fallback replay (purged sequence or older than replay_window).",
 	})
 
 	// nuts_subscription_errors_total counts failed JetStream subscribe attempts.

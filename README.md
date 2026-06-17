@@ -40,6 +40,8 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 ## Table of Contents
 
 - [Features](#features)
+- [Compatibility](#compatibility)
+- [Versioning policy](#versioning-policy)
 - [Installation](#installation)
   - [Using xcaddy (Recommended)](#using-xcaddy-recommended)
   - [Building from Source](#building-from-source)
@@ -98,6 +100,34 @@ directory:
   MSI targets, accepted-survivors log, and run reports.
 - [docs/MERCURE.md](docs/MERCURE.md) — short note on Mercure, which inspired
   NUTS.
+- [docs/SECURITY.md](docs/SECURITY.md) — security model, auth boundaries,
+  reverse-proxy patterns, and the supported disclosure process.
+
+## Compatibility
+
+| Component | Minimum tested | Notes |
+| --- | --- | --- |
+| Go (build) | 1.26.4 (`go.mod`) | Matches the toolchain `Dockerfile` uses. |
+| Caddy | 2.11.x | Embedded via `xcaddy`. Patch bumps tracked in `CHANGELOG.md`. |
+| NATS server | 2.9-alpine | Functional matrix covers `nats:2.9-alpine` and `nats:2.12-alpine` (see [`Makefile`](Makefile) `test-functional-matrix`). The in-process unit suite uses the embedded `nats-server/v2` library pinned in `go.mod`. |
+
+## Versioning policy
+
+NUTS follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+- **MAJOR** — incompatible changes to the Caddyfile directive set, JSON
+  config schema, Prometheus metric names or label sets, exported Go API,
+  or the HTTP response shape (status codes, headers, SSE framing).
+- **MINOR** — additive features, new directives, new metrics, new optional
+  behaviour gated on configuration. Existing configs continue to load
+  with unchanged semantics.
+- **PATCH** — bug fixes, security fixes, performance improvements with no
+  observable contract change.
+
+Deprecations land in a MINOR release with a warning at provision time
+and a note in `CHANGELOG.md`; removals land no sooner than the next
+MAJOR release. The `:latest` Docker tag follows `main`; production
+deployments should pin a specific tag (`vX.Y.Z`).
 
 ## Installation
 
@@ -151,7 +181,10 @@ A typical production-like stack with NATS and NUTS:
 services:
   nats:
     image: nats:2.12-alpine
-    command: ["--jetstream", "--store_dir=/data"]
+    # -m 8222 enables the HTTP monitoring endpoint that the healthcheck
+    # below probes. Without it the healthcheck never passes and any
+    # depends_on: { condition: service_healthy } gates block forever.
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
     volumes:
       - nats-data:/data
     healthcheck:
@@ -679,7 +712,7 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_messages_dropped_total` | Counter | Messages dropped (exceeded `max_event_size`) |
 | `nuts_slow_client_disconnects_total` | Counter | Clients disconnected due to slow consumption |
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
-| `nuts_replay_fallbacks_total` | Counter | Replay requests that used fallback replay because the requested sequence was purged |
+| `nuts_replay_fallbacks_total` | Counter | Replay requests that used fallback replay (requested sequence was purged or older than `replay_window`) |
 | `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
 | `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` labels the cause (e.g. `max_connections`). |
 | `nuts_replay_cap_reached_total` | Counter | Replaying SSE connections closed after `replay_max_messages` was reached |
@@ -942,7 +975,7 @@ the groundwork they laid in this space and we respect their work. See
 
 ### Prerequisites
 
-- Go 1.26.2+
+- Go 1.26.4+ (matches the `go` directive in [`go.mod`](go.mod))
 - Docker (for running NATS server)
 - [NATS CLI](https://github.com/nats-io/natscli) (optional, for manual testing)
 
