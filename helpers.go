@@ -12,7 +12,24 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"go.uber.org/zap"
 )
+
+// nopLogger is reused by Handler.log() when h.logger is nil so call sites
+// don't have to spell out the guard each time. zap.NewNop() is cheap to
+// construct but reusing one instance keeps the hot path branch-free.
+var nopLogger = zap.NewNop()
+
+// log returns h.logger when set and a no-op logger otherwise. Keeps every
+// h.log().X(...) call site safe regardless of whether the handler went
+// through Provision (which sets h.logger from ctx.Logger) or was
+// constructed directly by a test that forgot to set the field.
+func (h *Handler) log() *zap.Logger {
+	if h.logger != nil {
+		return h.logger
+	}
+	return nopLogger
+}
 
 // classifyNATSAsyncError maps a nats.go async error to a stable Prometheus
 // label value. Keep the label set small and bounded — Prometheus cardinality

@@ -74,22 +74,18 @@ func (h *Handler) authorizeStreamRequest(r *http.Request, plan streamPlan) *stre
 
 	claims, err := verifySubscriberJWT(token, []byte(h.SubscriberJWTKey), time.Now())
 	if err != nil {
-		if h.logger != nil {
-			h.logger.Warn("subscriber JWT rejected", appendStreamLogFields(plan, zap.Error(err))...)
-		}
+		h.log().Warn("subscriber JWT rejected", appendStreamLogFields(plan, zap.Error(err))...)
 		return &streamRequestError{status: http.StatusUnauthorized, message: "Invalid subscriber token"}
 	}
 
 	for _, topic := range plan.Topics {
 		if !claims.canSubscribe(topic) {
-			if h.logger != nil {
-				h.logger.Warn("subscriber is not authorized for requested topic",
-					appendStreamLogFields(plan,
-						zap.String("subscriber", claims.Subject),
-						zap.String("unauthorized_topic", topic),
-					)...,
-				)
-			}
+			h.log().Warn("subscriber is not authorized for requested topic",
+				appendStreamLogFields(plan,
+					zap.String("subscriber", claims.Subject),
+					zap.String("unauthorized_topic", topic),
+				)...,
+			)
 			return &streamRequestError{status: http.StatusForbidden, message: "Forbidden topic"}
 		}
 	}

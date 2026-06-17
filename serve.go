@@ -308,11 +308,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	runtime := h.currentStreamRuntime()
 	if runtime.js == nil {
-		if h.logger != nil {
-			h.logger.Warn("JetStream not available for SSE stream",
-				appendStreamLogFields(plan, zap.String("disconnect_reason", "jetstream_unavailable"))...,
-			)
-		}
+		h.log().Warn("JetStream not available for SSE stream",
+			appendStreamLogFields(plan, zap.String("disconnect_reason", "jetstream_unavailable"))...,
+		)
 		http.Error(w, "JetStream not available", http.StatusServiceUnavailable)
 		return nil
 	}
@@ -322,14 +320,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if h.MaxConnections > 0 {
 		if !h.reserveConnSlot() {
 			metricsConnectionsRejected.WithLabelValues("max_connections").Inc()
-			if h.logger != nil {
-				h.logger.Warn("rejecting SSE stream: max_connections reached",
-					appendStreamLogFields(plan,
-						zap.String("reject_reason", "max_connections"),
-						zap.Int("max_connections", h.MaxConnections),
-					)...,
-				)
-			}
+			h.log().Warn("rejecting SSE stream: max_connections reached",
+				appendStreamLogFields(plan,
+					zap.String("reject_reason", "max_connections"),
+					zap.Int("max_connections", h.MaxConnections),
+				)...,
+			)
 			w.Header().Set("Retry-After", "5")
 			http.Error(w, "Too many concurrent connections", http.StatusServiceUnavailable)
 			return nil
@@ -344,24 +340,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	result := h.executeSubscriptionPlan(runtime.js, runtime.conn, plan, enqueueMessage, enqueueRequestedMessage)
 	if len(result.FailedTopics) > 0 {
-		if h.logger != nil {
-			h.logger.Warn("failed to subscribe to requested SSE topics",
-				appendStreamLogFields(plan,
-					zap.Strings("failed_topics", result.FailedTopics),
-					zap.String("disconnect_reason", "subscription_failed"),
-				)...,
-			)
-		}
+		h.log().Warn("failed to subscribe to requested SSE topics",
+			appendStreamLogFields(plan,
+				zap.Strings("failed_topics", result.FailedTopics),
+				zap.String("disconnect_reason", "subscription_failed"),
+			)...,
+		)
 		h.cleanupStream(done, result.Subscriptions)
 		http.Error(w, fmt.Sprintf("Failed to subscribe to requested topics: %s", strings.Join(result.FailedTopics, ", ")), http.StatusServiceUnavailable)
 		return nil
 	}
 	if len(result.Subscriptions) == 0 {
-		if h.logger != nil {
-			h.logger.Warn("failed to subscribe to any requested SSE topics",
-				appendStreamLogFields(plan, zap.String("disconnect_reason", "subscription_empty"))...,
-			)
-		}
+		h.log().Warn("failed to subscribe to any requested SSE topics",
+			appendStreamLogFields(plan, zap.String("disconnect_reason", "subscription_empty"))...,
+		)
 		h.cleanupStream(done, nil)
 		http.Error(w, "Failed to subscribe to any requested topics", http.StatusServiceUnavailable)
 		return nil
@@ -469,10 +461,8 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 			if queryProvided {
 				return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Invalid last-id value: too long"}
 			}
-			if h.logger != nil {
-				h.logger.Warn("ignoring oversized Last-Event-ID header; resuming with DeliverNew",
-					zap.Int("length", len(lastIDStr)))
-			}
+			h.log().Warn("ignoring oversized Last-Event-ID header; resuming with DeliverNew",
+				zap.Int("length", len(lastIDStr)))
 			return plan, nil
 		}
 		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
@@ -489,9 +479,7 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 			} else {
 				fields = append(fields, zap.String("reason", "cursor would overflow"))
 			}
-			if h.logger != nil {
-				h.logger.Warn("ignoring unparseable Last-Event-ID header; resuming with DeliverNew", fields...)
-			}
+			h.log().Warn("ignoring unparseable Last-Event-ID header; resuming with DeliverNew", fields...)
 		} else {
 			plan.Replay = replayPlan{
 				HasLastID:     true,
@@ -575,12 +563,10 @@ func (h *Handler) signalSlowClient(slowClient chan<- string, subject string, don
 	case <-done:
 	case <-timer.C:
 		metricsDispatchTimeouts.Inc()
-		if h.logger != nil {
-			h.logger.Warn("timed out signaling slow SSE client",
-				zap.String("subject", subject),
-				zap.Int("dispatch_timeout_seconds", h.DispatchTimeout),
-			)
-		}
+		h.log().Warn("timed out signaling slow SSE client",
+			zap.String("subject", subject),
+			zap.Int("dispatch_timeout_seconds", h.DispatchTimeout),
+		)
 	}
 }
 
@@ -618,15 +604,15 @@ func (h *Handler) readStreamSnapshot(js streamMetadataReader, plan streamPlan) s
 				if msg, err := js.GetMsg(h.StreamName, plan.Replay.StartSequence); err == nil {
 					snapshot.StartSequenceTime = msg.Time
 					snapshot.HasStartSequenceTime = true
-				} else if h.logger != nil {
-					h.logger.Debug("failed to read replay start sequence timestamp",
+				} else {
+					h.log().Debug("failed to read replay start sequence timestamp",
 						appendStreamLogFields(plan, zap.Error(err))...,
 					)
 				}
 			}
 			return snapshot
-		} else if h.logger != nil {
-			h.logger.Debug("failed to read StreamInfo for request pre-check",
+		} else {
+			h.log().Debug("failed to read StreamInfo for request pre-check",
 				appendStreamLogFields(plan, zap.Error(infoErr))...,
 			)
 		}
@@ -717,7 +703,7 @@ func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
 	switch plan.Replay.Mode {
 	case replayModeStartSequence:
 		opts = append(opts, nats.StartSequence(plan.Replay.StartSequence))
-		h.logger.Debug("subscribing from sequence",
+		h.log().Debug("subscribing from sequence",
 			appendStreamLogFields(plan, zap.Uint64("start_sequence", plan.Replay.StartSequence))...,
 		)
 	case replayModeFallbackStartTime:
@@ -727,7 +713,7 @@ func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
 			start = h.replayWindowStart()
 		}
 		opts = append(opts, nats.StartTime(start))
-		h.logger.Warn("replay fallback: using time-bounded window",
+		h.log().Warn("replay fallback: using time-bounded window",
 			appendStreamLogFields(plan,
 				zap.Uint64("requested_sequence", plan.Replay.StartSequence),
 				zap.String("reason", plan.Replay.FallbackReason),
@@ -738,7 +724,7 @@ func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
 	case replayModeFallbackDeliverAll:
 		metricsReplayFallbacks.Inc()
 		opts = append(opts, nats.DeliverAll())
-		h.logger.Warn("replay fallback: delivering all retained messages",
+		h.log().Warn("replay fallback: delivering all retained messages",
 			appendStreamLogFields(plan,
 				zap.Uint64("requested_sequence", plan.Replay.StartSequence),
 				zap.String("reason", plan.Replay.FallbackReason),
@@ -770,21 +756,21 @@ func (h *Handler) executeSubscriptionPlan(js nats.JetStreamContext, conn *nats.C
 	if err != nil {
 		metricsSubscriptionErrors.Inc()
 		if len(activePlan.FullSubjects) == 1 {
-			h.logger.Error("failed to subscribe to topic",
+			h.log().Error("failed to subscribe to topic",
 				appendStreamLogFields(activePlan, zap.Error(err))...,
 			)
 			return subscriptionResult{FailedTopics: []string{activePlan.Topics[0]}}
 		}
-		h.logger.Error("failed to subscribe to topics",
+		h.log().Error("failed to subscribe to topics",
 			appendStreamLogFields(activePlan, zap.Error(err))...,
 		)
 		return subscriptionResult{FailedTopics: append([]string{}, activePlan.Topics...)}
 	}
 
 	if len(activePlan.FullSubjects) == 1 {
-		h.logger.Debug("subscribed to topic", streamLogFields(activePlan)...)
+		h.log().Debug("subscribed to topic", streamLogFields(activePlan)...)
 	} else {
-		h.logger.Debug("subscribed to topics", streamLogFields(activePlan)...)
+		h.log().Debug("subscribed to topics", streamLogFields(activePlan)...)
 	}
 	return subscriptionResult{
 		Subscriptions: []*nats.Subscription{sub},
@@ -812,7 +798,7 @@ func (h *Handler) cleanupStream(done chan struct{}, subscriptions []*nats.Subscr
 	close(done)
 	for _, sub := range subscriptions {
 		if err := sub.Unsubscribe(); err != nil {
-			h.logger.Warn("failed to unsubscribe",
+			h.log().Warn("failed to unsubscribe",
 				zap.String("topic", sub.Subject),
 				zap.Error(err))
 		}
@@ -853,7 +839,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 
 	if err := writeSSEChunkWithTimeout(w, flusher, formatConnectedEvent(plan.Topics), writeTimeout); err != nil {
 		metricsWriteDisconnects.WithLabelValues("connected").Inc()
-		h.logger.Warn("failed to write connected event",
+		h.log().Warn("failed to write connected event",
 			appendStreamLogFields(plan,
 				zap.String("disconnect_reason", "write_error"),
 				zap.String("write_site", "connected"),
@@ -873,14 +859,14 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 	for {
 		select {
 		case <-shutdown:
-			h.logger.Debug("handler shutting down; closing SSE stream",
+			h.log().Debug("handler shutting down; closing SSE stream",
 				appendStreamLogFields(plan, zap.String("disconnect_reason", "handler_shutdown"))...,
 			)
 			return nil
 
 		case slowTopic := <-slowClient:
 			metricsSlowClientDisconnects.Inc()
-			h.logger.Warn("disconnecting slow SSE client before dropping messages",
+			h.log().Warn("disconnecting slow SSE client before dropping messages",
 				appendStreamLogFields(plan,
 					zap.String("disconnect_reason", "slow_client"),
 					zap.String("slow_subject", slowTopic),
@@ -890,7 +876,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 			return nil
 
 		case <-ctx.Done():
-			h.logger.Debug("client disconnected",
+			h.log().Debug("client disconnected",
 				appendStreamLogFields(plan,
 					zap.String("disconnect_reason", "client_context_done"),
 					zap.Error(ctx.Err()),
@@ -905,7 +891,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 
 			formatted := h.formatMessageEvent(msg, time.Now())
 			if formatted.MetadataErr != nil {
-				h.logger.Warn("failed to read JetStream metadata",
+				h.log().Warn("failed to read JetStream metadata",
 					appendStreamLogFields(plan,
 						zap.String("message_subject", formatted.Subject),
 						zap.Error(formatted.MetadataErr),
@@ -918,7 +904,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 
 			if err := writeSSEChunkWithTimeout(w, flusher, formatted.Frame, writeTimeout); err != nil {
 				metricsWriteDisconnects.WithLabelValues("message").Inc()
-				h.logger.Warn("failed to write message event",
+				h.log().Warn("failed to write message event",
 					appendStreamLogFields(plan,
 						zap.String("disconnect_reason", "write_error"),
 						zap.String("write_site", "message"),
@@ -935,7 +921,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 				replayDelivered++
 				if replayDelivered >= h.ReplayMaxMessages {
 					metricsReplayCapReached.Inc()
-					h.logger.Warn("closing SSE stream: replay_max_messages reached",
+					h.log().Warn("closing SSE stream: replay_max_messages reached",
 						appendStreamLogFields(plan,
 							zap.String("disconnect_reason", "replay_cap_reached"),
 							zap.Int("replay_max_messages", h.ReplayMaxMessages),
@@ -949,7 +935,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 		case <-heartbeat.C:
 			if err := writeSSEChunkWithTimeout(w, flusher, formatHeartbeatEvent(time.Now()), writeTimeout); err != nil {
 				metricsWriteDisconnects.WithLabelValues("heartbeat").Inc()
-				h.logger.Warn("failed to write heartbeat",
+				h.log().Warn("failed to write heartbeat",
 					appendStreamLogFields(plan,
 						zap.String("disconnect_reason", "heartbeat_write_error"),
 						zap.String("write_site", "heartbeat"),
@@ -1097,13 +1083,13 @@ func (h *Handler) recordDroppedMessage(formatted formattedMessageEvent) {
 	metricsMessagesDropped.WithLabelValues(reason).Inc()
 	switch formatted.DropReason {
 	case dropReasonRawPayload:
-		h.logger.Warn("dropping oversized NATS payload",
+		h.log().Warn("dropping oversized NATS payload",
 			zap.String("topic", formatted.Subject),
 			zap.Int("payload_size", formatted.DropSize),
 			zap.Int("max_event_size", h.MaxEventSize),
 		)
 	case dropReasonFormattedSSEMessage:
-		h.logger.Warn("dropping oversized SSE event",
+		h.log().Warn("dropping oversized SSE event",
 			zap.String("topic", formatted.Subject),
 			zap.Int("event_size", formatted.DropSize),
 			zap.Int("max_event_size", h.MaxEventSize),
@@ -1130,7 +1116,7 @@ func (h *Handler) subscribeToMultipleTopics(js nats.JetStreamContext, plan strea
 	}
 
 	wildcardSubject := commonSubjectFilter(plan.FullSubjects)
-	h.logger.Warn("NATS server does not support multi-filter consumers; using common wildcard subscription",
+	h.log().Warn("NATS server does not support multi-filter consumers; using common wildcard subscription",
 		appendStreamLogFields(plan,
 			zap.String("wildcard_subject", wildcardSubject),
 			zap.String("server_version", serverVersion),
@@ -1431,8 +1417,8 @@ func (h *Handler) serveLiveCheck(w http.ResponseWriter) error {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(resp); err != nil && h.logger != nil {
-		h.logger.Debug("failed to encode liveness response", zap.Error(err))
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		h.log().Debug("failed to encode liveness response", zap.Error(err))
 	}
 	return nil
 }
@@ -1482,7 +1468,7 @@ func (h *Handler) serveReadinessCheck(w http.ResponseWriter) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		h.logger.Debug("failed to encode health response", zap.Error(err))
+		h.log().Debug("failed to encode health response", zap.Error(err))
 	}
 	return nil
 }

@@ -171,7 +171,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		return provisionErr
 	}
 
-	h.logger.Info("nuts handler provisioned",
+	h.log().Info("nuts handler provisioned",
 		zap.String("nats_url", redactURL(h.NatsURL)),
 		zap.String("stream_name", h.StreamName),
 		zap.String("topic_prefix", h.TopicPrefix),
@@ -197,14 +197,14 @@ func (h *Handler) connectNATS() error {
 
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			if err != nil {
-				h.logger.Warn("disconnected from NATS", zap.Error(err))
+				h.log().Warn("disconnected from NATS", zap.Error(err))
 			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			h.logger.Info("reconnected to NATS", zap.String("url", nc.ConnectedUrl()))
+			h.log().Info("reconnected to NATS", zap.String("url", nc.ConnectedUrl()))
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
-			h.logger.Info("NATS connection closed")
+			h.log().Info("NATS connection closed")
 		}),
 		// ErrorHandler captures async failures the nats.go client would
 		// otherwise log to stderr via its default printer — most importantly
@@ -218,7 +218,7 @@ func (h *Handler) connectNATS() error {
 			if sub != nil {
 				fields = append(fields, zap.String("subject", sub.Subject))
 			}
-			h.logger.Warn("NATS async error", fields...)
+			h.log().Warn("NATS async error", fields...)
 		}),
 	}
 
@@ -390,28 +390,25 @@ func (h *Handler) Validate() error {
 
 	for _, o := range h.AllowedOrigins {
 		if o == "*" {
-			if h.logger != nil {
-				h.logger.Warn("allowed_origins contains '*': Access-Control-Allow-Credentials " +
-					"is not advertised for wildcard-matched origins. If clients need credentialed " +
-					"CORS (cookies, Authorization headers), list explicit origins instead.")
-			}
+			h.log().Warn("allowed_origins contains '*': Access-Control-Allow-Credentials " +
+				"is not advertised for wildcard-matched origins. If clients need credentialed " +
+				"CORS (cookies, Authorization headers), list explicit origins instead.")
 			break
 		}
 	}
 
-	if h.logger != nil && (h.NatsCredentials != "" || h.NatsToken != "" || (h.NatsUser != "" && h.NatsPassword != "")) {
-		if strings.HasPrefix(h.NatsURL, "nats://") {
-			h.logger.Warn("NATS credentials sent over plaintext nats:// URL; consider tls:// or nats_tls_* directives",
-				zap.String("nats_url", redactURL(h.NatsURL)))
-		}
+	if (h.NatsCredentials != "" || h.NatsToken != "" || (h.NatsUser != "" && h.NatsPassword != "")) &&
+		strings.HasPrefix(h.NatsURL, "nats://") {
+		h.log().Warn("NATS credentials sent over plaintext nats:// URL; consider tls:// or nats_tls_* directives",
+			zap.String("nats_url", redactURL(h.NatsURL)))
 	}
 
-	if h.logger != nil && h.NatsTLSInsecureSkipVerify {
-		h.logger.Warn("nats_tls_insecure_skip_verify is enabled — server certificate is not verified")
+	if h.NatsTLSInsecureSkipVerify {
+		h.log().Warn("nats_tls_insecure_skip_verify is enabled — server certificate is not verified")
 	}
 
-	if h.logger != nil && h.SubscriberJWTKey != "" && len(h.SubscriberJWTKey) < minRecommendedJWTKeyLen {
-		h.logger.Warn("subscriber_jwt_key is shorter than recommended; HS256 assumes a key of at least 32 bytes",
+	if h.SubscriberJWTKey != "" && len(h.SubscriberJWTKey) < minRecommendedJWTKeyLen {
+		h.log().Warn("subscriber_jwt_key is shorter than recommended; HS256 assumes a key of at least 32 bytes",
 			zap.Int("key_length", len(h.SubscriberJWTKey)),
 			zap.Int("recommended_minimum", minRecommendedJWTKeyLen))
 	}
