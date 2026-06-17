@@ -901,6 +901,24 @@ const events = new EventSource(`/events?topic=updates&last-id=${lastId}`);
 - Standard `EventSource` reconnects can use the `Last-Event-ID` header automatically
 - When a slow client is disconnected, reconnecting with the last delivered event ID resumes from that point instead of losing messages silently
 
+**Source precedence and malformed-cursor handling:**
+
+When both `?last-id=` and the `Last-Event-ID` header are present on the
+same request, the **query parameter wins** — clients explicitly setting
+`?last-id=` override whatever the browser auto-attaches on EventSource
+reconnect.
+
+Malformed values are handled asymmetrically on purpose:
+
+- `?last-id=` malformed or above the cursor cap → **400 Bad Request**.
+  An explicit query value is a client choice; failing fast surfaces the
+  bug.
+- `Last-Event-ID:` malformed or above the cursor cap → **logged at
+  Warn, stream resumes with `DeliverNew`**. A browser auto-resumes on
+  reconnect with whatever it last received; returning 400 would make
+  it loop forever on a single bad value. The Warn log carries the
+  offending value so an operator can diagnose the producer.
+
 ### Message Format
 
 Messages are sent as SSE events with the following format:

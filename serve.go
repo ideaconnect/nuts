@@ -1031,13 +1031,18 @@ func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMess
 	payload := messageEventPayload{
 		Topic:   strings.TrimPrefix(msg.Subject, h.TopicPrefix),
 		Payload: tryParseJSON(msg.Data),
-		Time:    now.UTC().Format(time.RFC3339),
 	}
+	// Format the timestamp once, lazily: when JetStream metadata is present
+	// (the common case) we use meta.Timestamp; otherwise we fall back to
+	// `now`. Doing this after the metadata check avoids the wasted
+	// now.UTC().Format(time.RFC3339) allocation that the previous version
+	// always performed and then immediately overwrote.
 	var eventID uint64
 	hasEventID := false
 	meta, metaErr := msg.Metadata()
 	if metaErr != nil {
 		formatted.MetadataErr = metaErr
+		payload.Time = now.UTC().Format(time.RFC3339)
 	} else {
 		payload.Time = meta.Timestamp.UTC().Format(time.RFC3339)
 		eventID = meta.Sequence.Stream

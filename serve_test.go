@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -450,6 +451,76 @@ func TestHandler_FinalizeStreamedMessage(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := h.finalizeStreamedMessage(c.plan, c.event); got != c.want {
 				t.Errorf("finalizeStreamedMessage = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestHandler_ParseStreamRequest_LastIDBoundary exercises the
+// maxReplayCursor cut-off explicitly for both transport surfaces:
+//
+//   - `?last-id=<v>` query: a value equal to maxReplayCursor (uint64 max)
+//     or above must 400 because Subscribe with StartSequence(MAX+1) would
+//     wrap. One below maxReplayCursor is accepted.
+//   - `Last-Event-ID: <v>` header: same overflow must NOT 400 — browsers
+//     would loop forever on EventSource reconnect. Instead log a warning
+//     and fall back to DeliverNew (HasLastID stays false).
+//
+// Without this test a regression that flips the comparison from `==` to
+// `>=`, drops the guard, or swaps which surface gets the soft fallback
+// would land silently.
+func TestHandler_ParseStreamRequest_LastIDBoundary(t *testing.T) {
+	maxStr := strconv.FormatUint(maxReplayCursor, 10)            // 18446744073709551615
+	belowMaxStr := strconv.FormatUint(maxReplayCursor-1, 10)     // 18446744073709551614
+	overflow21Str := "99999999999999999999"                      // 20 digits but > MaxUint64
+	tooLongStr := strings.Repeat("9", 21)                         // length-cap triggered first
+
+	cases := []struct {
+		name        string
+		query       string
+		header      string
+		wantStatus  int
+		wantHasID   bool
+		wantStartAt uint64
+	}{
+		{"query at max rejected", maxStr, "", http.StatusBadRequest, false, 0},
+		{"query just below max accepted", belowMaxStr, "", 0, true, maxReplayCursor - 1},
+		{"query parseuint overflow rejected", overflow21Str, "", http.StatusBadRequest, false, 0},
+		{"query too long rejected", tooLongStr, "", http.StatusBadRequest, false, 0},
+		{"header at max falls back to DeliverNew", "", maxStr, 0, false, 0},
+		{"header just below max accepted", "", belowMaxStr, 0, true, maxReplayCursor - 1},
+		{"header parseuint overflow falls back", "", overflow21Str, 0, false, 0},
+		{"header too long falls back", "", tooLongStr, 0, false, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := &Handler{TopicPrefix: "events.", logger: zap.NewNop()}
+			u := "/events?topic=x"
+			if c.query != "" {
+				u += "&last-id=" + c.query
+			}
+			req := httptest.NewRequest(http.MethodGet, u, nil)
+			if c.header != "" {
+				req.Header.Set("Last-Event-ID", c.header)
+			}
+			plan, reqErr := h.parseStreamRequest(req)
+			if c.wantStatus != 0 {
+				if reqErr == nil {
+					t.Fatalf("expected streamRequestError with status %d, got nil", c.wantStatus)
+				}
+				if reqErr.status != c.wantStatus {
+					t.Fatalf("status = %d, want %d (message=%q)", reqErr.status, c.wantStatus, reqErr.message)
+				}
+				return
+			}
+			if reqErr != nil {
+				t.Fatalf("unexpected streamRequestError: status=%d message=%q", reqErr.status, reqErr.message)
+			}
+			if plan.Replay.HasLastID != c.wantHasID {
+				t.Fatalf("HasLastID = %v, want %v", plan.Replay.HasLastID, c.wantHasID)
+			}
+			if c.wantHasID && plan.Replay.StartSequence != c.wantStartAt+1 {
+				t.Fatalf("StartSequence = %d, want %d", plan.Replay.StartSequence, c.wantStartAt+1)
 			}
 		})
 	}

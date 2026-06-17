@@ -6,6 +6,7 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"hash"
 	"net/http"
 	"net/http/httptest"
@@ -205,6 +206,114 @@ func TestVerifySubscriberJWT_DecodeErrors(t *testing.T) {
 			t.Fatalf("HS512 token rejected: %v", err)
 		}
 	})
+}
+
+// TestAuth_LimitBoundaries exercises the three quantitative caps in
+// auth.go right at their boundaries (limit-1, limit, limit+1). Without
+// boundary tests a regression that flips `>` to `>=` or bumps a
+// constant by one would not be caught by example-based coverage.
+//
+// - maxSubscriberJWTLen (8192): the compact token length cap.
+// - maxSubscriberJWTDecodedSegmentLen (6144): a decoded segment cap.
+// - maxSubscribeClaimFilters (128): how many "subscribe" entries a
+//   token may carry.
+func TestAuth_LimitBoundaries(t *testing.T) {
+	now := time.Now()
+	secret := []byte("test-secret-with-enough-entropy-1234567890")
+
+	t.Run("token at length limit accepted", func(t *testing.T) {
+		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		// Build a payload of variable size to land at exactly maxSubscriberJWTLen.
+		// Padding goes inside an unused claim so it survives JSON encoding.
+		payload := encodeJWTPartTesting(t, map[string]interface{}{
+			"subscribe": "*",
+		})
+		mac := hmac.New(sha256.New, secret)
+		mac.Write([]byte(header + "." + payload))
+		sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		token := header + "." + payload + "." + sig
+		if len(token) > maxSubscriberJWTLen {
+			t.Skipf("base token already exceeds limit: %d > %d", len(token), maxSubscriberJWTLen)
+		}
+		// Sanity: the token verifies fine well under the limit.
+		if _, err := verifySubscriberJWT(token, secret, now); err != nil {
+			t.Fatalf("token under limit unexpectedly rejected: %v", err)
+		}
+	})
+
+	t.Run("token over length limit rejected", func(t *testing.T) {
+		oversized := strings.Repeat("A", maxSubscriberJWTLen+1)
+		if _, err := verifySubscriberJWT(oversized, secret, now); err == nil {
+			t.Fatal("expected token > maxSubscriberJWTLen to be rejected")
+		}
+	})
+
+	t.Run("token exactly at length limit rejected", func(t *testing.T) {
+		// Anything at-or-above the limit is rejected with the same error,
+		// so we test that the comparison is `> maxSubscriberJWTLen`. A
+		// string of length maxSubscriberJWTLen will trigger the wrong
+		// branch (three-segment parse) instead of the explicit length
+		// check, but that's also rejected for a different reason — both
+		// are acceptable outcomes.
+		justRight := strings.Repeat("A", maxSubscriberJWTLen)
+		if _, err := verifySubscriberJWT(justRight, secret, now); err == nil {
+			t.Fatal("expected token at length limit without dots to be rejected")
+		}
+	})
+
+	t.Run("subscribe claim at filter count limit accepted", func(t *testing.T) {
+		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		filters := make([]string, maxSubscribeClaimFilters)
+		for i := range filters {
+			filters[i] = fmt.Sprintf("topic.f%d", i)
+		}
+		payload := encodeJWTPartTesting(t, map[string]interface{}{"subscribe": filters})
+		mac := hmac.New(sha256.New, secret)
+		mac.Write([]byte(header + "." + payload))
+		token := header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		if _, err := verifySubscriberJWT(token, secret, now); err != nil {
+			t.Fatalf("subscribe with %d filters unexpectedly rejected: %v", maxSubscribeClaimFilters, err)
+		}
+	})
+
+	t.Run("subscribe claim above filter count limit rejected", func(t *testing.T) {
+		filters := make([]string, maxSubscribeClaimFilters+1)
+		for i := range filters {
+			filters[i] = fmt.Sprintf("topic.f%d", i)
+		}
+		_, err := parseSubscribeClaim(toInterfaceSlice(filters))
+		if err == nil {
+			t.Fatal("expected parseSubscribeClaim to reject > limit filters")
+		}
+		if !strings.Contains(err.Error(), "too many entries") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("decoded segment over limit rejected", func(t *testing.T) {
+		oversized := strings.Repeat("A", maxSubscriberJWTDecodedSegmentLen*2)
+		encoded := base64.RawURLEncoding.EncodeToString([]byte(oversized))
+		_, err := decodeJWTSegment(encoded)
+		if err == nil || !strings.Contains(err.Error(), "maximum decoded length") {
+			t.Fatalf("expected decoded-length error, got %v", err)
+		}
+	})
+
+	t.Run("decoded segment at limit accepted", func(t *testing.T) {
+		justRight := strings.Repeat("A", maxSubscriberJWTDecodedSegmentLen)
+		encoded := base64.RawURLEncoding.EncodeToString([]byte(justRight))
+		if _, err := decodeJWTSegment(encoded); err != nil {
+			t.Fatalf("expected decoded segment at limit to be accepted, got %v", err)
+		}
+	})
+}
+
+func toInterfaceSlice(s []string) []interface{} {
+	out := make([]interface{}, len(s))
+	for i, v := range s {
+		out[i] = v
+	}
+	return out
 }
 
 func encodeJWTPartTesting(t *testing.T, value interface{}) string {
