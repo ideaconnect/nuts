@@ -199,10 +199,35 @@ func TestHandler_SubscriptionOptionsFallbackStartTimeDefaultsWindow(t *testing.T
 
 func TestHandler_CountsTowardReplayCapWithoutSequenceMetadata(t *testing.T) {
 	h := &Handler{ReplayMaxMessages: 2}
-	plan := streamPlan{Replay: replayPlan{HasLastID: true, CapSequence: 20}}
+	// Snapshot was observed; message has no stream-sequence metadata.
+	// We conservatively count (the cap bounds total delivery rather
+	// than only historical replay — see countsTowardReplayCap comment).
+	plan := streamPlan{Replay: replayPlan{HasLastID: true, HasSnapshot: true, CapSequence: 20}}
 
 	if !h.countsTowardReplayCap(plan, formattedMessageEvent{}) {
-		t.Fatal("message without stream sequence should conservatively count toward replay cap")
+		t.Fatal("message without stream sequence should conservatively count toward replay cap when a snapshot was observed")
+	}
+}
+
+// TestHandler_CountsTowardReplayCap_NoSnapshotSkipsCap covers pass-7's
+// HasSnapshot fix: when readStreamSnapshot's StreamInfo call failed
+// (HasSnapshot=false) the replay cap MUST NOT enforce, because the
+// CapSequence we have is 0-by-default and the conservative "count it"
+// branch would silently retarget the cap at live traffic — closing a
+// long-lived SSE session with disconnect_reason=replay_cap_reached
+// after N live messages of any age.
+func TestHandler_CountsTowardReplayCap_NoSnapshotSkipsCap(t *testing.T) {
+	h := &Handler{ReplayMaxMessages: 2}
+	plan := streamPlan{Replay: replayPlan{HasLastID: true, HasSnapshot: false, CapSequence: 0}}
+
+	// Even though the cap is configured and the request asked for replay,
+	// no snapshot means we cannot tell live from historical — skip the
+	// cap entirely.
+	if h.countsTowardReplayCap(plan, formattedMessageEvent{HasStreamSequence: true, StreamSequence: 100}) {
+		t.Fatal("live message must not count toward replay cap when HasSnapshot=false")
+	}
+	if h.countsTowardReplayCap(plan, formattedMessageEvent{}) {
+		t.Fatal("metadata-less message must not count toward replay cap when HasSnapshot=false")
 	}
 }
 
@@ -601,21 +626,28 @@ func TestVaryContains(t *testing.T) {
 // TestHandler_ParseStreamRequest_LastIDBoundary exercises the
 // maxReplayCursor cut-off explicitly for both transport surfaces:
 //
-//   - `?last-id=<v>` query: a value equal to maxReplayCursor (uint64 max)
-//     or above must 400 because Subscribe with StartSequence(MAX+1) would
-//     wrap. One below maxReplayCursor is accepted.
+//   - `?last-id=<v>` query: a value of maxReplayCursor-1 or above must
+//     400 because Subscribe with StartSequence(parsedID+1) would land
+//     ON the maxReplayCursor sentinel (parsedID == maxReplayCursor-1)
+//     or wrap past it (parsedID == maxReplayCursor). The highest
+//     legitimate accepted value is therefore maxReplayCursor-2, whose
+//     StartSequence resolves to maxReplayCursor-1.
 //   - `Last-Event-ID: <v>` header: same overflow must NOT 400 — browsers
 //     would loop forever on EventSource reconnect. Instead log a warning
 //     and fall back to DeliverNew (HasLastID stays false).
 //
-// Without this test a regression that flips the comparison from `==` to
-// `>=`, drops the guard, or swaps which surface gets the soft fallback
-// would land silently.
+// Without this test a regression that flips the comparison from `>=`
+// back to `==`, drops the guard, or swaps which surface gets the soft
+// fallback would land silently. Pass 7 tightened the cap from `==
+// maxReplayCursor` to `>= maxReplayCursor-1` because parsedID+1 on the
+// off-by-one input lands exactly on the reserved sentinel and JetStream
+// silently parks the consumer at a sequence that will never arrive.
 func TestHandler_ParseStreamRequest_LastIDBoundary(t *testing.T) {
-	maxStr := strconv.FormatUint(maxReplayCursor, 10)            // 18446744073709551615
-	belowMaxStr := strconv.FormatUint(maxReplayCursor-1, 10)     // 18446744073709551614
+	maxStr := strconv.FormatUint(maxReplayCursor, 10)            // 18446744073709551615 — uint64 max, reserved
+	offByOneStr := strconv.FormatUint(maxReplayCursor-1, 10)     // 18446744073709551614 — parsedID+1 hits sentinel
+	acceptedHighStr := strconv.FormatUint(maxReplayCursor-2, 10) // 18446744073709551613 — highest legitimate
 	overflow21Str := "99999999999999999999"                      // 20 digits but > MaxUint64
-	tooLongStr := strings.Repeat("9", 21)                         // length-cap triggered first
+	tooLongStr := strings.Repeat("9", 21)                        // length-cap triggered first
 
 	cases := []struct {
 		name        string
@@ -626,11 +658,13 @@ func TestHandler_ParseStreamRequest_LastIDBoundary(t *testing.T) {
 		wantStartAt uint64
 	}{
 		{"query at max rejected", maxStr, "", http.StatusBadRequest, false, 0},
-		{"query just below max accepted", belowMaxStr, "", 0, true, maxReplayCursor - 1},
+		{"query off-by-one rejected (parsedID+1 hits sentinel)", offByOneStr, "", http.StatusBadRequest, false, 0},
+		{"query highest legitimate accepted", acceptedHighStr, "", 0, true, maxReplayCursor - 2},
 		{"query parseuint overflow rejected", overflow21Str, "", http.StatusBadRequest, false, 0},
 		{"query too long rejected", tooLongStr, "", http.StatusBadRequest, false, 0},
 		{"header at max falls back to DeliverNew", "", maxStr, 0, false, 0},
-		{"header just below max accepted", "", belowMaxStr, 0, true, maxReplayCursor - 1},
+		{"header off-by-one falls back", "", offByOneStr, 0, false, 0},
+		{"header highest legitimate accepted", "", acceptedHighStr, 0, true, maxReplayCursor - 2},
 		{"header parseuint overflow falls back", "", overflow21Str, 0, false, 0},
 		{"header too long falls back", "", tooLongStr, 0, false, 0},
 	}

@@ -115,7 +115,8 @@ type Handler struct {
 
 	// MaxConnections caps the total number of concurrent SSE connections served
 	// by this handler instance. 0 (default) disables the cap. Connections that
-	// would exceed the cap receive HTTP 503 with a Retry-After header.
+	// would exceed the cap receive HTTP 429 (Too Many Requests, RFC 6585) with
+	// a Retry-After header.
 	MaxConnections int `json:"max_connections,omitempty"`
 
 	// MaxTopicsPerSubscription caps how many distinct topics a single SSE

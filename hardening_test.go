@@ -1034,6 +1034,16 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 			mutate:  func(h *Handler) { h.TopicPrefix = "events/" },
 			wantErr: "topic_prefix",
 		},
+		{
+			name:    "negative heartbeat interval",
+			mutate:  func(h *Handler) { h.HeartbeatInterval = -30 },
+			wantErr: "heartbeat_interval",
+		},
+		{
+			name:    "negative reconnect wait",
+			mutate:  func(h *Handler) { h.ReconnectWait = -2 },
+			wantErr: "reconnect_wait",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1120,6 +1130,16 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			name:     "subscriber cookie validates name",
 			fragment: `"subscriber_jwt_key": "secret", "subscriber_jwt_cookie": "bad;name"`,
 			wantErr:  "subscriber_jwt_cookie",
+		},
+		{
+			name:     "negative heartbeat interval",
+			fragment: `"heartbeat_interval": -30`,
+			wantErr:  "heartbeat_interval",
+		},
+		{
+			name:     "negative reconnect wait",
+			fragment: `"reconnect_wait": -2`,
+			wantErr:  "reconnect_wait",
 		},
 	}
 

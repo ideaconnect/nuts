@@ -155,6 +155,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nuts_connections_rejected_total{reason="max_connections"}` counter
   are unchanged. Operators who scripted retry on `503` should add `429`
   to their accepted retryable-status set.
+- `replay_max_messages` no longer enforces against live messages when
+  the per-request `StreamInfo` snapshot is unavailable. Previously a
+  transient broker blip coinciding with a `?last-id=` reconnect would
+  leave `CapSequence=0` and the conservative "count it" branch in
+  `countsTowardReplayCap` silently retargeted the cap at live traffic,
+  closing the SSE session with `disconnect_reason=replay_cap_reached`
+  after N live messages of any age. A new `HasSnapshot` flag on
+  `streamInfoSnapshot` and `replayPlan` distinguishes "snapshot
+  unavailable" from "snapshot says LastSeq=0" so replay accounting only
+  runs when the snapshot was actually observed.
+- `?last-id=` cursor cap tightened from `parsedID == maxReplayCursor` to
+  `parsedID >= maxReplayCursor-1`. The previous check missed the
+  off-by-one input where `parsedID+1` (the JetStream StartSequence)
+  lands exactly on the reserved sentinel and JetStream silently parks
+  the consumer at a sequence that will never arrive, leaving the
+  client with only heartbeats. Query rejections still return 400;
+  header values still fall back to `DeliverNew` so browser
+  EventSource auto-reconnects don't loop.
+- `Validate()` now rejects negative `heartbeat_interval` and
+  `reconnect_wait`. Previously these silently fell into Provision's
+  `<= 0` normalization branch and were rewritten to defaults, so a
+  typo like `heartbeat_interval -30` (intended as `30`) passed
+  validation green and the keep-alive cadence reverted to the default.
+  The `0`-means-default semantic is preserved for forward
+  compatibility.
+- `handler.go` `MaxConnections` doc now reads `HTTP 429` (matches
+  the implementation post-`8d06acd`); `serve.go`'s CORS-rationale
+  comment now lists `429 (max_connections)` separately from genuine
+  `503` paths; `docs/CONFIGURATION.md`'s `dispatch_timeout` Notes
+  cell uses the unambiguous "leaves the wait unbounded" phrasing
+  from `handler.go`. Three doc surfaces that the pass-6 sweep missed.
+- NATS cert/key load error now cites both file paths
+  (`load nats_tls_cert=<path> nats_tls_key=<path>: <cause>`),
+  matching the CA-load error shape so operators don't have to bisect
+  which file is malformed.
 
 ### Operator notes
 - CORS headers are now emitted on every response with an allow-listed

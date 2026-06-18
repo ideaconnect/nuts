@@ -127,6 +127,11 @@ type replayPlan struct {
 	// at the moment the subscription opens. Anything above it is live
 	// traffic and does not count toward replay_max_messages.
 	CapSequence uint64
+	// HasSnapshot mirrors streamInfoSnapshot.HasSnapshot at plan time.
+	// Required for the replay-cap accounting in countsTowardReplayCap to
+	// distinguish "no snapshot observed" from "snapshot says LastSeq=0";
+	// see that function's comment for the failure mode the flag prevents.
+	HasSnapshot bool
 	// FallbackReason is a short human-readable string explaining why a
 	// fallback was chosen; surfaced in logs and metrics.
 	FallbackReason string
@@ -198,6 +203,14 @@ type streamMetadataReader interface {
 // the moment the request was planned. Reading once and reusing avoids racing
 // against background JetStream activity during planning decisions.
 type streamInfoSnapshot struct {
+	// HasSnapshot is true when StreamInfo succeeded and the FirstSeq /
+	// LastSeq fields below carry an observed value. False means
+	// "snapshot unavailable" — distinct from "snapshot says LastSeq=0"
+	// (an empty stream). The replay-cap accounting in
+	// countsTowardReplayCap relies on this distinction so a transient
+	// StreamInfo failure doesn't make live messages count toward
+	// replay_max_messages.
+	HasSnapshot bool
 	// FirstSeq is the lowest sequence currently retained in the stream.
 	// Used to detect requests for purged sequences.
 	FirstSeq uint64
@@ -302,8 +315,9 @@ func isReplayStartSequenceError(err error, hasLastID bool) bool {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// Set CORS headers before any short-circuit response path. Otherwise a
 	// browser hitting a 401 (JWT failure), 400 (validation), 405 (method),
-	// or 503 (jetstream unavailable / max_connections) would see an opaque
-	// CORS failure instead of the real status code. setCORSHeaders is a
+	// 503 (jetstream unavailable / subscription failed / readiness degraded),
+	// or 429 (max_connections) would see an opaque CORS failure instead of
+	// the real status code. setCORSHeaders is a
 	// no-op when the request has no Origin or the Origin is not allow-
 	// listed, so this is safe to call on every request including probes.
 	h.setCORSHeaders(w, r)
@@ -495,7 +509,13 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 			return plan, nil
 		}
 		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
-		if err != nil || parsedID == maxReplayCursor {
+		// `parsedID + 1` is the JetStream StartSequence we will dial. When
+		// parsedID == maxReplayCursor-1, that addition lands on
+		// maxReplayCursor itself — the reserved "invalid" sentinel — and
+		// JetStream silently parks the consumer at a sequence that will
+		// never arrive. Reject the off-by-one alongside the documented
+		// == maxReplayCursor case.
+		if err != nil || parsedID >= maxReplayCursor-1 {
 			// Explicit ?last-id= is a client error (bad request); a header
 			// value usually came from a browser auto-resume and we'd rather
 			// downgrade to DeliverNew than break reconnect entirely.
@@ -637,9 +657,10 @@ func (h *Handler) readStreamSnapshot(js streamMetadataReader, plan streamPlan) s
 	if plan.Replay.HasLastID || len(plan.FullSubjects) > 1 {
 		if info, infoErr := js.StreamInfo(h.StreamName); infoErr == nil {
 			snapshot := streamInfoSnapshot{
-				FirstSeq: info.State.FirstSeq,
-				LastSeq:  info.State.LastSeq,
-				Subjects: info.Config.Subjects,
+				HasSnapshot: true,
+				FirstSeq:    info.State.FirstSeq,
+				LastSeq:     info.State.LastSeq,
+				Subjects:    info.Config.Subjects,
 			}
 			if plan.Replay.HasLastID && h.ReplayWindow > 0 && plan.Replay.StartSequence >= info.State.FirstSeq {
 				if msg, err := js.GetMsg(h.StreamName, plan.Replay.StartSequence); err == nil {
@@ -681,6 +702,7 @@ func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot)
 	}
 	if plan.Replay.HasLastID {
 		plan.Replay.CapSequence = snapshot.LastSeq
+		plan.Replay.HasSnapshot = snapshot.HasSnapshot
 		if snapshot.FirstSeq > 0 && plan.Replay.StartSequence < snapshot.FirstSeq {
 			plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence below retention")
 		} else if h.shouldUseReplayWindow(plan.Replay, snapshot) {
@@ -696,6 +718,15 @@ func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot)
 // publish time is older than now-ReplayWindow, or when we couldn't read
 // the start-sequence timestamp at all (conservative: assume out-of-window
 // rather than risk emitting forbidden history).
+//
+// Condition order is load-bearing: the `snapshot.LastSeq < replay.StartSequence`
+// check at line 722 MUST run before the `!HasStartSequenceTime` conservative
+// branch. A fully caught-up client passes `last-id == LastSeq`, which
+// computes `StartSequence = LastSeq+1` — a sequence that doesn't yet
+// exist, so readStreamSnapshot's GetMsg call fails and leaves
+// HasStartSequenceTime=false. The "caught up" short-circuit returns
+// false (no fallback needed); reordering would re-introduce a bogus
+// time-windowed fallback for clients that are simply up to date.
 func (h *Handler) shouldUseReplayWindow(replay replayPlan, snapshot streamInfoSnapshot) bool {
 	if h.ReplayWindow <= 0 || !replay.HasLastID || snapshot.LastSeq < replay.StartSequence {
 		return false
@@ -1023,12 +1054,27 @@ func shouldSkipReplayWindowMessage(plan streamPlan, formatted formattedMessageEv
 
 // countsTowardReplayCap reports whether a delivered message should count
 // against ReplayMaxMessages. Only true when (a) the cap is configured,
-// (b) the request asked for replay, and (c) the message's sequence is at
-// or below the cap recorded when the subscription opened (i.e. it is
+// (b) the request asked for replay, (c) the request had an observed
+// stream snapshot at plan time, and (d) the message's sequence is at or
+// below the cap recorded when the subscription opened (i.e. it is
 // historical replay, not new live traffic produced after we connected).
-// Without sequence metadata we conservatively count it.
+//
+// When StreamInfo failed at plan time CapSequence is 0 because we never
+// observed LastSeq. Treating that as "count everything" would let a
+// transient broker blip silently retarget the cap at live traffic and
+// disconnect a long-lived SSE session with disconnect_reason=
+// replay_cap_reached after the configured number of LIVE messages. The
+// HasSnapshot guard distinguishes "snapshot unavailable" from
+// "snapshot says LastSeq=0" so that case skips replay accounting
+// entirely. Without sequence metadata on the message itself we still
+// conservatively count it (the cap then bounds total delivery rather
+// than only historical replay, which is the right side to err on for
+// the operator's protection budget).
 func (h *Handler) countsTowardReplayCap(plan streamPlan, formatted formattedMessageEvent) bool {
 	if h.ReplayMaxMessages <= 0 || !plan.Replay.HasLastID {
+		return false
+	}
+	if !plan.Replay.HasSnapshot {
 		return false
 	}
 	if plan.Replay.CapSequence == 0 || !formatted.HasStreamSequence {

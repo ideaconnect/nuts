@@ -283,7 +283,7 @@ func (h *Handler) buildTLSConfig() (*tls.Config, error) {
 	if h.NatsTLSCert != "" && h.NatsTLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(h.NatsTLSCert, h.NatsTLSKey)
 		if err != nil {
-			return nil, fmt.Errorf("load nats_tls_cert/key: %w", err)
+			return nil, fmt.Errorf("load nats_tls_cert=%s nats_tls_key=%s: %w", h.NatsTLSCert, h.NatsTLSKey, err)
 		}
 		cfg.Certificates = []tls.Certificate{cert}
 	}
@@ -409,6 +409,18 @@ func (h *Handler) validateConfigValues() error {
 	}
 	if h.ReplayWindow < 0 {
 		return fmt.Errorf("replay_window must be >= 0")
+	}
+	// HeartbeatInterval and ReconnectWait are silently rewritten to
+	// defaults at Provision-time when <= 0 (see provision.go:77-82),
+	// but a negative value is a likely typo (e.g. `heartbeat_interval -30`
+	// intended as `30`). Rejecting it surfaces the mistake instead of
+	// quietly using the default cadence. The <= 0 normalization stays so
+	// `0` still means "use the default" for forward compatibility.
+	if h.HeartbeatInterval < 0 {
+		return fmt.Errorf("heartbeat_interval must be >= 0")
+	}
+	if h.ReconnectWait < 0 {
+		return fmt.Errorf("reconnect_wait must be >= 0")
 	}
 	if h.SubscriberJWTCookie != "" && h.SubscriberJWTKey == "" {
 		return fmt.Errorf("subscriber_jwt_cookie requires subscriber_jwt_key")
