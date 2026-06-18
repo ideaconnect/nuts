@@ -88,6 +88,29 @@ filters when correlating logs with alerts.
    cover the expected `topic_prefix`.
 3. Recreate or restore the stream before routing traffic to the NUTS instance.
 
+## Incident: Oversized messages dropped
+
+**Signals**
+
+- `nuts_messages_dropped_total{reason="raw_payload"}` increases —
+  inbound NATS payload exceeded `max_event_size`.
+- `nuts_messages_dropped_total{reason="formatted_sse_message"}` increases
+  — payload fit but the SSE envelope (JSON wrap + `id`/`event`/`data`
+  lines) pushed the frame over `max_event_size`.
+- Logs at Warn level with `dropping oversized NATS payload` or
+  `dropping oversized SSE event` carry the offending topic and size.
+
+**Actions**
+
+1. `raw_payload` drops point at producer-side: a NATS subject is
+   carrying messages larger than NUTS is configured to deliver.
+   Either fix the producer or raise `max_event_size` after checking
+   the per-connection memory budget in [PERFORMANCE.md](PERFORMANCE.md).
+2. `formatted_sse_message` drops are envelope overhead on small but
+   pathological payloads (deeply nested JSON, escape-heavy strings).
+   Raising `max_event_size` by a modest amount (~25%) usually resolves
+   these without producer-side changes.
+
 ## Incident: Replay Storm
 
 **Signals**
@@ -113,6 +136,11 @@ filters when correlating logs with alerts.
 **Signals**
 
 - `nuts_slow_client_disconnects_total` increases quickly.
+- `nuts_nats_async_errors_total{kind="slow_consumer"}` also increases —
+  this counts drops at the nats.go-internal per-subscription buffer
+  layer (500k msg / 64 MB default), which fire BEFORE NUTS sees the
+  message at all. A non-zero rate here means NATS is shedding traffic
+  upstream of NUTS, not just slow SSE clients.
 - Logs show `disconnect_reason="slow_client"`, `slow_subject`, and
   `buffer_size`.
 - Delivered-message rate may remain high while client reconnect churn rises.
@@ -127,6 +155,57 @@ filters when correlating logs with alerts.
 4. Inspect downstream proxy buffering and browser/client processing speed.
 5. Confirm clients resume with `Last-Event-ID`; slow disconnects are designed
    to trigger replay rather than silently drop messages.
+6. If `nuts_nats_async_errors_total{kind="slow_consumer"}` dominates,
+   the bottleneck is between NATS and the NUTS subscription, not
+   between NUTS and SSE clients — tune the producer-side rate or scale
+   NUTS horizontally.
+
+## Incident: Stalled writes
+
+**Signals**
+
+- `nuts_write_disconnects_total{site}` increases, labelled by SSE write
+  site: `connected` (initial event), `message` (per-message frame), or
+  `heartbeat` (idle keepalive). A burst on `heartbeat` typically means
+  proxy buffering or a downstream connection issue; a burst on `message`
+  means clients can't keep up with delivery; a burst on `connected`
+  points at TLS handshake or Caddy-layer issues before NUTS could send
+  its first byte.
+- Logs at Warn level with `disconnect_reason="write_error"` or
+  `"heartbeat_write_error"` and the matching `write_site` field carry the
+  underlying error and elapsed time. (Note: every browser tab-close
+  mid-message also produces a Warn-level write_error entry — under high
+  client churn these will dominate the log volume; consider sampling
+  in your log shipper if this is noisy.)
+
+**Actions**
+
+1. Cross-reference the failing `site` with downstream proxy / load-
+   balancer error logs. Heartbeat-site failures are usually idle
+   connections being closed by a transparent proxy.
+2. Verify `write_timeout` is set to something reasonable for the
+   network path (`0` leaves it to Caddy and the underlying HTTP stack).
+3. For chronic `message`-site failures, inspect client behaviour —
+   browsers under heavy main-thread load can stall their event loop
+   long enough to trip `write_timeout`.
+
+## Incident: Wildcard-fallback overhead on pre-2.10 NATS
+
+**Signals**
+
+- `nuts_wildcard_filter_drops_total` increases steadily.
+- Connected NATS server reports version `< 2.10` (visible in
+  `nats-server -DV` output or the `INFO` line on connect).
+
+**Actions**
+
+1. The wildcard fallback subscribes to the smallest common parent
+   subject and filters client-side; every dropped message wasted a
+   network round-trip and CPU cycle. The metric measures that waste.
+2. Upgrading NATS to ≥ 2.10 enables native multi-filter consumers
+   (`ConsumerFilterSubjects`) and removes the fallback entirely.
+3. Until you can upgrade, narrow the wildcard by ensuring all topics in
+   a single subscription share a deeper common prefix.
 
 ## Incident: CORS Misconfiguration
 

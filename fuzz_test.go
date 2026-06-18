@@ -13,6 +13,7 @@
 package nuts
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -69,11 +70,15 @@ func FuzzIsValidTopic(f *testing.F) {
 }
 
 // FuzzIsValidTopicFilter exercises the JWT-claim filter validator.
-// Accepted filters must use only the documented character set
-// (letters, digits, dash, underscore in each token) plus dots as
-// segment separators; the bare `>` and `>` as the final token are
-// also accepted as the NATS multi-wildcard. The predicate must never
-// panic.
+// Accepts:
+//   - the bare wildcards "*" and ">"
+//   - any non-empty filter ≤ 256 bytes, no '$' prefix, no leading/
+//     trailing/consecutive dots, where each dot-separated token is
+//     either "*" or ">" (the latter only as the final token) or a
+//     non-empty string of [A-Za-z0-9_-].
+// The fuzz body asserts every accepted input meets this contract so a
+// regression that opened the filter to whitespace, NULs, $-prefixes,
+// or '>' in non-final position would surface.
 func FuzzIsValidTopicFilter(f *testing.F) {
 	for _, s := range []string{
 		"", "*", ">", "orders.>", "orders.created", "orders.*",
@@ -83,10 +88,58 @@ func FuzzIsValidTopicFilter(f *testing.F) {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, in string) {
-		_ = isValidTopicFilter(in)
-		// Acceptance contract is more nuanced than isValidTopic (wildcards
-		// are allowed); we don't re-implement it here. The panic-freedom
-		// guarantee alone is the major fuzz contract.
+		got := isValidTopicFilter(in)
+		if !got {
+			return
+		}
+		// Contract: non-empty, ≤ 256 bytes, no '$' prefix.
+		if in == "" {
+			t.Fatal("isValidTopicFilter accepted empty string")
+		}
+		const maxFilterLen = 256
+		if len(in) > maxFilterLen {
+			t.Fatalf("accepted filter of length %d (max %d): %q", len(in), maxFilterLen, in)
+		}
+		if in[0] == '$' {
+			t.Fatalf("accepted system-subject filter with $-prefix: %q", in)
+		}
+		// Bare wildcards are accepted and short-circuit token parsing.
+		if in == "*" || in == ">" {
+			return
+		}
+		// No leading/trailing/consecutive dots.
+		if in[0] == '.' || in[len(in)-1] == '.' {
+			t.Fatalf("accepted filter with leading/trailing dot: %q", in)
+		}
+		for i := 1; i < len(in); i++ {
+			if in[i] == '.' && in[i-1] == '.' {
+				t.Fatalf("accepted filter with consecutive dots: %q", in)
+			}
+		}
+		// Token-level contract.
+		tokens := strings.Split(in, ".")
+		for idx, tok := range tokens {
+			if tok == "" {
+				t.Fatalf("accepted filter with empty token at index %d: %q", idx, in)
+			}
+			if tok == ">" {
+				if idx != len(tokens)-1 {
+					t.Fatalf("accepted '>' token not in final position (idx=%d/%d): %q", idx, len(tokens)-1, in)
+				}
+				continue
+			}
+			if tok == "*" {
+				continue
+			}
+			for j := 0; j < len(tok); j++ {
+				c := tok[j]
+				ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+					(c >= '0' && c <= '9') || c == '-' || c == '_'
+				if !ok {
+					t.Fatalf("accepted filter token %q has disallowed byte 0x%02x: %q", tok, c, in)
+				}
+			}
+		}
 	})
 }
 

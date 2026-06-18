@@ -61,13 +61,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command so the documented healthcheck on port 8222 actually passes.
   Without it the depends-on health gate blocked forever.
 - README build-from-source Go version raised from `1.26.2+` to
-  `1.26.4+` to match `go.mod`.
+  `1.26.4+` to match `go.mod`. `CONTRIBUTING.md` aligned to the same
+  floor in the same release.
+- README gains a `Ephemeral consumer hygiene` section explaining the
+  30 s `InactiveThreshold` operator tradeoff (reconnect-storm protection
+  vs the previous nats-server 5 s default).
+- README gains a `Source precedence and malformed-cursor handling`
+  subsection under the replay docs that documents the contract:
+  `?last-id=` query takes precedence over the `Last-Event-ID` header,
+  malformed `?last-id=` returns 400, malformed `Last-Event-ID:` logs
+  at Warn and falls back to `DeliverNew` so browser auto-reconnect
+  doesn't loop forever.
+- Versioning policy clarifies the SemVer §4 carve-out for the 0.x
+  series — pre-1.0 MINOR releases MAY include breaking changes (the
+  `nuts_messages_dropped_total{reason}` labelled-counter migration is
+  the current example).
+- `docs/OPERATIONS.md` runbook updated with: (1) cross-reference from
+  the slow-consumer incident to `nuts_nats_async_errors_total{kind=
+  slow_consumer}`; (2) new `Stalled writes` section keyed on
+  `nuts_write_disconnects_total{site}`; (3) new `Wildcard-fallback
+  overhead on pre-2.10 NATS` section keyed on
+  `nuts_wildcard_filter_drops_total`; (4) new `Oversized messages
+  dropped` section covering both `nuts_messages_dropped_total{reason}`
+  values.
 
 ### Fixed
 - README documents the probe-path suffix-match semantic and the
   topic-shorthand collision risk for topics ending in the configured
   probe paths. Operators with conflicting topic names should configure
   unique `health_path`, `live_path`, `ready_path`.
+
+### Operator notes
+- CORS headers are now emitted on every response with an allow-listed
+  `Origin`, **including probe paths** (`/healthz`, `/livez`,
+  `/readyz`). Previously probes never set CORS headers. If your
+  load-balancer or monitoring scraper sends an `Origin` you don't
+  allow-list, behaviour is unchanged.
+- The Debug → Warn elevation of all three write-disconnect log sites
+  (`connected`, `message`, `heartbeat`) means **every browser tab-close
+  mid-stream now produces a Warn-level log entry**. Under heavy client
+  churn this can dominate aggregated log volume; consider sampling
+  `disconnect_reason="write_error"` entries in your log shipper if the
+  signal-to-noise ratio degrades.
+- PromQL migration for the `nuts_messages_dropped_total` labelled
+  counter: bare-metric queries (e.g. `nuts_messages_dropped_total > 0`)
+  now return one time series per reason instead of one in total. Alert
+  rules that compared the bare metric must wrap with
+  `sum without (reason)` or use `{reason=~".+"}` to keep their previous
+  semantics; queries that already used `rate()` / `increase()` are
+  unaffected because both functions preserve labels.
 
 ## [0.3.0] - 2026-05-21
 

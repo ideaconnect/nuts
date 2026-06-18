@@ -221,43 +221,83 @@ func TestAuth_LimitBoundaries(t *testing.T) {
 	now := time.Now()
 	secret := []byte("test-secret-with-enough-entropy-1234567890")
 
-	t.Run("token at length limit accepted", func(t *testing.T) {
+	// Three-point boundary on auth.go:141 — `len(token) > maxSubscriberJWTLen`.
+	// Builds a STRUCTURALLY VALID three-segment HS256 token whose total wire
+	// length is exactly the requested size by padding the payload with an
+	// unused `pad` claim. Without this padding-aware probe the previous
+	// implementation tested ~120-byte tokens and dot-less strings, neither
+	// of which exercises the actual length-cap branch — a regression
+	// flipping `>` to `>=` would pass all those subtests.
+	buildSizedToken := func(t *testing.T, totalLen int) string {
+		t.Helper()
 		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
-		// Build a payload of variable size to land at exactly maxSubscriberJWTLen.
-		// Padding goes inside an unused claim so it survives JSON encoding.
-		payload := encodeJWTPartTesting(t, map[string]interface{}{
-			"subscribe": "*",
-		})
-		mac := hmac.New(sha256.New, secret)
-		mac.Write([]byte(header + "." + payload))
-		sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-		token := header + "." + payload + "." + sig
-		if len(token) > maxSubscriberJWTLen {
-			t.Skipf("base token already exceeds limit: %d > %d", len(token), maxSubscriberJWTLen)
+		// Iterative calibration: each loop adjusts pad to converge on the
+		// target. Worst case we converge in a couple of iterations because
+		// each padded byte adds a known amount of base64-encoded output.
+		pad := 1
+		for i := 0; i < 16; i++ {
+			payloadObj := map[string]interface{}{
+				"subscribe": "*",
+				"pad":       strings.Repeat("A", pad),
+			}
+			payload := encodeJWTPartTesting(t, payloadObj)
+			mac := hmac.New(sha256.New, secret)
+			mac.Write([]byte(header + "." + payload))
+			sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+			token := header + "." + payload + "." + sig
+			diff := totalLen - len(token)
+			if diff == 0 {
+				return token
+			}
+			// Each character added to pad adds 1 to the encoded payload
+			// (base64 with potential alignment). Add diff but never less
+			// than 1 to make progress.
+			pad += diff
+			if pad < 1 {
+				pad = 1
+			}
 		}
-		// Sanity: the token verifies fine well under the limit.
+		t.Fatalf("buildSizedToken: did not converge to length %d (last pad=%d)", totalLen, pad)
+		return ""
+	}
+
+	t.Run("token one below length limit accepted", func(t *testing.T) {
+		token := buildSizedToken(t, maxSubscriberJWTLen-1)
+		if len(token) != maxSubscriberJWTLen-1 {
+			t.Fatalf("calibration failed: len=%d want=%d", len(token), maxSubscriberJWTLen-1)
+		}
 		if _, err := verifySubscriberJWT(token, secret, now); err != nil {
-			t.Fatalf("token under limit unexpectedly rejected: %v", err)
+			t.Fatalf("token at maxSubscriberJWTLen-1 unexpectedly rejected: %v", err)
 		}
 	})
 
-	t.Run("token over length limit rejected", func(t *testing.T) {
-		oversized := strings.Repeat("A", maxSubscriberJWTLen+1)
-		if _, err := verifySubscriberJWT(oversized, secret, now); err == nil {
+	t.Run("token exactly at length limit accepted", func(t *testing.T) {
+		// auth.go:141 is `len(token) > maxSubscriberJWTLen` — equality must
+		// be ACCEPTED. A regression to `>=` would fail this case with the
+		// specific "token exceeds maximum length" error.
+		token := buildSizedToken(t, maxSubscriberJWTLen)
+		if len(token) != maxSubscriberJWTLen {
+			t.Fatalf("calibration failed: len=%d want=%d", len(token), maxSubscriberJWTLen)
+		}
+		if _, err := verifySubscriberJWT(token, secret, now); err != nil {
+			t.Fatalf("token at exact maxSubscriberJWTLen unexpectedly rejected: %v", err)
+		}
+	})
+
+	t.Run("token one over length limit rejected with the length-cap error", func(t *testing.T) {
+		token := buildSizedToken(t, maxSubscriberJWTLen+1)
+		if len(token) != maxSubscriberJWTLen+1 {
+			t.Fatalf("calibration failed: len=%d want=%d", len(token), maxSubscriberJWTLen+1)
+		}
+		// Assert the SPECIFIC error so a regression that lets the token
+		// through the length cap but fails later (e.g. wrong segment count)
+		// doesn't silently pass this case.
+		_, err := verifySubscriberJWT(token, secret, now)
+		if err == nil {
 			t.Fatal("expected token > maxSubscriberJWTLen to be rejected")
 		}
-	})
-
-	t.Run("token exactly at length limit rejected", func(t *testing.T) {
-		// Anything at-or-above the limit is rejected with the same error,
-		// so we test that the comparison is `> maxSubscriberJWTLen`. A
-		// string of length maxSubscriberJWTLen will trigger the wrong
-		// branch (three-segment parse) instead of the explicit length
-		// check, but that's also rejected for a different reason — both
-		// are acceptable outcomes.
-		justRight := strings.Repeat("A", maxSubscriberJWTLen)
-		if _, err := verifySubscriberJWT(justRight, secret, now); err == nil {
-			t.Fatal("expected token at length limit without dots to be rejected")
+		if !strings.Contains(err.Error(), "exceeds maximum length") {
+			t.Fatalf("expected length-cap error, got %v", err)
 		}
 	})
 

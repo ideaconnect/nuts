@@ -7,7 +7,7 @@ get a development environment running and the expectations for contributions.
 
 Requirements:
 
-- Go 1.26.2+
+- Go 1.26.4+ (matches the `go` directive in [`go.mod`](go.mod))
 - Docker and Docker Compose (for the functional/BDD suite)
 - `xcaddy` if you want to build a custom Caddy binary with additional modules
 

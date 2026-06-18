@@ -80,7 +80,11 @@ func TestClassifyNATSAsyncError(t *testing.T) {
 		in   error
 		want string
 	}{
-		{"nil", nil, "unknown"},
+		// Production never calls classifyNATSAsyncError with a nil error
+		// (provision.go's ErrorHandler short-circuits on nil), but the
+		// classifier still tolerates it by falling through to the "other"
+		// bucket via errors.Is(nil, target) returning false.
+		{"nil falls through to other", nil, "other"},
 		{"slow consumer", nats.ErrSlowConsumer, "slow_consumer"},
 		{"slow consumer wrapped", fmt.Errorf("subscribe: %w", nats.ErrSlowConsumer), "slow_consumer"},
 		{"timeout", nats.ErrTimeout, "timeout"},

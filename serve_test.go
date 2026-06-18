@@ -284,11 +284,14 @@ func TestSubjectMatchesFilter_GreaterThanTerminatedFilterTokenCount(t *testing.T
 	}
 }
 
-// TestHandler_PlanSubscription_TopicPrefixVariants verifies plan
-// construction across non-`events.` prefix shapes the existing tests
-// never exercised: empty prefix (path-shorthand), no-trailing-dot
-// prefix (legacy operator typo), and multi-segment prefix.
-func TestHandler_PlanSubscription_TopicPrefixVariants(t *testing.T) {
+// TestHandler_ParseStreamRequest_TopicPrefixVariants verifies subject
+// construction in parseStreamRequest across non-`events.` prefix shapes
+// the existing tests never exercised: empty prefix (path-shorthand),
+// no-trailing-dot prefix (legacy operator typo), and multi-segment
+// prefix. Sibling test TestHandler_PlanSubscriptionDetectsMultiTopicStream-
+// Mismatch covers planSubscription itself; this test deliberately
+// targets the earlier subject-assembly step.
+func TestHandler_ParseStreamRequest_TopicPrefixVariants(t *testing.T) {
 	cases := []struct {
 		name             string
 		topicPrefix      string

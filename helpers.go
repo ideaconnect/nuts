@@ -34,10 +34,14 @@ func (h *Handler) log() *zap.Logger {
 // classifyNATSAsyncError maps a nats.go async error to a stable Prometheus
 // label value. Keep the label set small and bounded — Prometheus cardinality
 // matters, and operators triage on kind, not the underlying error string.
+//
+// Label set (must stay in sync with the README and OPERATIONS.md
+// documented values): slow_consumer, timeout, connection_state, other.
+// The caller (provision.go's nats.ErrorHandler) filters nil errors
+// before calling, so this function does not return an "unknown" or
+// similar label that would drift outside the documented set.
 func classifyNATSAsyncError(err error) string {
 	switch {
-	case err == nil:
-		return "unknown"
 	case errors.Is(err, nats.ErrSlowConsumer):
 		return "slow_consumer"
 	case errors.Is(err, nats.ErrTimeout):

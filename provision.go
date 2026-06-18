@@ -212,6 +212,13 @@ func (h *Handler) connectNATS() error {
 		// and silently drops messages. Routing through h.logger + a metric
 		// makes that failure mode observable in production.
 		nats.ErrorHandler(func(nc *nats.Conn, sub *nats.Subscription, err error) {
+			if err == nil {
+				// nats.go is documented to always pass a non-nil err here;
+				// guard defensively so a future library bug can't bump the
+				// metric with an undocumented label or log a confusing
+				// "<nil>"-error entry.
+				return
+			}
 			kind := classifyNATSAsyncError(err)
 			metricsNATSAsyncErrors.WithLabelValues(kind).Inc()
 			fields := []zap.Field{zap.String("kind", kind), zap.Error(err)}
