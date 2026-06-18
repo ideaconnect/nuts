@@ -1986,19 +1986,15 @@ func TestHandler_SubscriberJWT_RejectionCreatesNoConsumer(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
 	}
 
-	// Post-rejection: confirm no consumer ever appears. waitForConsumerCount
-	// would return true on its first sample (count is already 0), giving a
-	// trivial pass — instead sample over a window and assert the count
-	// stayed at 0 the whole time. A racing consumer-create would surface
-	// at some point during the window.
-	observationWindow := 750 * time.Millisecond
-	pollInterval := 25 * time.Millisecond
-	deadline := time.Now().Add(observationWindow)
-	for time.Now().Before(deadline) {
-		if got := consumerCount(js, "EVENTS"); got != 0 {
-			info, _ := js.StreamInfo("EVENTS")
-			t.Fatalf("post-rejection: consumer count = %d (stream reported %d consumers), want 0 (auth must run BEFORE Subscribe)", got, info.State.Consumers)
-		}
-		time.Sleep(pollInterval)
+	// Post-rejection: assert no consumer was created. authorizeStreamRequest
+	// runs SYNCHRONOUSLY inside ServeHTTP before executeSubscriptionPlan
+	// and before any goroutine is spawned on the auth-reject path, so a
+	// single post-call check is sufficient — there is no later moment at
+	// which a racing consumer-create could appear. The 401 above proves
+	// we took the reject branch; this assertion proves the branch did
+	// not allocate JetStream state on the way out.
+	if got := consumerCount(js, "EVENTS"); got != 0 {
+		info, _ := js.StreamInfo("EVENTS")
+		t.Fatalf("post-rejection: consumer count = %d (stream reported %d consumers), want 0 (auth must run BEFORE Subscribe)", got, info.State.Consumers)
 	}
 }

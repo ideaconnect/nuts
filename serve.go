@@ -41,6 +41,10 @@ import (
 // "Origin, Accept-Encoding". Token comparison is the contract the
 // HTTP spec defines for Vary; treating Header().Values() as opaque
 // strings would miss the combined case and emit a duplicate header.
+//
+// Note: Vary entries are bare HTTP field-name tokens (RFC 7231 §7.1.4),
+// which forbid commas and quoted-strings, so the simple comma split is
+// sufficient — no need to honour RFC 7230 quoted-string parsing here.
 func varyContains(values []string, token string) bool {
 	for _, v := range values {
 		for _, part := range strings.Split(v, ",") {
