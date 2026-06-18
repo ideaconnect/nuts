@@ -20,6 +20,13 @@ import (
 // construct but reusing one instance keeps the hot path branch-free.
 var nopLogger = zap.NewNop()
 
+// maxSubjectLen caps the byte length of an accepted NATS subject string —
+// applied to both request topics (isValidTopic) and JWT-claim filters
+// (isValidTopicFilter in auth.go). The two validators differ in alphabet
+// and wildcard rules, but the length contract is the same; hoisting the
+// constant prevents the two sides from drifting if it ever needs raising.
+const maxSubjectLen = 256
+
 // log returns h.logger when set and a no-op logger otherwise. Keeps every
 // h.log().X(...) call site safe regardless of whether the handler went
 // through Provision (which sets h.logger from ctx.Logger) or was
@@ -123,8 +130,7 @@ func isAllowedTopicByte(c byte) bool {
 // underscore. Rejects wildcards (* and >), the system prefix ($),
 // leading/trailing/consecutive dots, and any length over 256 bytes.
 func isValidTopic(topic string) bool {
-	const maxTopicLen = 256
-	if topic == "" || len(topic) > maxTopicLen {
+	if topic == "" || len(topic) > maxSubjectLen {
 		return false
 	}
 	if strings.HasPrefix(topic, "$") {

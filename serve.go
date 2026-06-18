@@ -344,7 +344,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			metricsConnectionsRejected.WithLabelValues("max_connections").Inc()
 			h.log().Warn("rejecting SSE stream: max_connections reached",
 				appendStreamLogFields(plan,
-					zap.String("reject_reason", "max_connections"),
+					zap.String("disconnect_reason", "max_connections"),
 					zap.Int("max_connections", h.MaxConnections),
 				)...,
 			)
@@ -779,6 +779,11 @@ func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
 // surface as a 503 to the client.
 func (h *Handler) executeSubscriptionPlan(js nats.JetStreamContext, conn *nats.Conn, plan streamPlan, enqueueMessage, enqueueRequestedMessage nats.MsgHandler) subscriptionResult {
 	if len(plan.FailedTopics) > 0 {
+		// Planning-time topic rejection (subject not allowed by the
+		// stream's configured subjects) hits the same 503 path as a
+		// subscribe-time failure below; align the metric so the
+		// nuts_subscription_errors_total alert fires for both shapes.
+		metricsSubscriptionErrors.Inc()
 		return subscriptionResult{FailedTopics: append([]string{}, plan.FailedTopics...)}
 	}
 
@@ -920,10 +925,8 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 			return nil
 
 		case msg := <-msgChan:
-			if msg == nil {
-				continue
-			}
-
+			// msgChan is never closed (enqueueMessage is the sole sender
+			// and only ever pushes non-nil *nats.Msg). No nil-guard needed.
 			formatted := h.formatMessageEvent(msg, time.Now())
 			if formatted.MetadataErr != nil {
 				h.log().Warn("failed to read JetStream metadata",
@@ -1354,7 +1357,7 @@ func matchesConfiguredPath(reqPath, configuredPath, defaultPath string) bool {
 func (h *Handler) reserveConnSlot() bool {
 	for {
 		cur := atomic.LoadInt64(&h.connCount)
-		if int(cur) >= h.MaxConnections {
+		if cur >= int64(h.MaxConnections) {
 			return false
 		}
 		if atomic.CompareAndSwapInt64(&h.connCount, cur, cur+1) {
@@ -1488,12 +1491,16 @@ func (h *Handler) serveReadinessCheck(w http.ResponseWriter) error {
 		resp.Status = "degraded"
 		resp.NATS = "disconnected"
 		statusCode = http.StatusServiceUnavailable
+		metricsReadinessFailures.WithLabelValues("nats_disconnected").Inc()
+		h.log().Warn("readiness probe degraded", zap.String("cause", "nats_disconnected"))
 	}
 
 	if js == nil {
 		resp.Status = "degraded"
 		resp.Stream = "unavailable"
 		statusCode = http.StatusServiceUnavailable
+		metricsReadinessFailures.WithLabelValues("jetstream_missing").Inc()
+		h.log().Warn("readiness probe degraded", zap.String("cause", "jetstream_missing"))
 	} else {
 		// Bound the JetStream call so a partially-degraded server can't stall
 		// the probe past the orchestrator's readiness budget. See
@@ -1503,6 +1510,11 @@ func (h *Handler) serveReadinessCheck(w http.ResponseWriter) error {
 			resp.Status = "degraded"
 			resp.Stream = "unavailable"
 			statusCode = http.StatusServiceUnavailable
+			metricsReadinessFailures.WithLabelValues("stream_info_error").Inc()
+			h.log().Warn("readiness probe degraded",
+				zap.String("cause", "stream_info_error"),
+				zap.Error(err),
+			)
 		}
 	}
 

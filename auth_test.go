@@ -364,3 +364,70 @@ func encodeJWTPartTesting(t *testing.T, value interface{}) string {
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
 }
+
+// TestAuthorizeStreamRequest_RejectionMetrics asserts that each rejection
+// branch in authorizeStreamRequest bumps the documented label on
+// nuts_connections_rejected_total. Without this an attacker probing the
+// auth surface leaves no Prometheus footprint (see ops/prometheus-alerts.yml's
+// NutsAuthRejectionsHigh alert).
+func TestAuthorizeStreamRequest_RejectionMetrics(t *testing.T) {
+	secret := "test-secret-with-enough-entropy-1234567890"
+	now := time.Now()
+	h := &Handler{SubscriberJWTKey: secret}
+	plan := streamPlan{Topics: []string{"orders.created"}}
+
+	t.Run("auth_missing_token", func(t *testing.T) {
+		before := counterValue(metricsConnectionsRejected, "auth_missing_token")
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=orders.created", nil)
+		err := h.authorizeStreamRequest(req, plan)
+		if err == nil || err.status != http.StatusUnauthorized {
+			t.Fatalf("want 401 token-missing rejection, got %#v", err)
+		}
+		if got := counterValue(metricsConnectionsRejected, "auth_missing_token"); got <= before {
+			t.Errorf("auth_missing_token counter did not increment: %v -> %v", before, got)
+		}
+	})
+
+	t.Run("auth_invalid_token", func(t *testing.T) {
+		before := counterValue(metricsConnectionsRejected, "auth_invalid_token")
+		// Structurally valid HS256 token signed with a different key.
+		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		payload := encodeJWTPartTesting(t, map[string]interface{}{"subscribe": "*", "exp": now.Add(time.Hour).Unix()})
+		mac := hmac.New(sha256.New, []byte("wrong-secret"))
+		mac.Write([]byte(header + "." + payload))
+		token := header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=orders.created", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		err := h.authorizeStreamRequest(req, plan)
+		if err == nil || err.status != http.StatusUnauthorized {
+			t.Fatalf("want 401 invalid-token rejection, got %#v", err)
+		}
+		if got := counterValue(metricsConnectionsRejected, "auth_invalid_token"); got <= before {
+			t.Errorf("auth_invalid_token counter did not increment: %v -> %v", before, got)
+		}
+	})
+
+	t.Run("auth_topic_forbidden", func(t *testing.T) {
+		before := counterValue(metricsConnectionsRejected, "auth_topic_forbidden")
+		// Valid token whose subscribe claim does NOT include orders.created.
+		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		payload := encodeJWTPartTesting(t, map[string]interface{}{
+			"subscribe": []string{"other.topic"},
+			"exp":       now.Add(time.Hour).Unix(),
+		})
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write([]byte(header + "." + payload))
+		token := header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=orders.created", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		err := h.authorizeStreamRequest(req, plan)
+		if err == nil || err.status != http.StatusForbidden {
+			t.Fatalf("want 403 topic-forbidden rejection, got %#v", err)
+		}
+		if got := counterValue(metricsConnectionsRejected, "auth_topic_forbidden"); got <= before {
+			t.Errorf("auth_topic_forbidden counter did not increment: %v -> %v", before, got)
+		}
+	})
+}

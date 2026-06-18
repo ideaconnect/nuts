@@ -751,6 +751,9 @@ func TestHandler_NATSReconnect_AllowsSubsequentSSE(t *testing.T) {
 	h.mu.Unlock()
 	defer h.Cleanup()
 
+	beforeDisconnect := counterValue(metricsNATSConnectionEvents, "disconnect")
+	beforeReconnect := counterValue(metricsNATSConnectionEvents, "reconnect")
+
 	// Kill the server, wait for the client to observe the disconnect, then
 	// bring the server back up so the client auto-reconnects.
 	ns.Shutdown()
@@ -771,6 +774,15 @@ func TestHandler_NATSReconnect_AllowsSubsequentSSE(t *testing.T) {
 	}
 	if !h.conn.IsConnected() {
 		t.Fatal("handler's NATS connection did not reconnect")
+	}
+
+	// The disconnect+reconnect cycle must have bumped the flap-detection
+	// counter so an SRE alert can fire on broker instability.
+	if got := counterValue(metricsNATSConnectionEvents, "disconnect"); got <= beforeDisconnect {
+		t.Errorf("nuts_nats_connection_events_total{event=disconnect} did not increment: %v -> %v", beforeDisconnect, got)
+	}
+	if got := counterValue(metricsNATSConnectionEvents, "reconnect"); got <= beforeReconnect {
+		t.Errorf("nuts_nats_connection_events_total{event=reconnect} did not increment: %v -> %v", beforeReconnect, got)
 	}
 
 	// Publish a fresh message via a new admin connection and confirm the

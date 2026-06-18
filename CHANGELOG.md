@@ -29,6 +29,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `defaultConsumerInactiveThreshold`) so server-side consumer state is
   reaped promptly under reconnect churn instead of relying on
   nats-server's 5s default.
+- New Prometheus counter `nuts_readiness_failures_total{cause}` labelled
+  by readiness-probe degradation cause (`nats_disconnected`,
+  `jetstream_missing`, `stream_info_error`). Previously `/readyz`
+  silently returned 503 with no log line and no metric, so an
+  orchestrator pulling pods out of rotation gave operators no
+  Prometheus signal explaining why.
+- New Prometheus counter `nuts_nats_connection_events_total{event}`
+  incremented from the registered `DisconnectErrHandler`,
+  `ReconnectHandler`, and `ClosedHandler`. `event` is one of
+  `disconnect`, `reconnect`, `closed`. Closes the flap-detection gap:
+  a clean broker-restart cycle never went through the async
+  ErrorHandler, so the existing `nuts_nats_async_errors_total{kind=
+  connection_state}` did not move on plain Disconnect+Reconnect.
+- `nuts_connections_rejected_total{reason}` now also fires for each
+  subscriber-JWT rejection path: `auth_missing_token` (no Authorization
+  header or malformed shape), `auth_invalid_token` (signature, expiry,
+  or claim verification failure), and `auth_topic_forbidden` (token
+  valid but the `subscribe` claim does not cover a requested topic).
+  An attacker probing the auth surface now leaves a Prometheus
+  footprint that `ops/prometheus-alerts.yml` watches via the new
+  `NutsAuthRejectionsHigh` alert.
+- `ops/prometheus-alerts.yml` gains three alerts:
+  `NutsNATSBrokerFlapping`, `NutsReadinessProbeFailing`,
+  `NutsAuthRejectionsHigh` — each keyed on the new counters above.
 
 ### Changed
 - **Breaking metric format.** `nuts_messages_dropped_total` is now a
@@ -90,6 +114,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   topic-shorthand collision risk for topics ending in the configured
   probe paths. Operators with conflicting topic names should configure
   unique `health_path`, `live_path`, `ready_path`.
+- `nuts_subscription_errors_total` now also increments on planning-time
+  topic rejection (multi-topic request where at least one requested
+  full subject is not allowed by the stream's configured subjects).
+  Previously only subscribe-time failures fired the counter, so the
+  `NutsSubscriptionErrorsHigh` alert missed deployments that changed a
+  stream's allowed subjects.
+- NATS reconnect log line now passes `nc.ConnectedUrl()` through
+  `redactURL()` to match the startup-log convention. Operators using
+  credentialed `nats://user:pass@host` URLs no longer leak credentials
+  on each reconnect event.
+- The max-connections rejection log line now emits
+  `disconnect_reason="max_connections"` to match the convention used
+  by every other connection-termination log site (10 others); the
+  previous `reject_reason` key was the lone outlier and operator
+  dashboards keyed on `disconnect_reason` missed it. The
+  `metricsConnectionsRejected{reason="max_connections"}` counter is
+  unchanged.
 
 ### Operator notes
 - CORS headers are now emitted on every response with an allow-listed

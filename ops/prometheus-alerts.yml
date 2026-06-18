@@ -45,3 +45,30 @@ groups:
         annotations:
           summary: NUTS max_connections is rejecting clients
           description: "NUTS rejected SSE clients because max_connections was reached for {{ $labels.job }}. Check active clients, instance capacity, and edge retry behavior."
+
+      - alert: NutsNATSBrokerFlapping
+        expr: increase(nuts_nats_connection_events_total{event="reconnect"}[10m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS NATS broker connection is flapping
+          description: "More than 3 NATS reconnects in 10 minutes for {{ $labels.job }}. Check broker stability, network path between NUTS and NATS, and NATS server logs."
+
+      - alert: NutsReadinessProbeFailing
+        expr: increase(nuts_readiness_failures_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: NUTS /readyz is returning 503
+          description: "Readiness probe is failing for {{ $labels.job }} ({{ $labels.cause }}). Orchestrator will pull the pod out of rotation. Cross-check NATS broker, JetStream context, and stream availability."
+
+      - alert: NutsAuthRejectionsHigh
+        expr: rate(nuts_connections_rejected_total{reason=~"auth_.*"}[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS subscriber JWT rejections are elevated
+          description: "Auth rejection rate above 0.5/sec for {{ $labels.job }} (reason={{ $labels.reason }}). Likely a credential probe or a misconfigured client; review access logs and rotate keys if compromise is suspected."

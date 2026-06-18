@@ -196,14 +196,17 @@ func (h *Handler) connectNATS() error {
 		nats.MaxReconnects(maxReconnects),
 
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
+			metricsNATSConnectionEvents.WithLabelValues("disconnect").Inc()
 			if err != nil {
 				h.log().Warn("disconnected from NATS", zap.Error(err))
 			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
+			metricsNATSConnectionEvents.WithLabelValues("reconnect").Inc()
 			h.log().Info("reconnected to NATS", zap.String("url", redactURL(nc.ConnectedUrl())))
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
+			metricsNATSConnectionEvents.WithLabelValues("closed").Inc()
 			h.log().Info("NATS connection closed")
 		}),
 		// ErrorHandler captures async failures the nats.go client would

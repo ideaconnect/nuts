@@ -139,7 +139,7 @@ The full PR checklist is [CONTRIBUTING.md § Contribution checklist](CONTRIBUTIN
 
 ## Coding conventions
 
-- **Go version:** match `go.mod` (Go 1.26.2 at time of writing). Don't bump
+- **Go version:** match `go.mod` (Go 1.26.4 at time of writing). Don't bump
   the toolchain unless asked.
 - **Style:** `gofmt -s -w .`; `make lint` must pass; no new `//nolint`
   directives without a one-line justification on the same line.

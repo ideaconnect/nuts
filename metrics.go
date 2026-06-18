@@ -133,4 +133,26 @@ var (
 		Name:      "write_disconnects_total",
 		Help:      "Total number of SSE streams terminated by a response-writer write error.",
 	}, []string{"site"})
+
+	// nuts_readiness_failures_total counts /readyz probe responses that
+	// returned 503 because a dependency was degraded. Labelled by cause
+	// so operators can distinguish a NATS-link outage from a JetStream
+	// context loss from a StreamInfo lookup failure.
+	metricsReadinessFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "readiness_failures_total",
+		Help:      "Total number of /readyz probe responses returning 503, labelled by cause.",
+	}, []string{"cause"})
+
+	// nuts_nats_connection_events_total counts NATS connection-state
+	// transitions reported by the registered Disconnect/Reconnect/Closed
+	// handlers. A flapping broker is invisible to nuts_nats_async_errors_total
+	// when the in-flight client surface is quiet, so this counter is the
+	// canonical signal for clean disconnect+reconnect cycles. Alert on
+	// e.g. increase(...{event="reconnect"}[10m]) > 3 for flap detection.
+	metricsNATSConnectionEvents = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "nats_connection_events_total",
+		Help:      "Total NATS connection-state transitions, labelled by event (disconnect, reconnect, closed).",
+	}, []string{"event"})
 )

@@ -749,6 +749,8 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_dispatch_timeout_total` | Counter | NATS callbacks that timed out signalling a slow SSE client (set when `dispatch_timeout` fires before the SSE loop observes the signal) |
 | `nuts_nats_async_errors_total{kind}` | Counter (labeled) | Asynchronous NATS client errors observed by the registered ErrorHandler. `kind` is one of `slow_consumer`, `timeout`, `connection_state`, `other`. `slow_consumer` indicates the nats.go per-subscription buffer overflowed and messages were silently dropped. |
 | `nuts_write_disconnects_total{site}` | Counter (labeled) | SSE streams terminated by a response-writer write error (typically the `write_timeout` deadline firing). `site` is one of `connected`, `message`, `heartbeat`. |
+| `nuts_readiness_failures_total{cause}` | Counter (labeled) | `/readyz` probe responses that returned 503 because a dependency was degraded. `cause` is one of `nats_disconnected`, `jetstream_missing`, `stream_info_error`. |
+| `nuts_nats_connection_events_total{event}` | Counter (labeled) | NATS connection-state transitions reported by the registered Disconnect/Reconnect/Closed handlers. `event` is one of `disconnect`, `reconnect`, `closed`. Use the `reconnect` series to alert on broker flapping (see [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml)). |
 
 Example alert rules and a Grafana dashboard are available in
 [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml) and

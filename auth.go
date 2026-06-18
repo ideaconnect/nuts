@@ -69,17 +69,20 @@ func (h *Handler) authorizeStreamRequest(r *http.Request, plan streamPlan) *stre
 
 	token, err := h.extractSubscriberToken(r)
 	if err != nil {
+		metricsConnectionsRejected.WithLabelValues("auth_missing_token").Inc()
 		return &streamRequestError{status: http.StatusUnauthorized, message: err.Error()}
 	}
 
 	claims, err := verifySubscriberJWT(token, []byte(h.SubscriberJWTKey), time.Now())
 	if err != nil {
+		metricsConnectionsRejected.WithLabelValues("auth_invalid_token").Inc()
 		h.log().Warn("subscriber JWT rejected", appendStreamLogFields(plan, zap.Error(err))...)
 		return &streamRequestError{status: http.StatusUnauthorized, message: "Invalid subscriber token"}
 	}
 
 	for _, topic := range plan.Topics {
 		if !claims.canSubscribe(topic) {
+			metricsConnectionsRejected.WithLabelValues("auth_topic_forbidden").Inc()
 			h.log().Warn("subscriber is not authorized for requested topic",
 				appendStreamLogFields(plan,
 					zap.String("subscriber", claims.Subject),
@@ -351,8 +354,7 @@ func subscriberTopicMatches(topic, filter string) bool {
 // matcher, so an attacker can't smuggle weird whitespace or null bytes
 // past authorization via a crafted JWT.
 func isValidTopicFilter(filter string) bool {
-	const maxFilterLen = 256
-	if filter == "" || len(filter) > maxFilterLen || strings.HasPrefix(filter, "$") {
+	if filter == "" || len(filter) > maxSubjectLen || strings.HasPrefix(filter, "$") {
 		return false
 	}
 	if filter == "*" || filter == ">" {

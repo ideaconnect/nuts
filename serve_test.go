@@ -231,6 +231,9 @@ func TestHandler_ServeReadinessCheckReportsMissingRuntime(t *testing.T) {
 	h := &Handler{logger: zap.NewNop()}
 	rr := httptest.NewRecorder()
 
+	beforeNats := counterValue(metricsReadinessFailures, "nats_disconnected")
+	beforeJS := counterValue(metricsReadinessFailures, "jetstream_missing")
+
 	if err := h.serveReadinessCheck(rr); err != nil {
 		t.Fatalf("serveReadinessCheck: %v", err)
 	}
@@ -241,6 +244,30 @@ func TestHandler_ServeReadinessCheckReportsMissingRuntime(t *testing.T) {
 		if !strings.Contains(rr.Body.String(), needle) {
 			t.Fatalf("readiness body missing %s: %s", needle, rr.Body.String())
 		}
+	}
+	if got := counterValue(metricsReadinessFailures, "nats_disconnected"); got <= beforeNats {
+		t.Errorf("nuts_readiness_failures_total{cause=nats_disconnected} did not increment: %v -> %v", beforeNats, got)
+	}
+	if got := counterValue(metricsReadinessFailures, "jetstream_missing"); got <= beforeJS {
+		t.Errorf("nuts_readiness_failures_total{cause=jetstream_missing} did not increment: %v -> %v", beforeJS, got)
+	}
+}
+
+func TestHandler_ExecuteSubscriptionPlan_PlanningRejectionBumpsMetric(t *testing.T) {
+	h := &Handler{logger: zap.NewNop()}
+	plan := streamPlan{
+		Topics:       []string{"allowed", "blocked"},
+		FullSubjects: []string{"events.allowed", "events.blocked"},
+		FailedTopics: []string{"blocked"},
+	}
+
+	before := counterVal(t, metricsSubscriptionErrors)
+	got := h.executeSubscriptionPlan(nil, nil, plan, nil, nil)
+	if len(got.FailedTopics) != 1 || got.FailedTopics[0] != "blocked" {
+		t.Fatalf("FailedTopics = %#v, want [blocked]", got.FailedTopics)
+	}
+	if after := counterVal(t, metricsSubscriptionErrors); after <= before {
+		t.Errorf("nuts_subscription_errors_total did not increment on planning-time rejection: %v -> %v", before, after)
 	}
 }
 
