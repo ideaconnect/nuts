@@ -190,6 +190,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`load nats_tls_cert=<path> nats_tls_key=<path>: <cause>`),
   matching the CA-load error shape so operators don't have to bisect
   which file is malformed.
+- `docs/CONFIGURATION.md` `max_connections` row updated from `503` to
+  `429 (Too Many Requests, RFC 6585)` — the canonical configuration
+  table is now consistent with `handler.go`, `serve.go`, `README.md`,
+  and `CHANGELOG.md`. (Last surface missed by the pass-6 status-code
+  rotation.)
+- CI image-scan tightening: Trivy scan in the `docker` job now runs on
+  every push-built image (including `:latest` promoted from `main`),
+  not only on tagged releases. A new HIGH/CRITICAL CVE in a base
+  image (Alpine, Caddy) can land between PR-merge and the next tag,
+  and the previous gate (`if: startsWith(github.ref, 'refs/tags/v')`)
+  silently shipped unscanned `:latest` images. The PR-build scan is
+  unchanged.
+- `govulncheck` invocation pinned from `@latest` to `@v1.1.4` to match
+  the pinning convention used for the other CI tooling (gremlins,
+  golangci-lint, Trivy).
 
 ### Operator notes
 - CORS headers are now emitted on every response with an allow-listed

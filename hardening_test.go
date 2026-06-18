@@ -1035,6 +1035,11 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 			wantErr: "topic_prefix",
 		},
 		{
+			name:    "topic_prefix exceeds maxSubjectLen",
+			mutate:  func(h *Handler) { h.TopicPrefix = strings.Repeat("a", maxSubjectLen+1) },
+			wantErr: "topic_prefix",
+		},
+		{
 			name:    "negative heartbeat interval",
 			mutate:  func(h *Handler) { h.HeartbeatInterval = -30 },
 			wantErr: "heartbeat_interval",
@@ -1065,10 +1070,17 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 }
 
 // TestValidateTopicPrefix_AcceptsLegitimate documents the positive side
-// of the prefix contract: empty is fine, and the idiomatic trailing-dot
-// forms shown in the README/CONFIGURATION docs must validate cleanly.
+// of the prefix contract: empty is fine, the idiomatic trailing-dot
+// forms shown in the README/CONFIGURATION docs must validate cleanly,
+// and the cap accepts exactly-at-boundary strings (length=maxSubjectLen)
+// so the boundary on the > check at provision.go is pinned in both
+// directions (matching the >maxSubjectLen rejection test above).
 func TestValidateTopicPrefix_AcceptsLegitimate(t *testing.T) {
-	for _, p := range []string{"", "events.", "tenants.a.", "events", "a_b-c.", "ABC.XYZ."} {
+	cases := []string{
+		"", "events.", "tenants.a.", "events", "a_b-c.", "ABC.XYZ.",
+		strings.Repeat("a", maxSubjectLen),
+	}
+	for _, p := range cases {
 		if err := validateTopicPrefix(p); err != nil {
 			t.Errorf("validateTopicPrefix(%q) rejected legitimate prefix: %v", p, err)
 		}

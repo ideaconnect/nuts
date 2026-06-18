@@ -62,7 +62,9 @@ jobs:
         run: go vet ./...
 
       - name: Run govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        # Pinned to match the rest of CI (golangci-lint, trivy, action SHAs).
+        # Bump in lockstep with Renovate/Dependabot updates.
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
       - name: Run functional test matrix
         env:
@@ -235,8 +237,13 @@ jobs:
           provenance: true
           sbom: true
 
-      - name: Scan release image for vulnerabilities
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Scan pushed image for vulnerabilities
+        # Run on every push-built image (including the :latest tag promoted
+        # from main), not only release tags. A new HIGH/CRITICAL CVE in the
+        # base image (Alpine, Caddy) can land between PR merge and the next
+        # tag — Trivy previously caught Caddy CVE-2026-45135 only because
+        # the PR-job scan ran, but the push-to-main job was gated on tags
+        # and silently shipped unscanned :latest images for hours/days.
         run: |
           mkdir -p "$HOME/.cache/trivy"
           docker run --rm \

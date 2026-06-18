@@ -720,8 +720,9 @@ func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot)
 // rather than risk emitting forbidden history).
 //
 // Condition order is load-bearing: the `snapshot.LastSeq < replay.StartSequence`
-// check at line 722 MUST run before the `!HasStartSequenceTime` conservative
-// branch. A fully caught-up client passes `last-id == LastSeq`, which
+// short-circuit in the first conditional below MUST run before the
+// `!HasStartSequenceTime` conservative branch. A fully caught-up client
+// passes `last-id == LastSeq`, which
 // computes `StartSequence = LastSeq+1` — a sequence that doesn't yet
 // exist, so readStreamSnapshot's GetMsg call fails and leaves
 // HasStartSequenceTime=false. The "caught up" short-circuit returns
