@@ -37,10 +37,19 @@ func FuzzIsValidTopic(f *testing.F) {
 		if !got {
 			return
 		}
-		// If accepted, verify the contract: only allowed bytes; no
-		// leading/trailing/consecutive dots; non-empty.
+		// If accepted, verify the documented contract (helpers.go:117):
+		// non-empty, ≤ 256 bytes, no '$' prefix (system subject), no
+		// leading/trailing/consecutive dots, and only allowed bytes
+		// (ASCII letters, digits, dot, dash, underscore).
 		if in == "" {
 			t.Fatal("isValidTopic accepted empty string")
+		}
+		const maxTopicLen = 256
+		if len(in) > maxTopicLen {
+			t.Fatalf("accepted topic of length %d (max %d): %q", len(in), maxTopicLen, in)
+		}
+		if in[0] == '$' {
+			t.Fatalf("accepted system-subject topic with $-prefix: %q", in)
 		}
 		if in[0] == '.' || in[len(in)-1] == '.' {
 			t.Fatalf("accepted topic with leading/trailing dot: %q", in)

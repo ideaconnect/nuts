@@ -523,6 +523,38 @@ func TestHandler_FinalizeStreamedMessage(t *testing.T) {
 	}
 }
 
+// TestVaryContains covers the token-membership semantic that backs
+// setCORSHeaders' idempotent Vary handling. A simple
+// slices.Contains-style element check would miss the case where an
+// upstream middleware combined multiple Vary entries into a single
+// comma-separated header value.
+func TestVaryContains(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+		token  string
+		want   bool
+	}{
+		{"absent", nil, "Origin", false},
+		{"single element exact", []string{"Origin"}, "Origin", true},
+		{"single element case-insensitive", []string{"origin"}, "Origin", true},
+		{"two separate Add calls", []string{"Accept-Encoding", "Origin"}, "Origin", true},
+		{"combined value Origin first", []string{"Origin, Accept-Encoding"}, "Origin", true},
+		{"combined value Origin last", []string{"Accept-Encoding, Origin"}, "Origin", true},
+		{"combined value Origin middle", []string{"Accept-Encoding, Origin, User-Agent"}, "Origin", true},
+		{"combined value without Origin", []string{"Accept-Encoding, User-Agent"}, "Origin", false},
+		{"whitespace surrounding token", []string{" Origin "}, "Origin", true},
+		{"prefix only match should not count", []string{"OriginHeader"}, "Origin", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := varyContains(c.values, c.token); got != c.want {
+				t.Errorf("varyContains(%v, %q) = %v, want %v", c.values, c.token, got, c.want)
+			}
+		})
+	}
+}
+
 // TestHandler_ParseStreamRequest_LastIDBoundary exercises the
 // maxReplayCursor cut-off explicitly for both transport surfaces:
 //

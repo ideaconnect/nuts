@@ -444,6 +444,18 @@ normal write path. Caddy server-level timeouts and proxy buffering policy still
 matter, but this directive gives the handler its own protection for supported
 HTTP stacks.
 
+#### Ephemeral consumer hygiene
+
+Every SSE request opens its own ephemeral JetStream consumer with an
+explicit **`InactiveThreshold` of 30 seconds**. After the SSE subscription
+ends (client disconnect, NUTS shutdown, write error), nats-server retains
+the consumer for 30 s in case the client reconnects, then reaps the
+server-side state. This protects against reconnect-storm accumulation
+that would build up with nats-server's 5 s default.
+
+The threshold is not user-configurable today; if 30 s is unsuitable for
+your deployment, open an issue with the scenario you need to support.
+
 #### `replay_max_messages` and `replay_window`
 
 Both guard against replay storms — when a client reconnects with an old

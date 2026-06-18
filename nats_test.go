@@ -2256,12 +2256,16 @@ func TestHandler_Cleanup_IsIdempotent(t *testing.T) {
 	}
 }
 
-// TestHandler_Provision_JSContextFailureRunsDeferredCleanup forces the
-// JetStream context-creation failure path inside Provision (around
-// provision.go's `conn.JetStream()` call) by closing the connection
-// between connectNATS and JetStream(). The previously-registered
-// failure-cleanup defer must run and null out the connection field.
-func TestHandler_Provision_JSContextFailureRunsDeferredCleanup(t *testing.T) {
+// TestHandler_Cleanup_AfterConnectionClosed simulates the post-failure
+// state that the Provision-failure defer would leave the handler in:
+// connectNATS succeeded, the underlying connection was then closed
+// (either by a peer reset or by a downstream JetStream API failure),
+// and Cleanup() runs. This asserts the field-nulling contract on
+// Cleanup() under that exact state — it does not drive Provision()
+// end-to-end, but covers the cleanup half of the JS-context failure
+// scenario. End-to-end Provision-failure is covered separately by
+// TestHandler_ProvisionCleanupOnFailure below.
+func TestHandler_Cleanup_AfterConnectionClosed(t *testing.T) {
 	ns := startJetStreamServer(t)
 	defer ns.Shutdown()
 
@@ -2326,7 +2330,11 @@ func TestHandler_ServeHTTP_HeartbeatWriteFailure(t *testing.T) {
 		NatsURL:           ns.ClientURL(),
 		StreamName:        "TEST_EVENTS",
 		TopicPrefix:       "events.",
-		HeartbeatInterval: 1, // minimum — fire heartbeat as quickly as possible
+		// HeartbeatInterval is in SECONDS (see provision.go default 30).
+		// 1 = the minimum supported value; the heartbeat ticker fires
+		// after ~1 s, well before the 4 s ctx deadline below. Don't
+		// reduce this unit without updating the test timeout windows.
+		HeartbeatInterval: 1,
 		ReconnectWait:     2,
 		MaxReconnects:     intPtr(-1),
 		AllowedOrigins:    []string{"*"},

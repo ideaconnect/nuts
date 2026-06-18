@@ -84,9 +84,13 @@ func TestClassifyNATSAsyncError(t *testing.T) {
 		{"slow consumer", nats.ErrSlowConsumer, "slow_consumer"},
 		{"slow consumer wrapped", fmt.Errorf("subscribe: %w", nats.ErrSlowConsumer), "slow_consumer"},
 		{"timeout", nats.ErrTimeout, "timeout"},
+		{"timeout wrapped", fmt.Errorf("op: %w", nats.ErrTimeout), "timeout"},
 		{"connection closed", nats.ErrConnectionClosed, "connection_state"},
+		{"connection closed wrapped", fmt.Errorf("op: %w", nats.ErrConnectionClosed), "connection_state"},
 		{"connection draining", nats.ErrConnectionDraining, "connection_state"},
+		{"connection draining wrapped", fmt.Errorf("op: %w", nats.ErrConnectionDraining), "connection_state"},
 		{"unknown error", errors.New("some unrelated"), "other"},
+		{"unknown wrapped", fmt.Errorf("op: %w", errors.New("some unrelated")), "other"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

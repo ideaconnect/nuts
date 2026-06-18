@@ -23,8 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -34,6 +32,25 @@ import (
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
+
+// varyContains reports whether token (case-insensitive, trimmed) is
+// present as one of the comma-separated entries across the Vary header
+// values. Used to make setCORSHeaders idempotent against both
+// repeated Add("Vary", "Origin") (separate header values) and an
+// upstream that wrote a single combined value like
+// "Origin, Accept-Encoding". Token comparison is the contract the
+// HTTP spec defines for Vary; treating Header().Values() as opaque
+// strings would miss the combined case and emit a duplicate header.
+func varyContains(values []string, token string) bool {
+	for _, v := range values {
+		for _, part := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 const (
 	// maxReplayCursor is reserved as an "invalid" sentinel: a Last-Event-ID
@@ -382,7 +399,8 @@ func (h *Handler) handleControlRequest(w http.ResponseWriter, r *http.Request, n
 	}
 
 	if r.Method == http.MethodOptions {
-		h.setCORSHeaders(w, r)
+		// setCORSHeaders already ran at the top of ServeHTTP before
+		// handleControlRequest was called. No need to call it again.
 		w.WriteHeader(http.StatusNoContent)
 		return true, nil
 	}
@@ -532,28 +550,24 @@ func (h *Handler) newMessageQueue() (chan *nats.Msg, chan string, chan struct{},
 			// blocking the NATS callback indefinitely.
 			return
 		case msgChan <- msg:
-			return
 		default:
+			// Buffer is full: the client is consuming slower than the stream
+			// is producing. Signal the SSE loop to disconnect (the only safe
+			// option — accumulating would OOM, dropping would silently lose).
+			//
+			// An earlier iteration of this code added a runtime.Gosched()
+			// then retried before declaring the client slow, on the theory
+			// that a transient scheduler stall could fill msgChan briefly.
+			// In practice the yield gave the parallel SSE-writer goroutine
+			// time to drain one slot, which made the retry succeed and the
+			// slow-client detection never fire — TestPerformance_SlowReader-
+			// DisconnectsWithoutGoroutineLeak began missing its 3 s budget.
+			// Sensitivity beats leniency here: a slightly-slow client is
+			// still slow, and the slow-client metric+log accurately
+			// reflects what happened. The transient-stall concern is
+			// better addressed by raising ClientBufferSize.
+			h.signalSlowClient(slowClient, msg.Subject, done, dispatchTimeout)
 		}
-		// Transient buffer pressure absorption: at small ClientBufferSize
-		// values, a single goroutine scheduling tick can leave msgChan
-		// briefly full even when the SSE writer is keeping up overall.
-		// Yield once and retry before declaring the client slow. A
-		// genuinely-slow client's buffer stays full across the yield and
-		// still gets disconnected via signalSlowClient.
-		runtime.Gosched()
-		select {
-		case <-done:
-			return
-		case msgChan <- msg:
-			return
-		default:
-		}
-		// Buffer is still full after a scheduler tick: the client is
-		// consuming slower than the stream is producing. Signal the SSE
-		// loop to disconnect (the only safe option — accumulating would
-		// OOM, dropping would silently lose).
-		h.signalSlowClient(slowClient, msg.Subject, done, dispatchTimeout)
 	}
 	return msgChan, slowClient, done, enqueueMessage
 }
@@ -1416,9 +1430,10 @@ func (h *Handler) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Idempotent: serveStream (and any other code path) may also call
-	// setCORSHeaders. Adding Vary only when it's not already present
-	// avoids "Vary: Origin, Origin" on the wire.
-	if !slices.Contains(w.Header().Values("Vary"), "Origin") {
+	// setCORSHeaders. Token-membership check (not element equality) so
+	// that an upstream middleware which already wrote a combined Vary
+	// like "Origin, Accept-Encoding" doesn't make us append a duplicate.
+	if !varyContains(w.Header().Values("Vary"), "Origin") {
 		w.Header().Add("Vary", "Origin")
 	}
 	w.Header().Set("Access-Control-Allow-Origin", origin)
