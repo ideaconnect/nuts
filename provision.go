@@ -201,7 +201,7 @@ func (h *Handler) connectNATS() error {
 			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			h.log().Info("reconnected to NATS", zap.String("url", nc.ConnectedUrl()))
+			h.log().Info("reconnected to NATS", zap.String("url", redactURL(nc.ConnectedUrl())))
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			h.log().Info("NATS connection closed")
