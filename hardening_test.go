@@ -632,8 +632,8 @@ func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
 	if err := h.ServeHTTP(rr2, req2, nil); err != nil {
 		t.Fatalf("second ServeHTTP returned err: %v", err)
 	}
-	if rr2.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected 503, got %d", rr2.Code)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429 (RFC 6585) for max_connections, got %d", rr2.Code)
 	}
 	if got := rr2.Header().Get("Retry-After"); got != "5" {
 		t.Errorf("Retry-After: expected 5, got %q", got)
@@ -1004,6 +1004,36 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 			},
 			wantErr: "subscriber_jwt_cookie",
 		},
+		{
+			name:    "topic_prefix with NATS asterisk wildcard",
+			mutate:  func(h *Handler) { h.TopicPrefix = "*." },
+			wantErr: "topic_prefix",
+		},
+		{
+			name:    "topic_prefix with NATS greater-than wildcard",
+			mutate:  func(h *Handler) { h.TopicPrefix = "events.>" },
+			wantErr: "topic_prefix",
+		},
+		{
+			name:    "topic_prefix with leading dot",
+			mutate:  func(h *Handler) { h.TopicPrefix = ".events." },
+			wantErr: "topic_prefix",
+		},
+		{
+			name:    "topic_prefix with system-subject prefix",
+			mutate:  func(h *Handler) { h.TopicPrefix = "$sys." },
+			wantErr: "topic_prefix",
+		},
+		{
+			name:    "topic_prefix with consecutive dots",
+			mutate:  func(h *Handler) { h.TopicPrefix = "events..a." },
+			wantErr: "topic_prefix",
+		},
+		{
+			name:    "topic_prefix with disallowed byte",
+			mutate:  func(h *Handler) { h.TopicPrefix = "events/" },
+			wantErr: "topic_prefix",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1021,6 +1051,17 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 				t.Fatalf("Validate() error = %q, want to contain %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestValidateTopicPrefix_AcceptsLegitimate documents the positive side
+// of the prefix contract: empty is fine, and the idiomatic trailing-dot
+// forms shown in the README/CONFIGURATION docs must validate cleanly.
+func TestValidateTopicPrefix_AcceptsLegitimate(t *testing.T) {
+	for _, p := range []string{"", "events.", "tenants.a.", "events", "a_b-c.", "ABC.XYZ."} {
+		if err := validateTopicPrefix(p); err != nil {
+			t.Errorf("validateTopicPrefix(%q) rejected legitimate prefix: %v", p, err)
+		}
 	}
 }
 

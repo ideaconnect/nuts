@@ -777,7 +777,19 @@ func TestHandler_NATSReconnect_AllowsSubsequentSSE(t *testing.T) {
 	}
 
 	// The disconnect+reconnect cycle must have bumped the flap-detection
-	// counter so an SRE alert can fire on broker instability.
+	// counter so an SRE alert can fire on broker instability. nats.go
+	// dispatches DisconnectErrHandler/ReconnectHandler on its async callback
+	// goroutine, which is not happens-before with the IsConnected() state
+	// flip observed above — poll until the counters reflect the lifecycle
+	// events instead of reading once and racing the dispatcher.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if counterValue(metricsNATSConnectionEvents, "disconnect") > beforeDisconnect &&
+			counterValue(metricsNATSConnectionEvents, "reconnect") > beforeReconnect {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	if got := counterValue(metricsNATSConnectionEvents, "disconnect"); got <= beforeDisconnect {
 		t.Errorf("nuts_nats_connection_events_total{event=disconnect} did not increment: %v -> %v", beforeDisconnect, got)
 	}

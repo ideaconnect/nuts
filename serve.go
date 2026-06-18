@@ -349,7 +349,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				)...,
 			)
 			w.Header().Set("Retry-After", "5")
-			http.Error(w, "Too many concurrent connections", http.StatusServiceUnavailable)
+			// 429 (RFC 6585) is the precise status for a per-client/server
+			// concurrency cap: the server is healthy, the caller should back
+			// off. Using 503 here would collide with the genuine-503 paths
+			// (jetstream_unavailable / subscription_failed / readiness probe
+			// degraded) and trip circuit breakers into opening the circuit
+			// when the right reaction is to keep retrying with Retry-After.
+			http.Error(w, "Too many concurrent connections", http.StatusTooManyRequests)
 			return nil
 		}
 		defer h.releaseConnSlot()
@@ -1487,20 +1493,34 @@ func (h *Handler) serveReadinessCheck(w http.ResponseWriter) error {
 	js := h.js
 	h.mu.RUnlock()
 
+	// recordFailure is a one-shot guard: a single 503 response must increment
+	// exactly one cause label (the first matched), so that the documented
+	// 1:1 contract between probe-failure count and sum-over-cause series
+	// holds. The body-field population below stays as multiple independent
+	// `if` blocks so a missing-runtime probe still reports both
+	// `nats=disconnected` and `stream=unavailable` in the JSON body.
+	failureRecorded := false
+	recordFailure := func(cause string, fields ...zap.Field) {
+		if failureRecorded {
+			return
+		}
+		failureRecorded = true
+		metricsReadinessFailures.WithLabelValues(cause).Inc()
+		h.log().Warn("readiness probe degraded", append([]zap.Field{zap.String("cause", cause)}, fields...)...)
+	}
+
 	if conn == nil || !conn.IsConnected() {
 		resp.Status = "degraded"
 		resp.NATS = "disconnected"
 		statusCode = http.StatusServiceUnavailable
-		metricsReadinessFailures.WithLabelValues("nats_disconnected").Inc()
-		h.log().Warn("readiness probe degraded", zap.String("cause", "nats_disconnected"))
+		recordFailure("nats_disconnected")
 	}
 
 	if js == nil {
 		resp.Status = "degraded"
 		resp.Stream = "unavailable"
 		statusCode = http.StatusServiceUnavailable
-		metricsReadinessFailures.WithLabelValues("jetstream_missing").Inc()
-		h.log().Warn("readiness probe degraded", zap.String("cause", "jetstream_missing"))
+		recordFailure("jetstream_missing")
 	} else {
 		// Bound the JetStream call so a partially-degraded server can't stall
 		// the probe past the orchestrator's readiness budget. See
@@ -1510,11 +1530,7 @@ func (h *Handler) serveReadinessCheck(w http.ResponseWriter) error {
 			resp.Status = "degraded"
 			resp.Stream = "unavailable"
 			statusCode = http.StatusServiceUnavailable
-			metricsReadinessFailures.WithLabelValues("stream_info_error").Inc()
-			h.log().Warn("readiness probe degraded",
-				zap.String("cause", "stream_info_error"),
-				zap.Error(err),
-			)
+			recordFailure("stream_info_error", zap.Error(err))
 		}
 	}
 

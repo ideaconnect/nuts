@@ -90,7 +90,7 @@ var (
 	metricsConnectionsRejected = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "connections_rejected_total",
-		Help:      "Total number of SSE connections rejected before streaming started.",
+		Help:      "Total number of SSE connections rejected before streaming started, labelled by reason (max_connections, auth_missing_token, auth_invalid_token, auth_topic_forbidden).",
 	}, []string{"reason"})
 
 	// nuts_replay_cap_reached_total counts replaying SSE connections closed

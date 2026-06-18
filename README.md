@@ -30,7 +30,7 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 - **[NATS Authentication](#with-nats-authentication)**: Credentials file, token, or user/password auth for the NUTS-to-NATS connection
 - **NATS TLS / mTLS**: Optional `nats_tls_ca`, `nats_tls_cert`, `nats_tls_key` directives for an encrypted and mutually authenticated NATS connection
 - **[Subscriber JWT Authorization](#subscriber-authentication-and-topic-authorization)**: Optional HMAC-signed JWT auth with per-topic `subscribe` claims, accepted from `Authorization: Bearer` or a configurable cookie
-- **[Connection Caps](#max_connections)**: `max_connections` bounds concurrent SSE streams; rejected clients receive `503` with `Retry-After`
+- **[Connection Caps](#max_connections)**: `max_connections` bounds concurrent SSE streams; rejected clients receive `429 Too Many Requests` with `Retry-After`
 - **[Per-frame Write Bounds](#dispatch_timeout-and-write_timeout)**: Optional `dispatch_timeout` and `write_timeout` keep slow downstream connections from tying up a handler indefinitely
 - **Topic Prefixing**: Optional prefix for all NATS subscriptions
 - **[Prometheus Metrics](#prometheus-metrics)**: Built-in `nuts_*` counters and gauges (active connections, messages delivered, slow-client disconnects, replay stats)
@@ -416,9 +416,13 @@ For example, setting `max_event_size 1000` means that if a NATS message produces
 #### `max_connections`
 
 Caps the number of concurrent SSE streams per NUTS instance. When the cap
-is reached, new clients receive `503 Service Unavailable` with
+is reached, new clients receive `429 Too Many Requests` (RFC 6585) with
 `Retry-After: 5` and the `nuts_connections_rejected_total{reason="max_connections"}`
-counter is incremented. Default `0` disables the cap.
+counter is incremented. Default `0` disables the cap. The `429` status
+distinguishes a client-side concurrency cap from genuine `503` paths
+(NATS unavailable / subscription failed / readiness probe degraded), so
+client-side circuit breakers can keep retrying rather than opening the
+circuit on a healthy backend.
 
 **Sizing memory.** The buffered-message footprint is bounded by
 `max_connections × client_buffer_size × max_event_size`. With defaults
@@ -744,7 +748,7 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
 | `nuts_replay_fallbacks_total` | Counter | Replay requests that used fallback replay (requested sequence was purged or older than `replay_window`) |
 | `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
-| `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` labels the cause (e.g. `max_connections`). |
+| `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` is one of `max_connections`, `auth_missing_token`, `auth_invalid_token`, `auth_topic_forbidden`. |
 | `nuts_replay_cap_reached_total` | Counter | Replaying SSE connections closed after `replay_max_messages` was reached |
 | `nuts_dispatch_timeout_total` | Counter | NATS callbacks that timed out signalling a slow SSE client (set when `dispatch_timeout` fires before the SSE loop observes the signal) |
 | `nuts_nats_async_errors_total{kind}` | Counter (labeled) | Asynchronous NATS client errors observed by the registered ErrorHandler. `kind` is one of `slow_consumer`, `timeout`, `connection_state`, `other`. `slow_consumer` indicates the nats.go per-subscription buffer overflowed and messages were silently dropped. |

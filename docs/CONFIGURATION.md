@@ -36,7 +36,7 @@ one mode and must be configured together.
 
 | Caddyfile directive | JSON field | Default | Valid values | Notes |
 | --- | --- | --- | --- | --- |
-| `topic_prefix <prefix>` | `topic_prefix` | Empty | NATS subject prefix | Prepended to every requested topic. Include the trailing `.` when needed, for example `events.`. |
+| `topic_prefix <prefix>` | `topic_prefix` | Empty | NATS subject prefix | Prepended to every requested topic. Include the trailing `.` when needed, for example `events.`. Validated at config load: must use the topic alphabet (`[A-Za-z0-9._-]`), may not contain NATS wildcards (`*`, `>`), may not start with `.` or `$`, may not contain consecutive dots, and is capped at 256 bytes. A wildcard slip would silently broaden every client's subscription. |
 | `allowed_origins <origins...>` | `allowed_origins` | `*` | One or more origins or `*` | Explicit origins allow credentialed CORS. Wildcard allows anonymous browser reads but does not advertise credentials. |
 | `allowed_headers <headers...>` | `allowed_headers` | `Cache-Control Last-Event-ID` | One or more request header names | Used for CORS preflight responses. Add custom headers only if a non-native SSE client sends them. |
 | `allowed_methods <methods...>` | `allowed_methods` | `GET OPTIONS` | Only `GET` and `OPTIONS` | Other methods are rejected during validation because NUTS only serves SSE and preflight requests. |

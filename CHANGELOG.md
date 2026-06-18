@@ -114,6 +114,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   topic-shorthand collision risk for topics ending in the configured
   probe paths. Operators with conflicting topic names should configure
   unique `health_path`, `live_path`, `ready_path`.
+- `nuts_readiness_failures_total{cause}` now keeps its documented 1:1
+  contract with /readyz 503 responses. Previously the three cause
+  branches were independent `if` blocks, so a missing-runtime probe
+  bumped two labels and a stale-`js` + disconnected-conn case could
+  bump three — operators summing `sum(rate(...))` saw 2–3× the actual
+  probe-failure rate during outages. A one-shot guard now records only
+  the first matched cause per response. Response body still reports
+  every observed degradation (`nats=disconnected`, `stream=unavailable`).
+- `topic_prefix` is validated at config load. Previously `Validate()`
+  inspected every other field but ignored TopicPrefix, so a one-character
+  Caddyfile typo (e.g. `topic_prefix *.`) composed with the per-request
+  topic to silently subscribe every client to a wildcard namespace
+  (cross-tenant fan-out). The new check rejects NATS wildcards (`*`,
+  `>`), leading `.`, system-subject prefix (`$`), consecutive dots,
+  disallowed bytes, and lengths over 256.
 - `nuts_subscription_errors_total` now also increments on planning-time
   topic rejection (multi-topic request where at least one requested
   full subject is not allowed by the stream's configured subjects).
@@ -131,6 +146,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dashboards keyed on `disconnect_reason` missed it. The
   `metricsConnectionsRejected{reason="max_connections"}` counter is
   unchanged.
+- **`max_connections` rejection status code is now `429` (RFC 6585) instead
+  of `503`.** A client-side concurrency cap is distinct from a genuine
+  backend outage; using `503` collided with the readiness-probe-degraded
+  and subscription-failure paths and tripped client-side circuit
+  breakers into opening the circuit when the right reaction is to keep
+  retrying with `Retry-After`. The `Retry-After: 5` header and the
+  `nuts_connections_rejected_total{reason="max_connections"}` counter
+  are unchanged. Operators who scripted retry on `503` should add `429`
+  to their accepted retryable-status set.
 
 ### Operator notes
 - CORS headers are now emitted on every response with an allow-listed

@@ -348,6 +348,44 @@ func (h *Handler) validateRequiredFields() error {
 	return nil
 }
 
+// validateTopicPrefix rejects topic_prefix values that would silently
+// compose with a request topic to produce a NATS wildcard subscription or
+// system-subject — the cross-tenant fan-out class. isValidTopic only sees
+// the unprefixed request token, so without this guard a one-character
+// Caddyfile typo (`topic_prefix *.`) would subscribe every client to
+// every first-token namespace under the configured stream.
+//
+// Allowed: empty (no prefix), or a string composed of isAllowedTopicByte
+// characters with no `*`/`>`, no `..`, no leading `.` or `$`, and at
+// most maxSubjectLen bytes. A trailing `.` is idiomatic per docs
+// (`events.`, `tenants.a.`) and remains allowed.
+func validateTopicPrefix(prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	if len(prefix) > maxSubjectLen {
+		return fmt.Errorf("topic_prefix exceeds %d bytes", maxSubjectLen)
+	}
+	if strings.HasPrefix(prefix, "$") {
+		return fmt.Errorf("topic_prefix may not address NATS system subjects ($-prefix)")
+	}
+	if strings.HasPrefix(prefix, ".") {
+		return fmt.Errorf("topic_prefix may not start with '.'")
+	}
+	if strings.Contains(prefix, "..") {
+		return fmt.Errorf("topic_prefix may not contain consecutive dots")
+	}
+	if strings.ContainsAny(prefix, "*>") {
+		return fmt.Errorf("topic_prefix may not contain NATS wildcards ('*' or '>') — they would compose with the request topic and silently broaden the subscription")
+	}
+	for i := 0; i < len(prefix); i++ {
+		if !isAllowedTopicByte(prefix[i]) {
+			return fmt.Errorf("topic_prefix contains disallowed byte at position %d: 0x%02x", i, prefix[i])
+		}
+	}
+	return nil
+}
+
 // validateConfigValues checks semantic constraints that must be identical
 // whether config was supplied through a Caddyfile or Caddy's JSON API.
 func (h *Handler) validateConfigValues() error {
@@ -377,6 +415,9 @@ func (h *Handler) validateConfigValues() error {
 	}
 	if h.SubscriberJWTCookie != "" && !isValidCookieName(h.SubscriberJWTCookie) {
 		return fmt.Errorf("subscriber_jwt_cookie contains invalid characters")
+	}
+	if err := validateTopicPrefix(h.TopicPrefix); err != nil {
+		return err
 	}
 	for _, method := range h.AllowedMethods {
 		switch strings.ToUpper(method) {

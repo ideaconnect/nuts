@@ -131,7 +131,11 @@ type Handler struct {
 	ClientBufferSize int `json:"client_buffer_size,omitempty"`
 
 	// DispatchTimeout caps how long the NATS callback waits to signal a blocked
-	// SSE client after its queue is full. Value is in seconds; 0 disables it.
+	// SSE client after its queue is full. Value is in seconds; 0 leaves the
+	// wait unbounded (the callback parks until the SSE loop observes the
+	// slow-client signal or the connection tears down). Set a positive value
+	// to bound callback latency; on expiry the slow-client signal is dropped
+	// and nuts_dispatch_timeout_total is incremented.
 	DispatchTimeout int `json:"dispatch_timeout,omitempty"`
 
 	// WriteTimeout caps each SSE frame write/flush. Value is in seconds; 0

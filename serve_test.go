@@ -231,8 +231,15 @@ func TestHandler_ServeReadinessCheckReportsMissingRuntime(t *testing.T) {
 	h := &Handler{logger: zap.NewNop()}
 	rr := httptest.NewRecorder()
 
+	// Pass-6 contract: a single 503 response must bump exactly one cause
+	// label (the first matched). The body still reports every degradation
+	// it observed (nats=disconnected AND stream=unavailable), but the
+	// metric must keep its 1:1 with probe-failure count so
+	// sum(rate(nuts_readiness_failures_total[...])) tracks the real
+	// /readyz error rate.
 	beforeNats := counterValue(metricsReadinessFailures, "nats_disconnected")
 	beforeJS := counterValue(metricsReadinessFailures, "jetstream_missing")
+	beforeStream := counterValue(metricsReadinessFailures, "stream_info_error")
 
 	if err := h.serveReadinessCheck(rr); err != nil {
 		t.Fatalf("serveReadinessCheck: %v", err)
@@ -245,11 +252,17 @@ func TestHandler_ServeReadinessCheckReportsMissingRuntime(t *testing.T) {
 			t.Fatalf("readiness body missing %s: %s", needle, rr.Body.String())
 		}
 	}
-	if got := counterValue(metricsReadinessFailures, "nats_disconnected"); got <= beforeNats {
-		t.Errorf("nuts_readiness_failures_total{cause=nats_disconnected} did not increment: %v -> %v", beforeNats, got)
+	// First matched cause (nats_disconnected) increments by exactly 1.
+	if got := counterValue(metricsReadinessFailures, "nats_disconnected"); got != beforeNats+1 {
+		t.Errorf("nuts_readiness_failures_total{cause=nats_disconnected} = %v, want %v (exactly one increment)", got, beforeNats+1)
 	}
-	if got := counterValue(metricsReadinessFailures, "jetstream_missing"); got <= beforeJS {
-		t.Errorf("nuts_readiness_failures_total{cause=jetstream_missing} did not increment: %v -> %v", beforeJS, got)
+	// Subsequent causes must NOT increment for the same 503 — the one-shot
+	// guard prevents the documented 1:1 contract from being violated.
+	if got := counterValue(metricsReadinessFailures, "jetstream_missing"); got != beforeJS {
+		t.Errorf("nuts_readiness_failures_total{cause=jetstream_missing} = %v, want %v (must not double-count when nats_disconnected already fired)", got, beforeJS)
+	}
+	if got := counterValue(metricsReadinessFailures, "stream_info_error"); got != beforeStream {
+		t.Errorf("nuts_readiness_failures_total{cause=stream_info_error} = %v, want %v", got, beforeStream)
 	}
 }
 

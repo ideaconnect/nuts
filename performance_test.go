@@ -408,10 +408,15 @@ func BenchmarkEnqueueMessageSteadyState(b *testing.B) {
 	}
 }
 
-// BenchmarkEnqueueMessageBackpressure measures the cost path WHEN the
-// buffer is saturated and signalSlowClient is invoked. This is the
-// 'sad' path — if it allocates aggressively under back-pressure it
-// would worsen the very situation we're trying to detect.
+// BenchmarkEnqueueMessageBackpressure measures the steady-state cost of
+// the slow-client signal handoff including the receiver goroutine. With
+// ClientBufferSize=1 and DispatchTimeout=0, every iteration after the
+// first hits signalSlowClient's unbounded branch (serve.go:586-591) and
+// sends on slowClient to the drainer below — so this benchmark tracks
+// the scheduler+channel cost path, not signalSlowClient's intrinsic
+// work in isolation. ReportAllocs() catches only allocations escaping
+// from signalSlowClient itself (currently zero); the channel handoff
+// dominates the ns/op number.
 func BenchmarkEnqueueMessageBackpressure(b *testing.B) {
 	h := &Handler{ClientBufferSize: 1, DispatchTimeout: 0, logger: nil}
 	msgChan, slowClient, done, enqueueMessage := h.newMessageQueue()
