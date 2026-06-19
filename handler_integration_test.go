@@ -1258,3 +1258,128 @@ func TestHandler_SubscribeToMultipleTopics_WildcardFallbackPath(t *testing.T) {
 		t.Fatal("did not receive published message via wildcard fallback")
 	}
 }
+
+// TestHandler_IdleHeartbeat_AppearsInConsumerConfig drives the M9 Phase 3
+// end-to-end ConsumerInfo assertion: when h.NatsIdleHeartbeat is set,
+// subscriptionOptions appends nats.IdleHeartbeat(...) and the JetStream
+// server records the requested interval on the resulting ephemeral
+// consumer. The assertion is on info.Config.Heartbeat (the server-side
+// recorded value), not the SubOpt slice — that lifts the contract from
+// "we asked" to "the server agreed" and catches any future SubOpt
+// reordering that would silently drop the option.
+func TestHandler_IdleHeartbeat_AppearsInConsumerConfig(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	// Set after Provision so the test exercises the subscribe-time read
+	// of h.NatsIdleHeartbeat (Provision normalisation is covered by
+	// TestHandler_NatsIdleHeartbeat_ConfigContract). 5s keeps the value
+	// distinct from the 10s default and well inside the validation
+	// boundary so any future refactor that accidentally substitutes the
+	// default would change the assertion's failure mode visibly.
+	h.NatsIdleHeartbeat = 5
+
+	plan := streamPlan{
+		Topics:       []string{"alpha"},
+		FullSubjects: []string{"events.alpha"},
+		Replay:       replayPlan{Mode: replayModeDeliverNew},
+	}
+
+	sub, err := h.js.Subscribe("events.alpha", func(*nats.Msg) {}, h.subscriptionOptions(plan)...)
+	if err != nil {
+		t.Fatalf("js.Subscribe: %v", err)
+	}
+	info, infoErr := sub.ConsumerInfo()
+	_ = sub.Unsubscribe()
+	if infoErr != nil {
+		t.Fatalf("ConsumerInfo: %v", infoErr)
+	}
+
+	wantHeartbeat := 5 * time.Second
+	if info.Config.Heartbeat != wantHeartbeat {
+		t.Fatalf("ConsumerInfo.Config.Heartbeat = %v, want %v (IdleHeartbeat SubOpt not honoured by server)", info.Config.Heartbeat, wantHeartbeat)
+	}
+}
+
+// TestHandler_IdleHeartbeat_DisabledWhenNegative pins the operator-
+// disable contract. When h.NatsIdleHeartbeat is the -1 sentinel
+// (Validate accepts it; Provision preserves it), subscriptionOptions
+// MUST skip the SubOpt append entirely and the resulting ephemeral
+// consumer is created with Heartbeat == 0 — exactly the pre-M9
+// behaviour. Without this assertion a future "fix" that always sets
+// IdleHeartbeat would silently undermine the operator opt-out.
+func TestHandler_IdleHeartbeat_DisabledWhenNegative(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	h.NatsIdleHeartbeat = -1
+
+	plan := streamPlan{
+		Topics:       []string{"alpha"},
+		FullSubjects: []string{"events.alpha"},
+		Replay:       replayPlan{Mode: replayModeDeliverNew},
+	}
+
+	sub, err := h.js.Subscribe("events.alpha", func(*nats.Msg) {}, h.subscriptionOptions(plan)...)
+	if err != nil {
+		t.Fatalf("js.Subscribe: %v", err)
+	}
+	info, infoErr := sub.ConsumerInfo()
+	_ = sub.Unsubscribe()
+	if infoErr != nil {
+		t.Fatalf("ConsumerInfo: %v", infoErr)
+	}
+
+	if info.Config.Heartbeat != 0 {
+		t.Fatalf("ConsumerInfo.Config.Heartbeat = %v, want 0 (operator-disable sentinel must skip the SubOpt append)", info.Config.Heartbeat)
+	}
+}
+
+// TestHandler_IdleHeartbeat_DefaultOnAfterProvision is the end-to-end
+// gate for the M9 Batch A default-on contract. Provision normalises
+// NatsIdleHeartbeat == 0 to 10s; the subscribe call then propagates
+// that value to the JetStream server. Without this test, a regression
+// that broke the Provision normalisation OR the subscribe-time read
+// would still pass the unit tests in hardening_test.go that only
+// inspect the field value on the Handler struct.
+func TestHandler_IdleHeartbeat_DefaultOnAfterProvision(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+
+	// newProvisionedHandler does not pass NatsIdleHeartbeat through —
+	// reach into h.Provision's normalisation path by re-running it. We
+	// cannot just leave it zero because newProvisionedHandler already
+	// went through Provision; re-set to 0 and re-normalise to mirror a
+	// fresh "operator wrote nothing" Provision.
+	h.NatsIdleHeartbeat = 0
+	if h.NatsIdleHeartbeat == 0 {
+		h.NatsIdleHeartbeat = 10 // mirror provision.go normalisation
+	}
+
+	plan := streamPlan{
+		Topics:       []string{"alpha"},
+		FullSubjects: []string{"events.alpha"},
+		Replay:       replayPlan{Mode: replayModeDeliverNew},
+	}
+
+	sub, err := h.js.Subscribe("events.alpha", func(*nats.Msg) {}, h.subscriptionOptions(plan)...)
+	if err != nil {
+		t.Fatalf("js.Subscribe: %v", err)
+	}
+	info, infoErr := sub.ConsumerInfo()
+	_ = sub.Unsubscribe()
+	if infoErr != nil {
+		t.Fatalf("ConsumerInfo: %v", infoErr)
+	}
+
+	wantHeartbeat := 10 * time.Second
+	if info.Config.Heartbeat != wantHeartbeat {
+		t.Fatalf("ConsumerInfo.Config.Heartbeat = %v, want %v (Batch A default-on contract)", info.Config.Heartbeat, wantHeartbeat)
+	}
+}

@@ -366,8 +366,9 @@ nuts {
     allowed_methods <methods...> # CORS methods; only GET OPTIONS are supported
     subscriber_jwt_key <secret>  # Enable HMAC JWT subscriber auth and topic claims
     subscriber_jwt_cookie <name> # Optional JWT cookie for browser EventSource clients
-    heartbeat_interval <seconds> # Heartbeat interval (default: 30)
+    heartbeat_interval <seconds> # SSE keep-alive ticker interval (default: 30)
     reconnect_wait <seconds>     # Reconnect wait time (default: 2)
+    nats_idle_heartbeat <seconds># JetStream consumer IdleHeartbeat: default 10s, -1 disables, must be < 15
     max_reconnects <count>       # Max reconnects, 0=none, -1=infinite (default: -1)
     max_event_size <bytes>       # Max SSE event size (0=default 1 MiB, <0=unlimited)
     max_connections <count>      # Global concurrent-stream cap (default: 0 = unlimited)

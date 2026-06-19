@@ -8,6 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **M9 Batch A — JetStream consumer-invalidation detection.** Closes
+  the first half of a two-batch milestone (#9) addressing a silent-
+  failure mode where a server-side ephemeral consumer reaped by
+  InactiveThreshold during a network blip, or one lost across a
+  leafnode route failover, would stay attached to its SSE handler
+  until the client reconnected for unrelated reasons. The SSE-layer
+  heartbeat ticker only proves the HTTP socket is open; it cannot see
+  a wedged JetStream push path. Batch A surfaces the failure as
+  metrics + structured logs; Batch B (still open) will terminate the
+  affected SSE handler with `disconnect_reason=consumer_invalidated`
+  so the client reconnects with `Last-Event-ID` against a fresh
+  consumer.
+  - New `nats_idle_heartbeat <seconds>` Caddyfile / JSON knob (default
+    10s, default-on). Sets `nats.IdleHeartbeat(...)` on every
+    ephemeral JetStream push consumer so nats.go can detect a wedged
+    push path even on a quiet stream. `-1` is the explicit operator-
+    disable sentinel; `0` is normalised to 10s by Provision. Validate
+    enforces the upper bound `< InactiveThreshold/2` (currently 15s)
+    so two missed heartbeats are detectable before the server reaps.
+  - New `consumer_sequence_mismatch` label value on
+    `nuts_nats_async_errors_total{kind}`. nats.go raises
+    `*nats.ErrConsumerSequenceMismatch` on a missed heartbeat or a
+    delivery-sequence gap; the classifier now buckets it as a
+    first-class label (was previously the generic `"other"` bucket).
+    Uses `errors.As`, not `errors.Is`, because the nats.go type is a
+    struct carrying recovery sequence numbers — a dedicated
+    regression test pins the As-vs-Is choice.
+  - New `nuts_consumer_invalidated_total{reason}` CounterVec
+    registered (declaration-only in Batch A; Batch B populates it).
+    Reason labels: `heartbeat_missed`, `slow_consumer`. Pre-
+    registration so /metrics exposes a zero-counted series before
+    dashboards reference it.
+  - New `docs/OPERATIONS.md` incident playbook section "Consumer
+    invalidated mid-stream" documenting the Batch A signal-only
+    contract and the Batch B disconnect contract.
 - README `Compatibility` table (Go, Caddy, NATS minimum tested) and a
   `Versioning policy` section documenting semver discipline, deprecation
   and removal cadence, and the `:latest` Docker-tag warning.

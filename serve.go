@@ -781,11 +781,30 @@ func (h *Handler) replayWindowStart() time.Time {
 // explicit InactiveThreshold so server-side consumer state is reaped
 // promptly after a client disconnect (default 30s; see
 // defaultConsumerInactiveThreshold for rationale).
+//
+// When h.NatsIdleHeartbeat > 0 (the M9 Batch A default is 10s), also
+// requests server-side IdleHeartbeat. Without it, an ephemeral
+// consumer reaped by InactiveThreshold during a network blip, or one
+// lost during a leafnode route failover, stays attached to the SSE
+// handler silently — the SSE-layer heartbeat ticker (serve.go's
+// HeartbeatInterval) only proves the HTTP socket is open, not that
+// the JetStream push path is live. A negative value is the operator-
+// disable sentinel and skips the SubOpt append entirely.
+//
+// Batch A surfaces a missed heartbeat as
+// nuts_nats_async_errors_total{kind="consumer_sequence_mismatch"};
+// Batch B (#54) will terminate the affected SSE handler with
+// disconnect_reason=consumer_invalidated. Validate enforces
+// NatsIdleHeartbeat < defaultConsumerInactiveThreshold/2 so two
+// missed heartbeats are detectable before the server reaps.
 func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
 	opts := []nats.SubOpt{
 		nats.BindStream(h.StreamName),
 		nats.AckNone(),
 		nats.InactiveThreshold(defaultConsumerInactiveThreshold),
+	}
+	if h.NatsIdleHeartbeat > 0 {
+		opts = append(opts, nats.IdleHeartbeat(time.Duration(h.NatsIdleHeartbeat)*time.Second))
 	}
 	switch plan.Replay.Mode {
 	case replayModeStartSequence:
