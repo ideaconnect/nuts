@@ -566,6 +566,11 @@ permissive than NATS itself, where a bare `*` matches only single-token
 subjects. Missing, expired, badly signed, or unauthorized tokens are rejected
 before subscription.
 The `exp` and `nbf` time claims are optional; when present they are enforced.
+NUTS requires integer epoch seconds for `exp` and `nbf` — RFC 7519 §2 permits
+non-integer NumericDate, but a fractional value (for example `1777392000.5`)
+is rejected as malformed rather than truncated. All major JWT issuers emit
+integer epoch seconds, so this is documented for completeness rather than as
+a real interop hazard.
 For public or browser-facing routes, include `exp` and keep tokens compact:
 NUTS rejects compact JWTs over 8 KiB, decoded JWT segments over 6 KiB, and
 `subscribe` claims with more than 128 filters.
@@ -953,6 +958,20 @@ Malformed values are handled asymmetrically on purpose:
   reconnect with whatever it last received; returning 400 would make
   it loop forever on a single bad value. The Warn log carries the
   offending value so an operator can diagnose the producer.
+
+The **cursor cap** is `2^64 − 2` (the highest accepted value). NUTS
+adds `1` to the parsed cursor to compute the JetStream `StartSequence`,
+so `2^64 − 1` is reserved as a "no sequence" sentinel and the value one
+below it is rejected to avoid wrapping into that sentinel. In practice
+no realistic stream is anywhere near this threshold, but a numerically
+explicit cap matters for fuzz tests and for clients that synthesize
+cursors. Inputs longer than 20 ASCII digits (`uint64` max is 20
+digits) are rejected on length before any `strconv.ParseUint` allocation
+— surfaced as `"Invalid last-id value: too long"` (400) for `?last-id=`
+and as the `"ignoring oversized Last-Event-ID header"` Warn for the
+header. The 20-digit precheck is a DoS guard against multi-megabyte
+numeric strings, not a semantic class distinct from "above the cap"; a
+value with 21+ digits is by definition outside the `uint64` range.
 
 ### Message Format
 

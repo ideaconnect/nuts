@@ -80,8 +80,10 @@ topic" meaning, which is more permissive than NATS itself (where bare `*`
 only matches single-token subjects). Missing, expired, badly signed, or
 unauthorized tokens are rejected before an ephemeral JetStream consumer is
 created. The `exp` and `nbf` time claims are optional; when present they are
-enforced. For public or browser-facing routes, issue short-lived tokens with
-`exp`. NUTS rejects compact JWTs over 8 KiB, decoded JWT segments over 6 KiB,
+enforced. Both must be integer epoch seconds — RFC 7519 §2 permits non-integer
+NumericDate, but fractional values are rejected as malformed rather than
+truncated; all major JWT issuers emit integer epoch seconds. For public or
+browser-facing routes, issue short-lived tokens with `exp`. NUTS rejects compact JWTs over 8 KiB, decoded JWT segments over 6 KiB,
 and `subscribe` claims with more than 128 filters.
 
 ### Rate limits and replay bounds
