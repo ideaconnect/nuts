@@ -306,6 +306,11 @@ jobs:
       - name: Install Cosign
         if: startsWith(github.ref, 'refs/tags/v')
         uses: sigstore/cosign-installer@v3
+        with:
+          # Match the pin in release.yml so both signing surfaces
+          # (docker image here, checksums.txt in release.yml) use the
+          # same cosign binary version.
+          cosign-release: 'v2.4.1'
 
       - name: Sign release image
         if: startsWith(github.ref, 'refs/tags/v')
