@@ -198,7 +198,7 @@ jobs:
           # cosign v2.4.1). Bump in lockstep with release.yml so PR
           # snapshot and tagged release exercise the same goreleaser
           # surface.
-          version: 'v2.6.3'
+          version: 'v2.16.0'
           args: check
 
       - name: Run GoReleaser snapshot dry run
@@ -206,7 +206,7 @@ jobs:
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: 'v2.6.3'
+          version: 'v2.16.0'
           # --skip=sign on the PR snapshot: the snapshot job has no
           # `id-token: write` permission, so cosign keyless via the
           # .goreleaser.yml `signs:` block would fail with "no OIDC
