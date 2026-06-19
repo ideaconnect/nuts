@@ -123,6 +123,28 @@ var (
 		Help:      "Total number of asynchronous NATS client errors observed by the registered ErrorHandler.",
 	}, []string{"kind"})
 
+	// nuts_consumer_invalidated_total counts JetStream push consumers that
+	// were invalidated mid-stream — either because nats.go detected a
+	// missed IdleHeartbeat (the server reaped or lost track of the
+	// ephemeral consumer, surfaced as *nats.ErrConsumerSequenceMismatch)
+	// or because nats.go's per-subscription internal buffer overflowed
+	// upstream of NUTS' bounded msgChan (nats.ErrSlowConsumer).
+	//
+	// Declared in M9 Batch A (#M9-1). Populated in M9 Batch B (#M9-5)
+	// from the serveStream consumer_invalidated termination arm — Batch
+	// A registers the metric so the series exists in /metrics with zero
+	// counts and dashboards do not break when Batch B starts incrementing.
+	//
+	// Label set: heartbeat_missed (from ErrConsumerSequenceMismatch),
+	// slow_consumer (from ErrSlowConsumer at the nats.go layer, distinct
+	// from NUTS' own nuts_slow_client_disconnects_total which fires when
+	// the SSE writer falls behind the bounded msgChan).
+	metricsConsumerInvalidated = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "consumer_invalidated_total",
+		Help:      "Total number of JetStream push consumers invalidated mid-stream, triggering SSE client disconnect with reason=consumer_invalidated. Labelled by invalidation cause.",
+	}, []string{"reason"})
+
 	// nuts_write_disconnects_total counts SSE streams that ended because a
 	// write to the response writer failed (typically the deadline imposed
 	// by write_timeout fired). Labelled by site so operators can tell

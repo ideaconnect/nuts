@@ -160,6 +160,43 @@ filters when correlating logs with alerts.
    between NUTS and SSE clients — tune the producer-side rate or scale
    NUTS horizontally.
 
+## Incident: Consumer invalidated mid-stream
+
+**Signals**
+
+- `nuts_nats_async_errors_total{kind="consumer_sequence_mismatch"}` ticks
+  up. nats.go raises `*nats.ErrConsumerSequenceMismatch` when it detects
+  a missed server-side `IdleHeartbeat` (the JetStream server reaped or
+  lost track of the ephemeral consumer) or an actual delivery-sequence
+  gap that breaks ordered replay.
+- After M9 Batch B ships, `nuts_consumer_invalidated_total{reason="heartbeat_missed"}`
+  also ticks once per invalidation and the affected SSE handler emits
+  `disconnect_reason="consumer_invalidated"`. During the Batch A window,
+  only the async-errors counter increments — the affected SSE handler
+  stays attached to its zombie consumer until the client reconnects for
+  other reasons.
+
+**Actions**
+
+1. Check the NATS server's effective `InactiveThreshold` against NUTS'
+   `nats_idle_heartbeat` setting. Two missed heartbeats must be
+   detectable before the server reaps; NUTS' `Validate` enforces
+   `nats_idle_heartbeat < InactiveThreshold/2` against its in-process
+   constant (`defaultConsumerInactiveThreshold = 30s`), but a server-side
+   override or a leafnode/cluster configuration can change the effective
+   reap interval. If the server reaps faster than NUTS detects, the
+   heartbeat path is silently undermined.
+2. Inspect NATS server logs for ephemeral consumer creation/deletion
+   churn. Leafnode route flaps and replica failovers are common upstream
+   causes.
+3. After Batch B is deployed, confirm clients reconnect with
+   `Last-Event-ID` and resume cleanly; the disconnect is by design and
+   the client-side retry is the recovery contract.
+4. If the counter ticks during periods of healthy delivery, a real
+   delivery gap (publisher-side issue, stream replication divergence)
+   may be present — cross-reference `nuts_replay_fallbacks_total` and
+   the NATS server's `nats stream report`.
+
 ## Incident: Stalled writes
 
 **Signals**

@@ -43,11 +43,27 @@ func (h *Handler) log() *zap.Logger {
 // matters, and operators triage on kind, not the underlying error string.
 //
 // Label set (must stay in sync with the README and OPERATIONS.md
-// documented values): slow_consumer, timeout, connection_state, other.
-// The caller (provision.go's nats.ErrorHandler) filters nil errors
-// before calling, so this function does not return an "unknown" or
-// similar label that would drift outside the documented set.
+// documented values): slow_consumer, timeout, connection_state,
+// consumer_sequence_mismatch, other. The caller (provision.go's
+// nats.ErrorHandler) filters nil errors before calling, so this function
+// does not return an "unknown" or similar label that would drift outside
+// the documented set.
+//
+// consumer_sequence_mismatch fires when nats.go detects a gap in the
+// JetStream push stream — either a missed IdleHeartbeat (the server
+// reaped or lost track of the ephemeral consumer) or an actual delivery
+// gap that interrupts ordered replay. M9 Batch B will use this label as
+// the trigger for terminating the affected SSE handler so the client
+// reconnects with Last-Event-ID against a fresh consumer; today (Batch
+// A) it is observability-only.
+//
+// The check uses errors.As because *nats.ErrConsumerSequenceMismatch is
+// a typed error carrying recovery sequence numbers (mirrors the
+// pattern at serve.go:306 isReplayStartSequenceError). errors.Is
+// against the same type would silently fall through to "other" — the
+// helpers_test.go table pins this contract explicitly.
 func classifyNATSAsyncError(err error) string {
+	var sequenceMismatch *nats.ErrConsumerSequenceMismatch
 	switch {
 	case errors.Is(err, nats.ErrSlowConsumer):
 		return "slow_consumer"
@@ -55,6 +71,8 @@ func classifyNATSAsyncError(err error) string {
 		return "timeout"
 	case errors.Is(err, nats.ErrConnectionClosed), errors.Is(err, nats.ErrConnectionDraining):
 		return "connection_state"
+	case errors.As(err, &sequenceMismatch):
+		return "consumer_sequence_mismatch"
 	default:
 		return "other"
 	}
