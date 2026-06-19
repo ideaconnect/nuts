@@ -128,6 +128,30 @@ func TestHandler_PlanSubscriptionSelectsReplayModes(t *testing.T) {
 			t.Fatalf("Replay mode = %s, want start_sequence", plan.Replay.Mode)
 		}
 	})
+
+	// Pins the HasSnapshot propagation introduced in pass 7. A regression
+	// that dropped `plan.Replay.HasSnapshot = snapshot.HasSnapshot` would
+	// re-introduce the bug where live messages count toward
+	// replay_max_messages on a transient StreamInfo failure. The two
+	// sub-cases (snapshot observed vs not) lock the propagation in both
+	// directions so a future refactor can't invert the assignment either.
+	t.Run("propagates HasSnapshot=true to plan.Replay", func(t *testing.T) {
+		h := &Handler{}
+		plan := h.planSubscription(basePlan, streamInfoSnapshot{
+			HasSnapshot: true, FirstSeq: 5, LastSeq: 20,
+		})
+		if !plan.Replay.HasSnapshot {
+			t.Fatal("plan.Replay.HasSnapshot was not propagated from observed snapshot")
+		}
+	})
+
+	t.Run("propagates HasSnapshot=false when StreamInfo failed", func(t *testing.T) {
+		h := &Handler{}
+		plan := h.planSubscription(basePlan, streamInfoSnapshot{HasSnapshot: false})
+		if plan.Replay.HasSnapshot {
+			t.Fatal("plan.Replay.HasSnapshot must stay false when no snapshot was observed; otherwise countsTowardReplayCap would re-enable on a transient StreamInfo blip")
+		}
+	})
 }
 
 func TestShouldSkipReplayWindowMessage(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -577,6 +578,99 @@ func TestHandler_ConnectNATS_TLSConfigErrorPropagates(t *testing.T) {
 	if err := h.connectNATS(); err == nil {
 		t.Fatal("expected connectNATS to return the TLS-build error when CA file is missing")
 	}
+}
+
+// startJetStreamServerWithTLS spins up an embedded NATS server with
+// JetStream enabled and TLS required on the client port, using the
+// supplied PEM cert/key. The server cert is self-signed by
+// generateSelfSignedPEM (CN="nuts-test", no SANs), so connections from
+// 127.0.0.1 will fail hostname verification unless the client opts into
+// InsecureSkipVerify. That's deliberate: it lets the negative test
+// below prove the operator-supplied *tls.Config is actually the one
+// nats.go used to dial.
+func startJetStreamServerWithTLS(t *testing.T, certPEM, keyPEM []byte) *server.Server {
+	t.Helper()
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("tls.X509KeyPair: %v", err)
+	}
+	opts := &server.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		},
+	}
+	ns, err := server.NewServer(opts)
+	if err != nil {
+		t.Fatalf("server.NewServer: %v", err)
+	}
+	go ns.Start()
+	if !ns.ReadyForConnections(5 * time.Second) {
+		t.Fatal("TLS NATS server not ready")
+	}
+	return ns
+}
+
+// TestHandler_ConnectNATS_TLS_LiveHandshake proves that the *tls.Config
+// produced by buildTLSConfig is actually used to dial NATS — that
+// nats.Secure(tlsCfg) is wired correctly in connectNATS. The existing
+// TestBuildTLSConfig_* tests only inspect the returned struct; a
+// regression that dropped the nats.Secure() option (e.g. replacing it
+// with nats.RootCAs(...) which discards client certs and TLS-Required
+// negotiation) would pass every prior TLS test but break this one.
+func TestHandler_ConnectNATS_TLS_LiveHandshake(t *testing.T) {
+	certPEM, keyPEM := generateSelfSignedPEM(t)
+	ns := startJetStreamServerWithTLS(t, certPEM, keyPEM)
+	defer ns.Shutdown()
+
+	t.Run("InsecureSkipVerify connects against self-signed CN-only cert", func(t *testing.T) {
+		h := &Handler{
+			NatsURL:                   ns.ClientURL(),
+			StreamName:                "EVENTS",
+			NatsTLSInsecureSkipVerify: true,
+			MaxReconnects:             intPtr(0),
+			logger:                    zap.NewNop(),
+		}
+		if err := h.connectNATS(); err != nil {
+			t.Fatalf("connectNATS against TLS NATS with InsecureSkipVerify: %v", err)
+		}
+		defer h.Cleanup()
+		if !h.conn.TLSRequired() {
+			t.Error("TLSRequired = false; the connection negotiated plaintext, not TLS — nats.Secure(tlsCfg) may not be wired")
+		}
+	})
+
+	t.Run("strict verify against same CA fails on 127.0.0.1 hostname mismatch", func(t *testing.T) {
+		// Same self-signed cert configured as a trust root; no
+		// InsecureSkipVerify. The cert has CN="nuts-test" and no
+		// IPAddresses SAN, so Go's verifier must reject the 127.0.0.1
+		// dial. A pass here would mean either the CA bundle is being
+		// ignored OR InsecureSkipVerify was silently flipped on.
+		dir := t.TempDir()
+		caPath := writeTempFile(t, dir, "ca.pem", certPEM)
+		h := &Handler{
+			NatsURL:       ns.ClientURL(),
+			StreamName:    "EVENTS",
+			NatsTLSCA:     caPath,
+			MaxReconnects: intPtr(0),
+			logger:        zap.NewNop(),
+		}
+		err := h.connectNATS()
+		if err == nil {
+			t.Fatal("expected handshake failure for hostname-mismatched self-signed CA")
+		}
+		// nats.go wraps the verifier error; the underlying x509 error
+		// mentions either "valid for" or "doesn't contain any IP SANs".
+		// Either substring confirms TLS verification ran.
+		msg := err.Error()
+		if !strings.Contains(msg, "valid") && !strings.Contains(msg, "SAN") && !strings.Contains(msg, "certificate") {
+			t.Fatalf("error %q doesn't look like a TLS verification failure; nats.Secure(tlsCfg) may not be wiring buildTLSConfig's output", msg)
+		}
+	})
 }
 
 // ── Heartbeat: the SSE stream emits the keep-alive comment ────────────────

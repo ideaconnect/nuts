@@ -117,9 +117,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Always compare against main so workflow_dispatch from a feature
+          # branch still gates against the canonical baseline. Without this
+          # the previous-run lookup matches the dispatched branch (usually
+          # zero successful runs) and silently sets has_previous=false,
+          # making the regression check a no-op on non-main dispatches.
           prev=$(gh run list \
             --workflow=mutation.yml \
-            --branch=${{ github.ref_name }} \
+            --branch=main \
             --status=success \
             --limit=2 \
             --json databaseId \

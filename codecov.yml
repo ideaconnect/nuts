@@ -1,0 +1,43 @@
+## Codecov configuration.
+##
+## The line-coverage threshold here is a soft safety net beneath the
+## stricter mutation-score (MSI) gate run weekly via
+## .github/workflows/mutation.yml. A drop in line coverage can mean a
+## test was deleted, a new code path is unexercised, or instrumentation
+## broke; the MSI gate catches more (e.g. a test that no longer asserts)
+## but only on a weekly cadence, so a per-PR line-% threshold gives
+## faster feedback on the simplest case.
+##
+## fail_ci_if_error in the workflow YAML is intentionally left false so
+## a transient Codecov upload outage doesn't block merges; the project
+## status check below is what enforces the actual threshold.
+
+coverage:
+  precision: 2
+  round: down
+  range: '90...100'  # green ≥ 100, red ≤ 90
+
+  status:
+    project:
+      default:
+        # Auto-track against the base branch; allow a 0.5% wiggle for
+        # noise (test reorderings, deleted-but-fine code), fail anything
+        # below.
+        target: auto
+        threshold: 0.5%
+        if_ci_failed: error
+        only_pulls: false
+
+    patch:
+      default:
+        # New code introduced by the PR must be 80%+ covered. Existing
+        # gaps don't block, but new code does — keeps coverage from
+        # decaying via new untested paths.
+        target: 80%
+        threshold: 0%
+        if_ci_failed: error
+
+comment:
+  layout: 'reach,diff,flags,tree'
+  behavior: default
+  require_changes: false

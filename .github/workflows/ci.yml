@@ -80,6 +80,20 @@ jobs:
           NATS_IMAGE: nats:2.12-alpine
         run: make test-functional-stress FUNCTIONAL_TEST_STRESS_COUNT=3
 
+      # One functional pass under the race detector against the newest
+      # NATS image. Catches broker-timing-dependent data races (slow-
+      # client pacing, dispatch backpressure) that the root-package -race
+      # step can't see because they only manifest against a real broker.
+      # Not in the matrix or stress count — -race ~doubles wall clock and
+      # the additional incremental signal is small.
+      - name: Run functional suite under -race
+        env:
+          TEST_BASE_URL: http://localhost:8080
+          TEST_NATS_URL: nats://localhost:4222
+          NATS_IMAGE: nats:2.12-alpine
+          FUNCTIONAL_TEST_RACE: '1'
+        run: make test-functional
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:

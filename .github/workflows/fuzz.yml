@@ -1,0 +1,78 @@
+name: Fuzz
+
+# Runs Go's native fuzz engine against the five Fuzz* targets defined in
+# fuzz_test.go. PR CI only exercises the seed corpus (every `go test .`
+# invocation runs the seeds as plain table tests); this workflow adds the
+# random-input exploration phase that catches accept-by-accident edge
+# cases the seeds can't reach.
+#
+# Not a PR trigger: short fuzz budgets add latency for marginal PR signal
+# and the engine is occasionally flaky on cold caches. Nightly + manual
+# dispatch is the right cadence.
+on:
+  schedule:
+    - cron: '0 4 * * *'  # 04:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: 'Per-target fuzz duration (Go duration string)'
+        required: false
+        default: '5m'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - FuzzIsValidTopic
+          - FuzzIsValidTopicFilter
+          - FuzzIsValidCookieName
+          - FuzzSubjectMatchesFilter
+          - FuzzSubscriberTopicMatches
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Per-target duration: the workflow_dispatch input wins; the
+      # scheduled default is 5m per target (25m total across the matrix
+      # in parallel, ~5m wall clock).
+      - name: Resolve fuzztime
+        id: ft
+        run: |
+          ft='${{ inputs.fuzztime }}'
+          if [ -z "$ft" ]; then ft='5m'; fi
+          echo "duration=$ft" >> "$GITHUB_OUTPUT"
+
+      - name: Run ${{ matrix.target }}
+        run: |
+          go test -run='^$' \
+            -fuzz='^${{ matrix.target }}$' \
+            -fuzztime='${{ steps.ft.outputs.duration }}' \
+            -timeout=30m \
+            .
+
+      # On failure, Go's fuzz engine writes the offending input to
+      # testdata/fuzz/<TargetName>/<hash>. Surface that as an artifact so
+      # the next maintainer can reproduce locally with `go test -run
+      # '<TargetName>/<hash>' .` and convert it into a seed.
+      - name: Upload crashing inputs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: testdata/fuzz/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -11,6 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README `Compatibility` table (Go, Caddy, NATS minimum tested) and a
   `Versioning policy` section documenting semver discipline, deprecation
   and removal cadence, and the `:latest` Docker-tag warning.
+- New nightly fuzz workflow (`.github/workflows/fuzz.yml`) — five
+  matrix jobs, one per `Fuzz*` target in `fuzz_test.go`
+  (`FuzzIsValidTopic`, `FuzzIsValidTopicFilter`, `FuzzIsValidCookieName`,
+  `FuzzSubjectMatchesFilter`, `FuzzSubscriberTopicMatches`). Default 5
+  min per target; `workflow_dispatch` accepts a custom `fuzztime`
+  input. Crashing inputs are uploaded as artifacts so the next
+  maintainer can reproduce locally and convert them into seeds.
+- New live-handshake mTLS integration test
+  (`TestHandler_ConnectNATS_TLS_LiveHandshake`) drives `connectNATS`
+  against an embedded TLS-enabled NATS server, asserting both
+  positive (`InsecureSkipVerify`) and negative (hostname-mismatch
+  rejection) paths. Catches regressions where `nats.Secure(tlsCfg)`
+  is unwired (e.g. replaced with `nats.RootCAs(...)`), which would
+  pass every prior `buildTLSConfig`-only test.
+- New `codecov.yml` with project (`auto` target, 0.5% threshold) and
+  patch (80% target) coverage gates so PR-time line-coverage
+  regressions surface as Codecov status checks, complementing the
+  weekly MSI gate in `mutation.yml`.
+- `Makefile`'s `test-functional` / `test-functional-dev` targets
+  honour `FUNCTIONAL_TEST_RACE=1`, which appends `-race` to the
+  `go test` invocation. CI runs one functional pass under `-race`
+  against `nats:2.12-alpine` to catch broker-timing-dependent races
+  the root-package `-race` step can't see.
+- `TestHandler_PlanSubscriptionSelectsReplayModes` gains two sub-tests
+  pinning the `plan.Replay.HasSnapshot` propagation introduced in
+  pass 7. A regression that dropped or inverted the assignment would
+  fail at the unit layer before reaching mutation testing or the
+  JetStream integration suite.
 - New Prometheus counter `nuts_nats_async_errors_total{kind}` populated
   by a registered `nats.ErrorHandler`. Kinds: `slow_consumer`, `timeout`,
   `connection_state`, `other`. Surfaces `nats.ErrSlowConsumer` drops that
@@ -205,6 +233,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `govulncheck` invocation pinned from `@latest` to `@v1.1.4` to match
   the pinning convention used for the other CI tooling (gremlins,
   golangci-lint, Trivy).
+- Mutation workflow's `gh run list` baseline lookup now hard-codes
+  `--branch=main` instead of `${{ github.ref_name }}`. A
+  `workflow_dispatch` from a feature branch previously silently
+  skipped regression detection because the previous-run lookup
+  matched the dispatched branch (usually zero successful runs); now
+  it always compares against the canonical main baseline.
 
 ### Operator notes
 - CORS headers are now emitted on every response with an allow-listed

@@ -80,18 +80,28 @@ docker-logs:
 		$(DOCKER_COMPOSE) logs --no-color --timestamps nats nats-init nuts || true; \
 	fi
 
-# Run functional tests (requires Docker services)
+# Run functional tests (requires Docker services).
+# FUNCTIONAL_TEST_RACE=1 appends -race to the go test invocation so a
+# CI job (or local run) can exercise the broker-timing-dependent
+# concurrency paths under the race detector. Disabled by default
+# because -race roughly doubles wall-clock and the unit suite already
+# runs -race on every PR.
 test-functional: docker-up
 	@echo "Running functional tests..."
 	@status=0; \
-	(cd functional_test && go test -count=1 -v -timeout 120s ./...) || status=$$?; \
+	race_flag=""; \
+	if [ "$(FUNCTIONAL_TEST_RACE)" = "1" ]; then race_flag="-race"; echo "  (race detector enabled via FUNCTIONAL_TEST_RACE=1)"; fi; \
+	(cd functional_test && go test $$race_flag -count=1 -v -timeout 240s ./...) || status=$$?; \
 	if [ $$status -ne 0 ]; then $(MAKE) docker-logs; fi; \
 	$(MAKE) docker-down || status=$$?; \
 	exit $$status
 
-# Run functional tests without stopping Docker (for development)
+# Run functional tests without stopping Docker (for development).
+# Honours FUNCTIONAL_TEST_RACE=1 just like the production target.
 test-functional-dev:
-	cd functional_test && go test -count=1 -v -timeout 120s ./...
+	@race_flag=""; \
+	if [ "$(FUNCTIONAL_TEST_RACE)" = "1" ]; then race_flag="-race"; fi; \
+	cd functional_test && go test $$race_flag -count=1 -v -timeout 240s ./...
 
 # Run the functional suite repeatedly to smoke out flakes.
 test-functional-stress: docker-up
