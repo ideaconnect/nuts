@@ -7,6 +7,19 @@ on:
 
 permissions:
   contents: write
+  # Required by cosign keyless signing (sign-blob over checksums.txt
+  # via the signs: block in .goreleaser.yml). Without it the OIDC
+  # token is not available and goreleaser's signing step fails.
+  id-token: write
+
+# Serialize releases per ref so a tag-delete + re-push recovery (a
+# common changelog-fix pattern) can't race two goreleaser jobs over the
+# same dist/ directory and GH Release assets. cancel-in-progress: false
+# is deliberate — a second run queues rather than tearing down a
+# partial publish mid-upload.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   goreleaser:
@@ -33,6 +46,9 @@ jobs:
 
       - name: Install Syft for GoReleaser SBOMs
         uses: anchore/sbom-action/download-syft@v0
+
+      - name: Install Cosign for checksum signing
+        uses: sigstore/cosign-installer@v3
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7

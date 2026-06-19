@@ -237,6 +237,41 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
 
+      # Pre-push gate: build the amd64 image locally (`load: true`) and
+      # scan it BEFORE the multi-arch push. Mirrors the closed-window
+      # pattern already used by the PR-only `docker-build` job above.
+      # The amd64 build is enough to catch the base-image CVE classes
+      # (Alpine/Caddy/musl/static-Go-binary) because they're
+      # arch-independent; the post-push scan on the multi-arch digest
+      # stays as defense-in-depth for arm64 audit. Without this gate,
+      # a fresh HIGH/CRITICAL CVE in the base layer would publish
+      # `idcttech/nuts:latest` to Docker Hub for any `docker pull`
+      # between the push step and the post-push Trivy failure — a
+      # silent publish-then-revoke window that a failed scan does not
+      # actually close (Docker Hub keeps the pushed tag).
+      - name: Build amd64 image locally for pre-push scan
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: idcttech/nuts:prepush-scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities before pushing to Docker Hub
+        run: |
+          mkdir -p "$HOME/.cache/trivy"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache" \
+            aquasec/trivy:0.59.1 image \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --severity HIGH,CRITICAL \
+            idcttech/nuts:prepush-scan
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7

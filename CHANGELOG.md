@@ -27,11 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New live-handshake mTLS integration test
   (`TestHandler_ConnectNATS_TLS_LiveHandshake`) drives `connectNATS`
   against an embedded TLS-enabled NATS server, asserting both
-  positive (handshake succeeds when the test client trusts the
-  embedded server cert) and negative (hostname-mismatch rejection)
-  paths. Catches regressions where `nats.Secure(tlsCfg)`
-  is unwired (e.g. replaced with `nats.RootCAs(...)`), which would
-  pass every prior `buildTLSConfig`-only test.
+  positive (handshake succeeds with `InsecureSkipVerify` against a
+  self-signed CN-only cert, proving `nats.Secure(tlsCfg)` wires the
+  TLS layer) and negative (hostname-mismatch rejection when the same
+  cert is loaded as a trust root) paths. Catches regressions where
+  `nats.Secure(tlsCfg)` is unwired (e.g. replaced with
+  `nats.RootCAs(...)`), which would pass every prior
+  `buildTLSConfig`-only test.
 - New `codecov.yml` with project (`auto` target, 0.5% threshold) and
   patch (80% target) coverage gates so PR-time line-coverage
   regressions surface as Codecov status checks, complementing the

@@ -44,6 +44,29 @@ checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
+# Cosign keyless signs the checksum manifest so downstream verifiers
+# can `cosign verify-blob --certificate ... --signature ... checksums.txt`
+# to bind every artifact in the release to a sigstore identity. Without
+# this, an attacker who compromised GITHUB_TOKEN (or who raced the
+# Release upload step before the per-ref concurrency guard in
+# release.yml landed) could swap an archive and republish a matching
+# unsigned manifest undetected. ci.yml already runs cosign keyless
+# against the docker image, so the same primitive applies here.
+# Requires `id-token: write` on release.yml's permissions block so the
+# OIDC token is available to cosign.
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    signature: ${artifact}.sig
+    certificate: ${artifact}.pem
+    args:
+      - sign-blob
+      - --yes
+      - --oidc-issuer=https://token.actions.githubusercontent.com
+      - --output-signature=${signature}
+      - --output-certificate=${certificate}
+      - ${artifact}
+
 snapshot:
   version_template: "{{ .Tag }}-next"
 
