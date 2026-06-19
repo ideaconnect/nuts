@@ -93,19 +93,30 @@ func TestClassifyNATSAsyncError(t *testing.T) {
 		{"connection closed wrapped", fmt.Errorf("op: %w", nats.ErrConnectionClosed), "connection_state"},
 		{"connection draining", nats.ErrConnectionDraining, "connection_state"},
 		{"connection draining wrapped", fmt.Errorf("op: %w", nats.ErrConnectionDraining), "connection_state"},
-		// consumer_sequence_mismatch is the M9 Batch B trigger: nats.go
-		// detected a missed IdleHeartbeat (push consumer reaped / lost)
-		// or a delivery-sequence gap. Pin both the bare typed-error path
-		// and the fmt.Errorf-wrapped path because we use errors.As, not
-		// errors.Is — verify both shapes resolve to the same label.
-		{"consumer sequence mismatch", &nats.ErrConsumerSequenceMismatch{StreamResumeSequence: 42, ConsumerSequence: 1, LastConsumerSequence: 2}, "consumer_sequence_mismatch"},
-		{"consumer sequence mismatch wrapped", fmt.Errorf("delivered: %w", &nats.ErrConsumerSequenceMismatch{StreamResumeSequence: 7}), "consumer_sequence_mismatch"},
-		// Empty-struct case: errors.As checks the type, not the field
-		// state — a zero-value mismatch error MUST still classify as
-		// consumer_sequence_mismatch. Future code that filters on
-		// non-zero StreamResumeSequence would silently regress without
-		// this case.
-		{"consumer sequence mismatch zero value", &nats.ErrConsumerSequenceMismatch{}, "consumer_sequence_mismatch"},
+		// consumer_invalidated covers the three nats.go error paths
+		// that all mean the JetStream push consumer is unusable. The
+		// hardening test TestHandler_BatchA_HeartbeatMissTriggers
+		// ClassifierAndLog uncovered that nats.go's IdleHeartbeat-miss
+		// detector raises nats.ErrConsumerNotActive (sentinel), NOT
+		// *nats.ErrConsumerSequenceMismatch (typed struct). Without
+		// the ErrConsumerNotActive arm, Phase 1's metric label would
+		// never tick in production for the primary failure mode M9
+		// targets. Pin every error type explicitly here so a future
+		// nats.go change that re-routes one of them is caught at unit
+		// time rather than in production.
+		{"ErrConsumerNotActive (primary heartbeat-miss path)", nats.ErrConsumerNotActive, "consumer_invalidated"},
+		{"ErrConsumerNotActive wrapped", fmt.Errorf("activity check: %w", nats.ErrConsumerNotActive), "consumer_invalidated"},
+		{"ErrConsumerDeleted", nats.ErrConsumerDeleted, "consumer_invalidated"},
+		{"ErrConsumerDeleted wrapped", fmt.Errorf("delivery: %w", nats.ErrConsumerDeleted), "consumer_invalidated"},
+		// *nats.ErrConsumerSequenceMismatch is the secondary path:
+		// heartbeats arrive but the sequence drifted. Bare + wrapped
+		// + zero-value sub-cases pin the errors.As contract: future
+		// refactors that swap As for Is would silently fall through
+		// to "other" because Is would compare against a zero-value
+		// sentinel struct and fail.
+		{"ErrConsumerSequenceMismatch populated", &nats.ErrConsumerSequenceMismatch{StreamResumeSequence: 42, ConsumerSequence: 1, LastConsumerSequence: 2}, "consumer_invalidated"},
+		{"ErrConsumerSequenceMismatch wrapped", fmt.Errorf("delivered: %w", &nats.ErrConsumerSequenceMismatch{StreamResumeSequence: 7}), "consumer_invalidated"},
+		{"ErrConsumerSequenceMismatch zero value", &nats.ErrConsumerSequenceMismatch{}, "consumer_invalidated"},
 		{"unknown error", errors.New("some unrelated"), "other"},
 		{"unknown wrapped", fmt.Errorf("op: %w", errors.New("some unrelated")), "other"},
 	}
@@ -119,12 +130,12 @@ func TestClassifyNATSAsyncError(t *testing.T) {
 }
 
 // TestClassifyNATSAsyncError_ConsumerSequenceMismatch_RequiresErrorsAs pins
-// the contract that the consumer_sequence_mismatch path is checked via
+// the contract that *nats.ErrConsumerSequenceMismatch is matched via
 // errors.As, NOT errors.Is. nats.ErrConsumerSequenceMismatch is a struct
 // type carrying recovery sequence numbers — an errors.Is check against
 // the zero value would compare by equality and fail for any real error
 // instance with non-zero fields. If a future refactor accidentally swaps
-// As→Is the classifier would silently route the M9 Batch B termination
+// As→Is the classifier would silently route this M9 Batch B termination
 // trigger into the generic "other" bucket and SSE clients would stay
 // attached to zombie consumers. Guard explicitly.
 func TestClassifyNATSAsyncError_ConsumerSequenceMismatch_RequiresErrorsAs(t *testing.T) {
@@ -132,8 +143,8 @@ func TestClassifyNATSAsyncError_ConsumerSequenceMismatch_RequiresErrorsAs(t *tes
 	// ErrConsumerSequenceMismatch{}) would compare against the zero value
 	// and fail — the very regression we're guarding against.
 	err := &nats.ErrConsumerSequenceMismatch{StreamResumeSequence: 99, ConsumerSequence: 5, LastConsumerSequence: 6}
-	if got := classifyNATSAsyncError(err); got != "consumer_sequence_mismatch" {
-		t.Fatalf("populated sequence-mismatch error classified as %q, want consumer_sequence_mismatch — likely errors.Is regression", got)
+	if got := classifyNATSAsyncError(err); got != "consumer_invalidated" {
+		t.Fatalf("populated sequence-mismatch error classified as %q, want consumer_invalidated — likely errors.Is regression", got)
 	}
 
 	// And confirm errors.Is itself would NOT match — this guards future
@@ -141,6 +152,27 @@ func TestClassifyNATSAsyncError_ConsumerSequenceMismatch_RequiresErrorsAs(t *tes
 	// works in some narrow case.
 	if errors.Is(err, &nats.ErrConsumerSequenceMismatch{}) {
 		t.Fatalf("errors.Is unexpectedly matched a populated sequence-mismatch against zero-value sentinel; the classifier must rely on errors.As")
+	}
+}
+
+// TestClassifyNATSAsyncError_ConsumerNotActive_PrimaryHeartbeatMissPath
+// pins the contract that nats.ErrConsumerNotActive — the actual error
+// raised by nats.go's activityCheck when the IdleHeartbeat timeout
+// elapses without a heartbeat arriving — buckets as consumer_invalidated.
+// The Phase 1 implementation originally only covered *ErrConsumerSequence
+// Mismatch; TestHandler_BatchA_HeartbeatMissTriggersClassifierAndLog
+// uncovered this hole because consumer deletion via the JetStream admin
+// API surfaces as ErrConsumerNotActive, not the sequence-mismatch type.
+// Without this regression guard a future refactor could silently drop
+// the primary detection path and the metric would never tick in
+// production.
+func TestClassifyNATSAsyncError_ConsumerNotActive_PrimaryHeartbeatMissPath(t *testing.T) {
+	if got := classifyNATSAsyncError(nats.ErrConsumerNotActive); got != "consumer_invalidated" {
+		t.Fatalf("nats.ErrConsumerNotActive classified as %q, want consumer_invalidated — the primary IdleHeartbeat-miss signal would never reach the metric label", got)
+	}
+	wrapped := fmt.Errorf("activity check fired: %w", nats.ErrConsumerNotActive)
+	if got := classifyNATSAsyncError(wrapped); got != "consumer_invalidated" {
+		t.Fatalf("wrapped ErrConsumerNotActive classified as %q, want consumer_invalidated", got)
 	}
 }
 
@@ -152,7 +184,7 @@ func TestClassifyNATSAsyncError_ConsumerSequenceMismatch_RequiresErrorsAs(t *tes
 //
 // The two reason values (heartbeat_missed, slow_consumer) match the
 // two errors classifyNATSAsyncError surfaces for routed termination
-// (consumer_sequence_mismatch and slow_consumer respectively); Batch B
+// (consumer_invalidated and slow_consumer respectively); Batch B
 // maps one to the other inside the serveStream termination arm.
 func TestMetrics_ConsumerInvalidated_RegisteredWithExpectedLabels(t *testing.T) {
 	for _, reason := range []string{"heartbeat_missed", "slow_consumer"} {

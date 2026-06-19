@@ -44,24 +44,43 @@ func (h *Handler) log() *zap.Logger {
 //
 // Label set (must stay in sync with the README and OPERATIONS.md
 // documented values): slow_consumer, timeout, connection_state,
-// consumer_sequence_mismatch, other. The caller (provision.go's
+// consumer_invalidated, other. The caller (provision.go's
 // nats.ErrorHandler) filters nil errors before calling, so this function
 // does not return an "unknown" or similar label that would drift outside
 // the documented set.
 //
-// consumer_sequence_mismatch fires when nats.go detects a gap in the
-// JetStream push stream — either a missed IdleHeartbeat (the server
-// reaped or lost track of the ephemeral consumer) or an actual delivery
-// gap that interrupts ordered replay. M9 Batch B will use this label as
-// the trigger for terminating the affected SSE handler so the client
-// reconnects with Last-Event-ID against a fresh consumer; today (Batch
-// A) it is observability-only.
+// consumer_invalidated covers three distinct nats.go error paths that
+// all indicate the JetStream push consumer is no longer usable:
 //
-// The check uses errors.As because *nats.ErrConsumerSequenceMismatch is
-// a typed error carrying recovery sequence numbers (mirrors the
-// pattern at serve.go:306 isReplayStartSequenceError). errors.Is
-// against the same type would silently fall through to "other" — the
-// helpers_test.go table pins this contract explicitly.
+//   - nats.ErrConsumerNotActive (sentinel, errors.Is): raised by
+//     nats.go's activityCheck() when no IdleHeartbeat has arrived
+//     within the configured tolerance. This is the primary failure
+//     mode M9 targets — the server reaped or lost track of the
+//     ephemeral, e.g. InactiveThreshold tripped during a network
+//     blip or a leafnode route failover dropped the inbox.
+//   - nats.ErrConsumerDeleted (sentinel, errors.Is): raised when the
+//     consumer was administratively deleted while a subscription
+//     held it. Push subscribers rarely see this directly (it's more
+//     common on pull paths) but the operator-visible event is the
+//     same — the SSE handler holds a zombie subscription.
+//   - *nats.ErrConsumerSequenceMismatch (typed struct, errors.As):
+//     raised by checkForSequenceMismatch when heartbeats DO arrive
+//     but the delivered consumer sequence has drifted from the
+//     value carried in the heartbeat — interrupts ordered replay.
+//     Mirrors serve.go:306 isReplayStartSequenceError's typed-error
+//     pattern.
+//
+// M9 Batch B will route this label as the trigger for terminating the
+// affected SSE handler so the client reconnects with Last-Event-ID
+// against a fresh consumer; today (Batch A) it is observability-only.
+//
+// The mix of errors.Is and errors.As is load-bearing. ErrConsumerNot
+// Active and ErrConsumerDeleted are JetStreamError-interface values
+// backed by *jsError sentinels — errors.Is is the right matcher.
+// ErrConsumerSequenceMismatch is a struct type carrying recovery
+// sequence numbers — errors.As is required because errors.Is would
+// compare against a zero-value sentinel and silently fall through to
+// "other". The helpers_test.go table pins both contracts explicitly.
 func classifyNATSAsyncError(err error) string {
 	var sequenceMismatch *nats.ErrConsumerSequenceMismatch
 	switch {
@@ -71,8 +90,10 @@ func classifyNATSAsyncError(err error) string {
 		return "timeout"
 	case errors.Is(err, nats.ErrConnectionClosed), errors.Is(err, nats.ErrConnectionDraining):
 		return "connection_state"
-	case errors.As(err, &sequenceMismatch):
-		return "consumer_sequence_mismatch"
+	case errors.Is(err, nats.ErrConsumerNotActive),
+		errors.Is(err, nats.ErrConsumerDeleted),
+		errors.As(err, &sequenceMismatch):
+		return "consumer_invalidated"
 	default:
 		return "other"
 	}

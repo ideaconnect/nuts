@@ -27,14 +27,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     disable sentinel; `0` is normalised to 10s by Provision. Validate
     enforces the upper bound `< InactiveThreshold/2` (currently 15s)
     so two missed heartbeats are detectable before the server reaps.
-  - New `consumer_sequence_mismatch` label value on
-    `nuts_nats_async_errors_total{kind}`. nats.go raises
-    `*nats.ErrConsumerSequenceMismatch` on a missed heartbeat or a
-    delivery-sequence gap; the classifier now buckets it as a
-    first-class label (was previously the generic `"other"` bucket).
-    Uses `errors.As`, not `errors.Is`, because the nats.go type is a
-    struct carrying recovery sequence numbers — a dedicated
-    regression test pins the As-vs-Is choice.
+  - New `consumer_invalidated` label value on
+    `nuts_nats_async_errors_total{kind}`. Covers three distinct
+    nats.go error paths that all indicate the JetStream push
+    consumer is unusable: `nats.ErrConsumerNotActive` (sentinel,
+    raised by nats.go's `activityCheck` when IdleHeartbeat tolerance
+    elapses without a heartbeat arriving — the primary failure mode
+    M9 targets), `nats.ErrConsumerDeleted` (sentinel, raised when
+    the consumer was administratively deleted), and
+    `*nats.ErrConsumerSequenceMismatch` (typed struct, raised when
+    heartbeats arrive but the delivered sequence drifted). All
+    three previously routed to the generic `"other"` bucket. The
+    initial Phase 1 implementation only covered the typed
+    `ErrConsumerSequenceMismatch` case; the heavy Batch A test gate
+    (#52) uncovered that the primary heartbeat-miss path actually
+    surfaces as `ErrConsumerNotActive` and was never reaching the
+    metric — without the gate the label would have shipped with
+    zero counts in production. Classifier uses both `errors.Is`
+    (for the sentinel paths) and `errors.As` (for the typed
+    struct); dedicated regression tests pin both contracts.
   - New `nuts_consumer_invalidated_total{reason}` CounterVec
     registered (declaration-only in Batch A; Batch B populates it).
     Reason labels: `heartbeat_missed`, `slow_consumer`. Pre-

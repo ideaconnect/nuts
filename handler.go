@@ -167,7 +167,7 @@ type Handler struct {
 	// server reaps the consumer.
 	//
 	// M9 Batch A surfaces a missed heartbeat as
-	// nuts_nats_async_errors_total{kind="consumer_sequence_mismatch"}
+	// nuts_nats_async_errors_total{kind="consumer_invalidated"}
 	// only; Batch B will terminate the affected SSE handler with
 	// disconnect_reason=consumer_invalidated.
 	NatsIdleHeartbeat int `json:"nats_idle_heartbeat,omitempty"`

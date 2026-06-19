@@ -792,7 +792,7 @@ func (h *Handler) replayWindowStart() time.Time {
 // disable sentinel and skips the SubOpt append entirely.
 //
 // Batch A surfaces a missed heartbeat as
-// nuts_nats_async_errors_total{kind="consumer_sequence_mismatch"};
+// nuts_nats_async_errors_total{kind="consumer_invalidated"};
 // Batch B (#54) will terminate the affected SSE handler with
 // disconnect_reason=consumer_invalidated. Validate enforces
 // NatsIdleHeartbeat < defaultConsumerInactiveThreshold/2 so two

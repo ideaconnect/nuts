@@ -164,11 +164,19 @@ filters when correlating logs with alerts.
 
 **Signals**
 
-- `nuts_nats_async_errors_total{kind="consumer_sequence_mismatch"}` ticks
-  up. nats.go raises `*nats.ErrConsumerSequenceMismatch` when it detects
-  a missed server-side `IdleHeartbeat` (the JetStream server reaped or
-  lost track of the ephemeral consumer) or an actual delivery-sequence
-  gap that breaks ordered replay.
+- `nuts_nats_async_errors_total{kind="consumer_invalidated"}` ticks
+  up. The label covers three nats.go signals that all mean the
+  JetStream push consumer is unusable:
+  - `nats.ErrConsumerNotActive` — the primary case. nats.go's
+    `activityCheck` fires when no `IdleHeartbeat` has arrived within
+    the configured tolerance (typically the JetStream server reaped
+    the ephemeral via `InactiveThreshold` during a network blip, or
+    a leafnode route failover dropped the inbox subscription).
+  - `nats.ErrConsumerDeleted` — the consumer was administratively
+    deleted while NUTS held the subscription.
+  - `*nats.ErrConsumerSequenceMismatch` — heartbeats DID arrive but
+    the delivered consumer sequence drifted from what nats.go
+    expected (interrupts ordered replay; rarer than the other two).
 - After M9 Batch B ships, `nuts_consumer_invalidated_total{reason="heartbeat_missed"}`
   also ticks once per invalidation and the affected SSE handler emits
   `disconnect_reason="consumer_invalidated"`. During the Batch A window,
