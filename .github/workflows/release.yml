@@ -41,7 +41,11 @@ jobs:
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: '~> v2'
+          # Pinned to an exact version (was '~> v2'). Matches the
+          # convention used by the rest of the supply-chain tooling.
+          # Bump in lockstep with ci.yml's snapshot job so PR and
+          # tagged release exercise the same goreleaser surface.
+          version: 'v2.6.3'
           args: check
 
       - name: Install Syft for GoReleaser SBOMs
@@ -62,7 +66,7 @@ jobs:
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: '~> v2'
+          version: 'v2.6.3'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
