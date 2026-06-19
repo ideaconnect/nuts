@@ -483,6 +483,110 @@ func readSSEEvents(body io.Reader, done chan<- struct{}) {
 	}
 }
 
+// iDeleteTheActiveJetStreamConsumer forces the M9 Batch A failure mode
+// end-to-end: find the ephemeral consumer NUTS opened on the stream,
+// delete it via the JetStream admin API, and let nats.go's
+// IdleHeartbeat detector (configured with 1s heartbeat in
+// Caddyfile.test) raise nats.ErrConsumerNotActive on the NUTS side.
+// Batch A surfaces that as
+// nuts_nats_async_errors_total{kind="consumer_invalidated"} + a
+// structured Warn log; the SSE handler stays attached until the
+// Batch B termination arm lands.
+func iDeleteTheActiveJetStreamConsumer(stream string) error {
+	if tc.js == nil {
+		return fmt.Errorf("no JetStream context — was the Background step skipped?")
+	}
+	// There is exactly one consumer on the test stream per scenario
+	// because the SSE client only opens one subscription. ConsumersInfo
+	// streams over a channel; collect everything before deleting so we
+	// can fail with a clean error if there are zero or multiple.
+	var names []string
+	for info := range tc.js.ConsumersInfo(stream) {
+		if info != nil {
+			names = append(names, info.Name)
+		}
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("no consumer present on stream %q — was the SSE client connected?", stream)
+	}
+	if len(names) > 1 {
+		return fmt.Errorf("expected exactly one consumer on stream %q, got %d: %v", stream, len(names), names)
+	}
+	if err := tc.js.DeleteConsumer(stream, names[0]); err != nil {
+		return fmt.Errorf("DeleteConsumer(%s, %s): %w", stream, names[0], err)
+	}
+	return nil
+}
+
+// iWaitNSecondsForHeartbeatMissDetection blocks for the requested
+// duration. Used after the consumer-delete step to give nats.go's
+// activityCheck timer time to fire (~2× heartbeat interval). A bare
+// time.Sleep is the simplest fit; the assertion that follows (SSE
+// stream still open) does not depend on the exact firing time.
+func iWaitNSecondsForHeartbeatMissDetection(seconds int) error {
+	if seconds <= 0 || seconds > 30 {
+		return fmt.Errorf("wait window %ds is outside the supported (0, 30]s range", seconds)
+	}
+	time.Sleep(time.Duration(seconds) * time.Second)
+	return nil
+}
+
+// theSSEStreamShouldStillBeOpen pins the M9 Batch A contract: even
+// after nats.ErrConsumerNotActive has fired on the NUTS side, the
+// SSE HTTP response is still being streamed and the read goroutine
+// has NOT returned. A Batch B regression that prematurely added the
+// disconnect path would close tc.sseReadDone and trip this assertion.
+//
+// The check is intentionally non-blocking: we do a single
+// select-with-default on the readDone channel. A close would have
+// been observed by now (the wait step above gave detection ~3s of
+// headroom against a 1s heartbeat).
+func theSSEStreamShouldStillBeOpen() error {
+	if tc.sseReadDone == nil {
+		return fmt.Errorf("no SSE read goroutine recorded — was the client connected via /events?")
+	}
+	select {
+	case <-tc.sseReadDone:
+		// Capture whatever the client did receive so the failure is
+		// debuggable (probably a stray EOF/error closed the stream
+		// early — the very Batch B-leak we want to catch).
+		events, heartbeats := singleEventsSnapshot()
+		return fmt.Errorf("SSE read goroutine returned — handler exited prematurely (Batch A contract violation). events=%d heartbeats=%d", len(events), len(heartbeats))
+	default:
+		return nil
+	}
+}
+
+// iShouldKeepReceivingHeartbeatComments asserts that the SSE-layer
+// heartbeat ticker (HeartbeatInterval=1 in Caddyfile.test) continues
+// firing after the consumer deletion. NUTS' SSE-side heartbeat is
+// independent of the JetStream push consumer — Phase 3's godoc on
+// subscriptionOptions calls out that the SSE-layer ticker only
+// proves the HTTP socket is open, not the JetStream push path. This
+// step confirms that property end-to-end: a dead push consumer does
+// NOT silence the SSE keepalive.
+//
+// Concretely: snapshot the heartbeat count, wait one quiet window
+// (~500ms by default), confirm the count grew. Any growth at all is
+// sufficient — with a 1s heartbeat interval and ≥1s of waiting in
+// the prior step, at least one new heartbeat MUST have arrived.
+func iShouldKeepReceivingHeartbeatComments() error {
+	before := func() int {
+		_, heartbeats := singleEventsSnapshot()
+		return len(heartbeats)
+	}()
+	return waitUntil("additional heartbeat comments after consumer invalidation",
+		3*time.Second,
+		func() (bool, string) {
+			_, heartbeats := singleEventsSnapshot()
+			if len(heartbeats) > before {
+				return true, ""
+			}
+			return false, fmt.Sprintf("heartbeats stayed at %d", len(heartbeats))
+		},
+	)
+}
+
 func iPublishMessageToSubject(message, subject string) error {
 	ack, err := tc.js.Publish(subject, []byte(message))
 	if err != nil {
@@ -1040,6 +1144,12 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the response header "([^"]*)" should be "([^"]*)"$`, theResponseHeaderShouldBe)
 	ctx.Step(`^I should receive a heartbeat comment$`, iShouldReceiveAHeartbeatComment)
 	ctx.Step(`^the stream "([^"]*)" should have an active consumer using expected multi-topic filters for subjects "([^"]*)"$`, streamShouldHaveActiveConsumerUsingExpectedMultiTopicFilters)
+
+	// M9 Batch A — consumer invalidation observability
+	ctx.Step(`^I delete the active JetStream consumer for stream "([^"]*)"$`, iDeleteTheActiveJetStreamConsumer)
+	ctx.Step(`^I wait (\d+) seconds for heartbeat-miss detection$`, iWaitNSecondsForHeartbeatMissDetection)
+	ctx.Step(`^the SSE stream should still be open$`, theSSEStreamShouldStillBeOpen)
+	ctx.Step(`^I should keep receiving heartbeat comments$`, iShouldKeepReceivingHeartbeatComments)
 
 	// Multi-client steps
 	ctx.Step(`^client "([^"]*)" is connected to SSE endpoint "([^"]*)"$`, clientIsConnectedToSSEEndpoint)
