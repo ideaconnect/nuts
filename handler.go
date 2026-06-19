@@ -158,8 +158,10 @@ type Handler struct {
 	// proves the HTTP socket is open, not that the JetStream push path
 	// is live).
 	//
-	// Default: 10 (seconds). Set to a negative value to disable. 0 (or
-	// unset) is normalised to the default during Provision.
+	// Default: 10 (seconds). Set to exactly -1 to disable. 0 (or unset)
+	// is normalised to the default during Provision; other negative
+	// values are rejected by Validate as likely typos (consistent with
+	// how heartbeat_interval and reconnect_wait reject negatives).
 	//
 	// Constraint enforced by Validate when positive:
 	// NatsIdleHeartbeat < defaultConsumerInactiveThreshold/2 (currently

@@ -1060,6 +1060,16 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 			mutate:  func(h *Handler) { h.NatsIdleHeartbeat = 30 },
 			wantErr: "nats_idle_heartbeat",
 		},
+		{
+			name:    "nats_idle_heartbeat negative typo just below sentinel",
+			mutate:  func(h *Handler) { h.NatsIdleHeartbeat = -2 },
+			wantErr: "nats_idle_heartbeat",
+		},
+		{
+			name:    "nats_idle_heartbeat large-magnitude negative typo",
+			mutate:  func(h *Handler) { h.NatsIdleHeartbeat = -100 },
+			wantErr: "nats_idle_heartbeat",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1172,6 +1182,16 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 		{
 			name:     "nats_idle_heartbeat above InactiveThreshold/2",
 			fragment: `"nats_idle_heartbeat": 30`,
+			wantErr:  "nats_idle_heartbeat",
+		},
+		{
+			name:     "nats_idle_heartbeat negative typo just below sentinel",
+			fragment: `"nats_idle_heartbeat": -2`,
+			wantErr:  "nats_idle_heartbeat",
+		},
+		{
+			name:     "nats_idle_heartbeat large-magnitude negative typo",
+			fragment: `"nats_idle_heartbeat": -100`,
 			wantErr:  "nats_idle_heartbeat",
 		},
 	}
@@ -1393,6 +1413,25 @@ func TestHandler_NatsIdleHeartbeat_ConfigContract(t *testing.T) {
 		h := Handler{NatsURL: "nats://localhost:4222", StreamName: "EVENTS", NatsIdleHeartbeat: -1}
 		if err := h.Validate(); err != nil {
 			t.Fatalf("Validate rejected disable sentinel: %v", err)
+		}
+	})
+	t.Run("Validate rejects non-sentinel negatives as typo guard", func(t *testing.T) {
+		// Sibling fields (heartbeat_interval, reconnect_wait) reject
+		// negatives unconditionally; nats_idle_heartbeat accepts exactly
+		// -1 (the explicit operator-disable sentinel) and rejects every
+		// other negative as a likely typo. Pin both ends of the -1
+		// boundary to catch a future regression that loosens the check
+		// (e.g. "any negative disables") and re-enables silent typo
+		// configurations.
+		for _, v := range []int{-2, -10, -100} {
+			h := Handler{NatsURL: "nats://localhost:4222", StreamName: "EVENTS", NatsIdleHeartbeat: v}
+			err := h.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted nats_idle_heartbeat=%d, want rejection (only -1 is the disable sentinel)", v)
+			}
+			if !strings.Contains(err.Error(), "nats_idle_heartbeat") {
+				t.Fatalf("Validate error for nats_idle_heartbeat=%d does not mention the field: %v", v, err)
+			}
 		}
 	})
 }

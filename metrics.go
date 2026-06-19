@@ -113,36 +113,73 @@ var (
 	})
 
 	// nuts_nats_async_errors_total counts asynchronous errors reported by
-	// the NATS client (most importantly nats.ErrSlowConsumer, which fires
-	// when nats.go's per-subscription buffer overflows and silently drops
-	// messages). Labelled by kind so operators can distinguish slow-consumer
-	// drops at the library layer from other async error categories.
+	// the NATS client. Labelled by kind so operators can distinguish
+	// slow-consumer drops at the library layer from connection-state
+	// transitions and from JetStream consumer-invalidation events.
+	//
+	// Bounded label set (kept in lockstep with classifyNATSAsyncError —
+	// helpers.go is the source of truth and pins the mapping in
+	// regression tests):
+	//
+	//   - slow_consumer:        nats.ErrSlowConsumer (nats.go's per-
+	//                           subscription internal buffer overflowed
+	//                           and messages were silently dropped at
+	//                           the library layer — upstream of NUTS'
+	//                           bounded msgChan).
+	//   - timeout:              nats.ErrTimeout.
+	//   - connection_state:     nats.ErrConnectionClosed,
+	//                           nats.ErrConnectionDraining.
+	//   - consumer_invalidated: nats.ErrConsumerNotActive (primary
+	//                           heartbeat-miss path; raised by
+	//                           activityCheck on IdleHeartbeat timeout),
+	//                           nats.ErrConsumerDeleted (kept as
+	//                           forward-compat — see helpers.go),
+	//                           *nats.ErrConsumerSequenceMismatch
+	//                           (sequence drift while heartbeats are
+	//                           still arriving).
+	//   - other:                everything else.
 	metricsNATSAsyncErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "nats_async_errors_total",
-		Help:      "Total number of asynchronous NATS client errors observed by the registered ErrorHandler.",
+		Help:      "Total number of asynchronous NATS client errors observed by the registered ErrorHandler. Labelled by kind: slow_consumer, timeout, connection_state, consumer_invalidated, other.",
 	}, []string{"kind"})
 
-	// nuts_consumer_invalidated_total counts JetStream push consumers that
-	// were invalidated mid-stream — either because nats.go detected a
-	// missed IdleHeartbeat (the server reaped or lost track of the
-	// ephemeral consumer, surfaced as *nats.ErrConsumerSequenceMismatch)
-	// or because nats.go's per-subscription internal buffer overflowed
-	// upstream of NUTS' bounded msgChan (nats.ErrSlowConsumer).
+	// nuts_consumer_invalidated_total — declared in M9 Batch A
+	// (#M9-1) so the series is visible at /metrics from day one;
+	// populated by M9 Batch B (#M9-5) from the serveStream
+	// consumer_invalidated termination arm. During Batch A the
+	// series is permastuck at zero and the SSE handler is NOT
+	// disconnected on heartbeat miss; the Help string below is
+	// phrased to reflect that current behaviour rather than the
+	// post-Batch-B contract, so an operator reading /metrics
+	// without source access can tell which milestone has shipped.
 	//
-	// Declared in M9 Batch A (#M9-1). Populated in M9 Batch B (#M9-5)
-	// from the serveStream consumer_invalidated termination arm — Batch
-	// A registers the metric so the series exists in /metrics with zero
-	// counts and dashboards do not break when Batch B starts incrementing.
+	// Reason labels (kept in lockstep with the classifyNATSAsync
+	// Error label set, so a Batch B implementer routing the
+	// classifier output to a reason label has one mapping to
+	// follow, not two):
 	//
-	// Label set: heartbeat_missed (from ErrConsumerSequenceMismatch),
-	// slow_consumer (from ErrSlowConsumer at the nats.go layer, distinct
-	// from NUTS' own nuts_slow_client_disconnects_total which fires when
-	// the SSE writer falls behind the bounded msgChan).
+	//   - heartbeat_missed: from kind=consumer_invalidated. Covers
+	//                      all three nats.go errors that classifier
+	//                      buckets there: ErrConsumerNotActive
+	//                      (primary heartbeat-miss path),
+	//                      ErrConsumerDeleted (forward-compat),
+	//                      *ErrConsumerSequenceMismatch (sequence
+	//                      drift). The earlier Phase 1 attribution
+	//                      that wired heartbeat_missed only to
+	//                      *ErrConsumerSequenceMismatch was the bug
+	//                      the Batch A hardening (104299f) caught
+	//                      and corrected — this comment is the
+	//                      authoritative wiring spec for Batch B.
+	//   - slow_consumer:   from kind=slow_consumer (nats.ErrSlowConsumer
+	//                      at the nats.go library layer; distinct from
+	//                      nuts_slow_client_disconnects_total which
+	//                      fires when the SSE writer falls behind
+	//                      NUTS' bounded msgChan one layer downstream).
 	metricsConsumerInvalidated = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "consumer_invalidated_total",
-		Help:      "Total number of JetStream push consumers invalidated mid-stream, triggering SSE client disconnect with reason=consumer_invalidated. Labelled by invalidation cause.",
+		Help:      "Total JetStream push-consumer invalidation events. Declared in M9 Batch A (#M9-1) and currently always 0 — Batch A is detection-only; M9 Batch B (#M9-5) will increment this when an invalidated consumer triggers an SSE disconnect with reason=consumer_invalidated. Labels: heartbeat_missed, slow_consumer.",
 	}, []string{"reason"})
 
 	// nuts_write_disconnects_total counts SSE streams that ended because a

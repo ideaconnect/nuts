@@ -186,7 +186,19 @@ filters when correlating logs with alerts.
 
 **Actions**
 
-1. Check the NATS server's effective `InactiveThreshold` against NUTS'
+1. **Cross-reference `nuts_nats_connection_events_total{event="disconnect"}`
+   FIRST.** A NATS-side connection blip longer than `2 × nats_idle_heartbeat`
+   (default 20s with the 10s heartbeat) trips `nats.go`'s `activityCheck`
+   on every active push subscription — each one fires
+   `ErrConsumerNotActive` and increments `consumer_invalidated` once
+   per concurrent SSE client. With N active clients you will see N
+   `consumer_invalidated` ticks for what was operationally one
+   disconnect, plus the matching `connection_events{event="disconnect"}`
+   tick. If the `disconnect` tick correlates in time, treat this
+   incident as a connection blip — not a server-side consumer reap —
+   and move to the network/cluster troubleshooting flow rather than
+   continuing with the steps below.
+2. Check the NATS server's effective `InactiveThreshold` against NUTS'
    `nats_idle_heartbeat` setting. Two missed heartbeats must be
    detectable before the server reaps; NUTS' `Validate` enforces
    `nats_idle_heartbeat < InactiveThreshold/2` against its in-process
@@ -194,16 +206,18 @@ filters when correlating logs with alerts.
    override or a leafnode/cluster configuration can change the effective
    reap interval. If the server reaps faster than NUTS detects, the
    heartbeat path is silently undermined.
-2. Inspect NATS server logs for ephemeral consumer creation/deletion
+3. Inspect NATS server logs for ephemeral consumer creation/deletion
    churn. Leafnode route flaps and replica failovers are common upstream
    causes.
-3. After Batch B is deployed, confirm clients reconnect with
+4. After Batch B is deployed, confirm clients reconnect with
    `Last-Event-ID` and resume cleanly; the disconnect is by design and
    the client-side retry is the recovery contract.
-4. If the counter ticks during periods of healthy delivery, a real
-   delivery gap (publisher-side issue, stream replication divergence)
-   may be present — cross-reference `nuts_replay_fallbacks_total` and
-   the NATS server's `nats stream report`.
+5. If the counter ticks during periods of healthy delivery (no
+   coincident `connection_events{disconnect}` tick, no server-side
+   consumer churn), a real delivery gap (publisher-side issue, stream
+   replication divergence) may be present — cross-reference
+   `nuts_replay_fallbacks_total` and the NATS server's
+   `nats stream report`.
 
 ## Incident: Stalled writes
 

@@ -58,6 +58,24 @@ const defaultReadinessProbeTimeout = time.Second
 // probe already establishes this pattern at serve.go's serveReadinessCheck.
 const defaultMetadataReadTimeout = 2 * time.Second
 
+// defaultNatsIdleHeartbeatSeconds is the M9 Batch A default for the
+// server-side IdleHeartbeat interval on every JetStream push consumer
+// NUTS opens. Default-on at 10s so the IdleHeartbeat-miss detector
+// can surface a reaped or lost ephemeral consumer without operator
+// intervention. The value is in seconds (not time.Duration) to match
+// the int-seconds shape of NatsIdleHeartbeat on Handler — Validate
+// requires it to stay strictly below defaultConsumerInactiveThreshold/2
+// so two missed heartbeats can be detected before the server reaps.
+//
+// natsIdleHeartbeatDisabledSentinel is the explicit operator-disable
+// value. Validate accepts exactly this value and rejects any other
+// negative input as a likely typo (matching how HeartbeatInterval
+// and ReconnectWait are validated — see validateConfigValues).
+const (
+	defaultNatsIdleHeartbeatSeconds   = 10
+	natsIdleHeartbeatDisabledSentinel = -1
+)
+
 // defaultMaxTopicsPerSubscription bounds how many distinct ?topic= filters
 // a single SSE request may carry when MaxTopicsPerSubscription is 0. A
 // strict default protects NATS from consumer-creation amplification by an
@@ -90,14 +108,15 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.ReconnectWait <= 0 {
 		h.ReconnectWait = 2
 	}
-	// NatsIdleHeartbeat: 0 means "use default" (10s); a negative value is
-	// the explicit operator-disable sentinel and is preserved as-is so
+	// NatsIdleHeartbeat: 0 means "use default" (10s); the explicit
+	// operator-disable sentinel (-1) is preserved as-is so
 	// subscriptionOptions can skip the SubOpt append. Validate has
-	// already rejected positive values >= InactiveThreshold/2 by this
-	// point, so by the time the value is consumed it is guaranteed to
-	// be either a safe positive interval or the disable sentinel.
+	// already rejected positive values >= InactiveThreshold/2 AND any
+	// negative value other than the sentinel by this point, so by the
+	// time the value is consumed it is guaranteed to be either a safe
+	// positive interval or the disable sentinel exactly.
 	if h.NatsIdleHeartbeat == 0 {
-		h.NatsIdleHeartbeat = 10
+		h.NatsIdleHeartbeat = defaultNatsIdleHeartbeatSeconds
 	}
 	// MaxReconnects nil (directive omitted in Caddyfile or absent from JSON)
 	// defaults to -1 (unlimited). An explicit 0 from either source is honoured
@@ -452,13 +471,20 @@ func (h *Handler) validateConfigValues() error {
 	// missed heartbeats before the server reaps the ephemeral via
 	// InactiveThreshold. We pin to the same constant subscriptionOptions
 	// uses (defaultConsumerInactiveThreshold = 30s), so the valid range
-	// is (0, 15). Negative values are the explicit operator-disable
-	// sentinel and skip the bound check. Zero is normalised by Provision
-	// to the default (10), well inside the bound.
+	// is (0, 15). The only accepted negative value is the explicit
+	// operator-disable sentinel (-1) — any other negative is rejected as
+	// a likely typo, matching how heartbeat_interval and reconnect_wait
+	// are validated above. Zero is normalised by Provision to the
+	// default (defaultNatsIdleHeartbeatSeconds = 10), well inside the
+	// bound.
 	idleHeartbeatUpperBound := int(defaultConsumerInactiveThreshold/time.Second) / 2
-	if h.NatsIdleHeartbeat > 0 && h.NatsIdleHeartbeat >= idleHeartbeatUpperBound {
+	switch {
+	case h.NatsIdleHeartbeat > 0 && h.NatsIdleHeartbeat >= idleHeartbeatUpperBound:
 		return fmt.Errorf("nats_idle_heartbeat (%d) must be less than half of InactiveThreshold (%d seconds): two missed heartbeats must be detectable before the server reaps the consumer",
 			h.NatsIdleHeartbeat, int(defaultConsumerInactiveThreshold/time.Second))
+	case h.NatsIdleHeartbeat < 0 && h.NatsIdleHeartbeat != natsIdleHeartbeatDisabledSentinel:
+		return fmt.Errorf("nats_idle_heartbeat (%d) is invalid: the only accepted negative value is %d (operator-disable sentinel) — other negatives are rejected as typos",
+			h.NatsIdleHeartbeat, natsIdleHeartbeatDisabledSentinel)
 	}
 	if h.SubscriberJWTCookie != "" && h.SubscriberJWTKey == "" {
 		return fmt.Errorf("subscriber_jwt_cookie requires subscriber_jwt_key")

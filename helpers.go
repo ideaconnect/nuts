@@ -60,9 +60,17 @@ func (h *Handler) log() *zap.Logger {
 //     blip or a leafnode route failover dropped the inbox.
 //   - nats.ErrConsumerDeleted (sentinel, errors.Is): raised when the
 //     consumer was administratively deleted while a subscription
-//     held it. Push subscribers rarely see this directly (it's more
-//     common on pull paths) but the operator-visible event is the
-//     same — the SSE handler holds a zombie subscription.
+//     held it. In the pinned nats.go v1.52.0 legacy `nats` package
+//     this sentinel is only dispatched from the pull-request 409
+//     status handler (js.go:checkMsg → jetStream409Sts) — push
+//     subscribers like NUTS will not see it via AsyncErrorCB on this
+//     library version (an admin-delete of a push consumer surfaces
+//     via ErrConsumerNotActive once heartbeats stop). The arm is
+//     kept as defensive forward-compat against (a) the newer
+//     github.com/nats-io/nats.go/jetstream subpackage, which DOES
+//     dispatch this sentinel on push paths, and (b) future legacy-
+//     package changes that may unify the push and pull dispatch
+//     sites.
 //   - *nats.ErrConsumerSequenceMismatch (typed struct, errors.As):
 //     raised by checkForSequenceMismatch when heartbeats DO arrive
 //     but the delivered consumer sequence has drifted from the
