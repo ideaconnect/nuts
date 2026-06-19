@@ -356,11 +356,11 @@ func TestSubjectMatchesFilter_GreaterThanTerminatedFilterTokenCount(t *testing.T
 		filter  string
 		want    bool
 	}{
-		{"orders", "orders.>", false},               // FEWER tokens than filter requires
-		{"orders.created", "orders.>", true},        // exactly one trailing token
-		{"orders.created.gold", "orders.>", true},   // multiple trailing tokens
-		{"events.x.y.z", "events.>", true},          // deep nesting
-		{"events", "events.>", false},               // root token only
+		{"orders", "orders.>", false},             // FEWER tokens than filter requires
+		{"orders.created", "orders.>", true},      // exactly one trailing token
+		{"orders.created.gold", "orders.>", true}, // multiple trailing tokens
+		{"events.x.y.z", "events.>", true},        // deep nesting
+		{"events", "events.>", false},             // root token only
 		{"events.foo.bar.baz", "events.foo.>", true},
 		{"events.foo", "events.foo.>", false},
 	}

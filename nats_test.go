@@ -2270,11 +2270,11 @@ func TestHandler_Cleanup_AfterConnectionClosed(t *testing.T) {
 	defer ns.Shutdown()
 
 	h := &Handler{
-		NatsURL:        ns.ClientURL(),
-		StreamName:     "EVENTS",
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
 		HeartbeatInterval: 30,
-		AllowedOrigins: []string{"*"},
-		logger:         zap.NewNop(),
+		AllowedOrigins:    []string{"*"},
+		logger:            zap.NewNop(),
 	}
 	// Drive the connectNATS path directly (we want to inject a
 	// JetStream-failure scenario, which Provision does via conn.JetStream
@@ -2327,9 +2327,9 @@ func TestHandler_ServeHTTP_HeartbeatWriteFailure(t *testing.T) {
 	createTestStream(t, nc, "TEST_EVENTS", []string{"events.>"})
 
 	h := &Handler{
-		NatsURL:           ns.ClientURL(),
-		StreamName:        "TEST_EVENTS",
-		TopicPrefix:       "events.",
+		NatsURL:     ns.ClientURL(),
+		StreamName:  "TEST_EVENTS",
+		TopicPrefix: "events.",
 		// HeartbeatInterval is in SECONDS (see provision.go default 30).
 		// 1 = the minimum supported value; the heartbeat ticker fires
 		// after ~1 s, well before the 4 s ctx deadline below. Don't

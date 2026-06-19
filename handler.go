@@ -194,9 +194,9 @@ type Handler struct {
 //	event: message
 //	data: {"topic":"orders","payload":{"id":1},"time":"2024-01-01T12:00:00Z"}
 type messageEventPayload struct {
-	Topic   string      `json:"topic"`   // Topic name (without the prefix)
+	Topic   string `json:"topic"`   // Topic name (without the prefix)
 	Payload any    `json:"payload"` // Original message body; valid JSON is embedded without numeric coercion
-	Time    string      `json:"time"`    // ISO 8601 timestamp (from JetStream metadata when available)
+	Time    string `json:"time"`    // ISO 8601 timestamp (from JetStream metadata when available)
 }
 
 // CaddyModule returns metadata that tells Caddy about this module.

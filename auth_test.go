@@ -213,10 +213,10 @@ func TestVerifySubscriberJWT_DecodeErrors(t *testing.T) {
 // boundary tests a regression that flips `>` to `>=` or bumps a
 // constant by one would not be caught by example-based coverage.
 //
-// - maxSubscriberJWTLen (8192): the compact token length cap.
-// - maxSubscriberJWTDecodedSegmentLen (6144): a decoded segment cap.
-// - maxSubscribeClaimFilters (128): how many "subscribe" entries a
-//   token may carry.
+//   - maxSubscriberJWTLen (8192): the compact token length cap.
+//   - maxSubscriberJWTDecodedSegmentLen (6144): a decoded segment cap.
+//   - maxSubscribeClaimFilters (128): how many "subscribe" entries a
+//     token may carry.
 func TestAuth_LimitBoundaries(t *testing.T) {
 	now := time.Now()
 	secret := []byte("test-secret-with-enough-entropy-1234567890")

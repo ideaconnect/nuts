@@ -76,6 +76,7 @@ func FuzzIsValidTopic(f *testing.F) {
 //     trailing/consecutive dots, where each dot-separated token is
 //     either "*" or ">" (the latter only as the final token) or a
 //     non-empty string of [A-Za-z0-9_-].
+//
 // The fuzz body asserts every accepted input meets this contract so a
 // regression that opened the filter to whitespace, NULs, $-prefixes,
 // or '>' in non-final position would surface.
