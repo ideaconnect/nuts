@@ -69,7 +69,7 @@ enforced. For public or browser-facing routes, issue short-lived tokens with
 | `client_buffer_size <count>` | `client_buffer_size` | `64` when `0` or omitted | Integer `>= 0` | Per-connection queue length. A full queue disconnects the slow client. |
 | `dispatch_timeout <seconds>` | `dispatch_timeout` | `0` | Integer `>= 0` | `0` leaves the wait unbounded — the NATS callback parks until the SSE loop observes the slow-client signal or the connection tears down. Positive values bound how long a NATS callback waits to signal a slow client after its queue is already full; on expiry the slow-client signal is dropped and `nuts_dispatch_timeout_total` is incremented. |
 | `write_timeout <seconds>` | `write_timeout` | `0` | Integer `>= 0` | `0` leaves write deadlines to Caddy/server config. Positive values set per-frame SSE write deadlines when the response writer supports them. |
-| `replay_max_messages <count>` | `replay_max_messages` | `0` | Integer `>= 0` | `0` is unlimited. When reached during replay, NUTS closes the stream cleanly. |
+| `replay_max_messages <count>` | `replay_max_messages` | `0` | Integer `>= 0` | `0` is unlimited. When reached during replay, NUTS closes the stream cleanly. Conservatively counts subsequent deliveries against the cap when a client reconnects with `last-id` against an empty stream (`LastSeq=0`) or when message metadata is missing — see README "replay_max_messages and replay_window" for the edge case. |
 | `replay_window <seconds>` | `replay_window` | `0` | Integer `>= 0` | `0` preserves retained replay. Positive values bound old replay cursors to `StartTime(now - replay_window)` while preserving exact sequence replay inside the window. |
 
 ## Production Defaults To Revisit

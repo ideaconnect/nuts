@@ -1171,12 +1171,14 @@ func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMess
 // recordDroppedMessage emits the metric and structured log line for a
 // message the formatter decided not to send. Operators rely on these logs
 // to size MaxEventSize correctly without grepping the message payloads.
+//
+// Callers must only invoke this with a formattedMessageEvent where Dropped
+// is true; formatMessageEvent always sets DropReason to one of the two
+// declared constants (dropReasonRawPayload / dropReasonFormattedSSEMessage)
+// at every Dropped=true assignment site, so the metric label set stays
+// bounded to the values documented in README "nuts_messages_dropped_total".
 func (h *Handler) recordDroppedMessage(formatted formattedMessageEvent) {
-	reason := formatted.DropReason
-	if reason == "" {
-		reason = "unknown"
-	}
-	metricsMessagesDropped.WithLabelValues(reason).Inc()
+	metricsMessagesDropped.WithLabelValues(formatted.DropReason).Inc()
 	switch formatted.DropReason {
 	case dropReasonRawPayload:
 		h.log().Warn("dropping oversized NATS payload",

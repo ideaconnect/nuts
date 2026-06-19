@@ -73,8 +73,11 @@ matters:
 
 NUTS subscriber JWTs use HMAC signatures (`HS256`, `HS384`, or `HS512`) and
 must include a `subscribe` claim. Supported filters are exact topic names,
-single-token wildcards such as `orders.*`, tail wildcards such as `tenant-a.>`,
-or `*` / `>` for all topics on the route. Missing, expired, badly signed, or
+single-token wildcards such as `orders.*`, and tail wildcards such as
+`tenant-a.>`. A bare `>` matches every topic on the route per standard NATS
+semantics; a bare `*` is accepted as a NUTS-only alias with the same "every
+topic" meaning, which is more permissive than NATS itself (where bare `*`
+only matches single-token subjects). Missing, expired, badly signed, or
 unauthorized tokens are rejected before an ephemeral JetStream consumer is
 created. The `exp` and `nbf` time claims are optional; when present they are
 enforced. For public or browser-facing routes, issue short-lived tokens with

@@ -478,7 +478,13 @@ this can be tens of thousands of events.
   configured number of historical replay events have been delivered. The
   client reconnects with a fresher `Last-Event-ID` and continues normally.
   The `nuts_replay_cap_reached_total` counter is incremented each time the cap
-  fires.
+  fires. Edge case: when a client reconnects with `last-id` but the stream
+  is empty at that moment (`LastSeq=0`), or a delivered message lacks
+  JetStream metadata, NUTS conservatively counts subsequent deliveries
+  against the cap. This is intentional — it protects the operator's
+  protection budget when the snapshot cannot tell historical replay apart
+  from live traffic — but it does mean the cap can fire after N live
+  messages following such a reconnect rather than after N historical ones.
 - `replay_window <seconds>` time-bounds replay to recent retained messages.
   If the requested cursor is older than the window, NUTS starts replay at
   `now - window`; if the cursor is still inside the window, NUTS preserves
@@ -551,10 +557,14 @@ include a `subscribe` claim listing allowed topic filters before
 }
 ```
 
-Allowed filters use NATS-style tokens: exact topics such as `orders.created`,
-single-token wildcards such as `orders.*`, tail wildcards such as
-`tenant-a.>`, or `*` / `>` to allow every topic on that route. Missing,
-expired, badly signed, or unauthorized tokens are rejected before subscription.
+Allowed filters use NATS subject syntax for compound values — exact topics
+such as `orders.created`, single-token wildcards such as `orders.*`, and tail
+wildcards such as `tenant-a.>`. A bare `>` matches every topic on the route
+(standard NATS semantics). A bare `*` is also accepted with the same "every
+topic" meaning as a NUTS-only convenience alias — note that this is more
+permissive than NATS itself, where a bare `*` matches only single-token
+subjects. Missing, expired, badly signed, or unauthorized tokens are rejected
+before subscription.
 The `exp` and `nbf` time claims are optional; when present they are enforced.
 For public or browser-facing routes, include `exp` and keep tokens compact:
 NUTS rejects compact JWTs over 8 KiB, decoded JWT segments over 6 KiB, and
