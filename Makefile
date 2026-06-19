@@ -2,7 +2,7 @@
 
 DOCKER_COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo docker compose; elif docker-compose version >/dev/null 2>&1; then echo docker-compose; fi)
 FUNCTIONAL_TEST_STRESS_COUNT ?= 3
-NATS_COMPAT_IMAGES ?= nats:2.9-alpine nats:2.12-alpine
+NATS_COMPAT_IMAGES ?= nats:2.9-alpine nats:2.12-alpine nats:2.14-alpine
 GORELEASER_IMAGE ?= goreleaser/goreleaser:v2.8.2
 GOLANGCI_LINT_IMAGE ?= golangci/golangci-lint:v2.11.4
 GREMLINS_VERSION ?= v0.6.0

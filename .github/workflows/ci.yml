@@ -70,7 +70,7 @@ jobs:
         env:
           TEST_BASE_URL: http://localhost:8080
           TEST_NATS_URL: nats://localhost:4222
-          NATS_COMPAT_IMAGES: nats:2.9-alpine nats:2.12-alpine
+          NATS_COMPAT_IMAGES: nats:2.9-alpine nats:2.12-alpine nats:2.14-alpine
         run: make test-functional-matrix
 
       - name: Run functional test stress pass

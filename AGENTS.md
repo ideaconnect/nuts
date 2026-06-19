@@ -111,7 +111,7 @@ go build ./cmd/caddy       # equivalent
 | `make test-performance` | `TestPerformance_*` plus the named hot-path benchmarks. |
 | `make test-functional` | Godog BDD scenarios against the Docker Compose stack. |
 | `make test-functional-stress FUNCTIONAL_TEST_STRESS_COUNT=N` | Repeats the functional suite N times to catch flakes. |
-| `make test-functional-matrix` | Runs functional tests against `nats:2.9-alpine` (pre-multi-filter) and `nats:2.12-alpine`. |
+| `make test-functional-matrix` | Runs functional tests against `nats:2.9-alpine` (pre-multi-filter), `nats:2.12-alpine`, and `nats:2.14-alpine` (matches the embedded `nats-server/v2` major.minor pinned in `go.mod`). |
 | `make test` | `test-unit` + `test-functional`. |
 | `make lint` | golangci-lint via the pinned container image. |
 | `make release-check` | GoReleaser config validation in a container. |
@@ -223,8 +223,8 @@ PRs run, in this order:
 
 1. `gofmt`, `go mod tidy` diff check, golangci-lint, unit tests with coverage,
    focused race tests, `go vet`, `govulncheck`.
-2. Functional test matrix (`nats:2.9-alpine` + `nats:2.12-alpine`) and a
-   3× functional stress pass.
+2. Functional test matrix (`nats:2.9-alpine`, `nats:2.12-alpine`,
+   `nats:2.14-alpine`) and a 3× functional stress pass.
 3. Coverage upload to Codecov.
 4. Production Docker image build + `caddy adapt` validation + Trivy scan +
    SBOM (SPDX JSON) artifact.

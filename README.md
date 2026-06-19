@@ -109,7 +109,7 @@ directory:
 | --- | --- | --- |
 | Go (build) | 1.26.4 (`go.mod`) | Matches the toolchain `Dockerfile` uses. |
 | Caddy | 2.11.x | Embedded via `xcaddy`. Patch bumps tracked in `CHANGELOG.md`. |
-| NATS server | 2.9-alpine | Functional matrix covers `nats:2.9-alpine` and `nats:2.12-alpine` (see [`Makefile`](Makefile) `test-functional-matrix`). The in-process unit suite uses the embedded `nats-server/v2` library pinned in `go.mod`. **Recommendation:** run NATS ≥ 2.10. Pre-2.10 servers lack `ConsumerFilterSubjects`, so multi-topic subscriptions fall back to wildcard-subscribe with client-side filtering — observe `nuts_wildcard_filter_drops_total` to size the impact. |
+| NATS server | 2.9-alpine | Functional matrix covers `nats:2.9-alpine`, `nats:2.12-alpine`, and `nats:2.14-alpine` (see [`Makefile`](Makefile) `test-functional-matrix`). The in-process unit suite uses the embedded `nats-server/v2` library pinned in `go.mod` (same major.minor as the 2.14 matrix line). **Recommendation:** run NATS ≥ 2.10. Pre-2.10 servers lack `ConsumerFilterSubjects`, so multi-topic subscriptions fall back to wildcard-subscribe with client-side filtering — observe `nuts_wildcard_filter_drops_total` to size the impact. |
 
 ## Versioning policy
 

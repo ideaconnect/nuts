@@ -48,6 +48,16 @@ const defaultConsumerInactiveThreshold = 30 * time.Second
 // kubelet's default 1s timeout.
 const defaultReadinessProbeTimeout = time.Second
 
+// defaultMetadataReadTimeout bounds the per-request JetStream metadata
+// reads (StreamInfo + GetMsg in readStreamSnapshot) that run on the SSE
+// connection-setup hot path. Without it, a partially-degraded cluster
+// can stall every new subscription up to nats.go's library default
+// (5s), holding a Caddy handler goroutine and a MaxConnections slot.
+// 2s is more permissive than the readiness probe (which fires
+// frequently) but still well below the library default. The readiness
+// probe already establishes this pattern at serve.go's serveReadinessCheck.
+const defaultMetadataReadTimeout = 2 * time.Second
+
 // defaultMaxTopicsPerSubscription bounds how many distinct ?topic= filters
 // a single SSE request may carry when MaxTopicsPerSubscription is 0. A
 // strict default protects NATS from consumer-creation amplification by an
@@ -192,6 +202,13 @@ func (h *Handler) connectNATS() error {
 		maxReconnects = *h.MaxReconnects
 	}
 	opts := []nats.Option{
+		// nats.Name labels this connection on the NATS server side. It
+		// surfaces in /connz output and in server-side slow-consumer
+		// warnings so operators can attribute a connection to a NUTS
+		// gateway instance among other workloads sharing the cluster.
+		// Without it the connection is anonymous (IP:port only), which
+		// is operationally painful when many Caddy pods share egress.
+		nats.Name("nuts-caddy"),
 		nats.ReconnectWait(time.Duration(h.ReconnectWait) * time.Second),
 		nats.MaxReconnects(maxReconnects),
 

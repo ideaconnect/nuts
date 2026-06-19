@@ -653,9 +653,23 @@ func (p streamPlan) requestedMessageHandler(enqueueMessage nats.MsgHandler) nats
 // skip the round trip entirely. Read failures are logged at debug and
 // return a zero-value snapshot, which downstream code treats as "no
 // snapshot info available".
+//
+// Both metadata reads are bounded by nats.MaxWait(defaultMetadataReadTimeout)
+// so a partially-degraded JetStream cluster cannot stall a new SSE handshake
+// past the per-request budget — without it the calls inherit nats.go's 5s
+// library default and each new subscription would hold a Caddy handler
+// goroutine and consume a MaxConnections slot while the cluster is unhealthy.
+// The readiness probe (serveReadinessCheck) already applies the same pattern
+// with the tighter defaultReadinessProbeTimeout; this is the request-path
+// counterpart. nats.Context is intentionally NOT propagated here: in nats.go
+// passing a non-nil ctx to JS opts takes precedence over MaxWait, which would
+// either disable the bound (no deadline on the inbound request) or invalidate
+// the cached embedded-server StreamInfo response in tests — so the bounded
+// MaxWait carries the protection on its own.
 func (h *Handler) readStreamSnapshot(js streamMetadataReader, plan streamPlan) streamInfoSnapshot {
 	if plan.Replay.HasLastID || len(plan.FullSubjects) > 1 {
-		if info, infoErr := js.StreamInfo(h.StreamName); infoErr == nil {
+		jsOpts := []nats.JSOpt{nats.MaxWait(defaultMetadataReadTimeout)}
+		if info, infoErr := js.StreamInfo(h.StreamName, jsOpts...); infoErr == nil {
 			snapshot := streamInfoSnapshot{
 				HasSnapshot: true,
 				FirstSeq:    info.State.FirstSeq,
@@ -663,7 +677,7 @@ func (h *Handler) readStreamSnapshot(js streamMetadataReader, plan streamPlan) s
 				Subjects:    info.Config.Subjects,
 			}
 			if plan.Replay.HasLastID && h.ReplayWindow > 0 && plan.Replay.StartSequence >= info.State.FirstSeq {
-				if msg, err := js.GetMsg(h.StreamName, plan.Replay.StartSequence); err == nil {
+				if msg, err := js.GetMsg(h.StreamName, plan.Replay.StartSequence, jsOpts...); err == nil {
 					snapshot.StartSequenceTime = msg.Time
 					snapshot.HasStartSequenceTime = true
 				} else {
