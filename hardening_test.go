@@ -823,6 +823,7 @@ func TestHandler_UnmarshalCaddyfile_RejectsNonNumericInt(t *testing.T) {
 		"client_buffer_size -",
 		"dispatch_timeout 1s",
 		"write_timeout 2s",
+		"nats_idle_heartbeat 5x",
 	}
 	for _, line := range cases {
 		line := line
@@ -1049,6 +1050,16 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 			mutate:  func(h *Handler) { h.ReconnectWait = -2 },
 			wantErr: "reconnect_wait",
 		},
+		{
+			name:    "nats_idle_heartbeat at boundary equals InactiveThreshold/2",
+			mutate:  func(h *Handler) { h.NatsIdleHeartbeat = 15 },
+			wantErr: "nats_idle_heartbeat",
+		},
+		{
+			name:    "nats_idle_heartbeat above InactiveThreshold/2",
+			mutate:  func(h *Handler) { h.NatsIdleHeartbeat = 30 },
+			wantErr: "nats_idle_heartbeat",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1152,6 +1163,16 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			name:     "negative reconnect wait",
 			fragment: `"reconnect_wait": -2`,
 			wantErr:  "reconnect_wait",
+		},
+		{
+			name:     "nats_idle_heartbeat at boundary equals InactiveThreshold/2",
+			fragment: `"nats_idle_heartbeat": 15`,
+			wantErr:  "nats_idle_heartbeat",
+		},
+		{
+			name:     "nats_idle_heartbeat above InactiveThreshold/2",
+			fragment: `"nats_idle_heartbeat": 30`,
+			wantErr:  "nats_idle_heartbeat",
 		},
 	}
 
@@ -1262,6 +1283,162 @@ func TestHandler_Provision_PreservesSentinelConfigSemantics(t *testing.T) {
 	if h.ClientBufferSize != defaultClientBufferSize {
 		t.Fatalf("ClientBufferSize = %d, want default %d", h.ClientBufferSize, defaultClientBufferSize)
 	}
+}
+
+// TestHandler_NatsIdleHeartbeat_ConfigContract is the M9 Phase 2 contract
+// test for the nats_idle_heartbeat knob. It pins every interesting input
+// to its expected outcome across the four config surfaces a NUTS
+// deployment can reach: Caddyfile parser, JSON unmarshal, Provision
+// normalisation, Validate. The shape is intentionally exhaustive — the
+// knob is the operator-facing handle for the M9 Batch A→B failure-
+// detection contract and a silent regression on any boundary would
+// silently undermine consumer-invalidation routing.
+func TestHandler_NatsIdleHeartbeat_ConfigContract(t *testing.T) {
+	t.Run("caddyfile parser accepts positive default", func(t *testing.T) {
+		h := parseNatsIdleHeartbeatCaddyfile(t, "10")
+		if h.NatsIdleHeartbeat != 10 {
+			t.Fatalf("Caddyfile NatsIdleHeartbeat = %d, want 10", h.NatsIdleHeartbeat)
+		}
+	})
+	t.Run("caddyfile parser accepts low positive", func(t *testing.T) {
+		h := parseNatsIdleHeartbeatCaddyfile(t, "5")
+		if h.NatsIdleHeartbeat != 5 {
+			t.Fatalf("Caddyfile NatsIdleHeartbeat = %d, want 5", h.NatsIdleHeartbeat)
+		}
+	})
+	t.Run("caddyfile parser accepts operator-disable sentinel", func(t *testing.T) {
+		h := parseNatsIdleHeartbeatCaddyfile(t, "-1")
+		if h.NatsIdleHeartbeat != -1 {
+			t.Fatalf("Caddyfile NatsIdleHeartbeat = %d, want -1 (disable sentinel)", h.NatsIdleHeartbeat)
+		}
+	})
+	t.Run("caddyfile parser preserves zero for Provision-time normalisation", func(t *testing.T) {
+		// Operators who write `nats_idle_heartbeat 0` expect "use the
+		// default" semantics, same as every other int knob in the file
+		// (heartbeat_interval, reconnect_wait, etc.). The parser keeps
+		// the zero; Provision rewrites it to the default. Validate must
+		// also accept 0 because it runs before Provision normalisation
+		// (provision.go:82-83).
+		h := parseNatsIdleHeartbeatCaddyfile(t, "0")
+		if h.NatsIdleHeartbeat != 0 {
+			t.Fatalf("Caddyfile NatsIdleHeartbeat = %d, want 0 (Provision normalises)", h.NatsIdleHeartbeat)
+		}
+	})
+	t.Run("JSON round-trip absent field decodes to zero", func(t *testing.T) {
+		var h Handler
+		if err := json.Unmarshal([]byte(`{"nats_url":"nats://localhost:4222","stream_name":"EVENTS"}`), &h); err != nil {
+			t.Fatalf("json.Unmarshal: %v", err)
+		}
+		if h.NatsIdleHeartbeat != 0 {
+			t.Fatalf("absent JSON field decoded to %d, want 0 (Provision normalises)", h.NatsIdleHeartbeat)
+		}
+	})
+	t.Run("JSON round-trip explicit value preserved through Validate", func(t *testing.T) {
+		var h Handler
+		raw := []byte(`{"nats_url":"nats://localhost:4222","stream_name":"EVENTS","nats_idle_heartbeat":7}`)
+		if err := json.Unmarshal(raw, &h); err != nil {
+			t.Fatalf("json.Unmarshal: %v", err)
+		}
+		if h.NatsIdleHeartbeat != 7 {
+			t.Fatalf("JSON nats_idle_heartbeat decoded to %d, want 7", h.NatsIdleHeartbeat)
+		}
+		if err := h.Validate(); err != nil {
+			t.Fatalf("Validate rejected legitimate value: %v", err)
+		}
+	})
+	t.Run("Provision normalises zero to default 10", func(t *testing.T) {
+		h := provisionNatsIdleHeartbeat(t, 0)
+		defer h.Cleanup()
+		if h.NatsIdleHeartbeat != 10 {
+			t.Fatalf("post-Provision NatsIdleHeartbeat = %d, want 10 default", h.NatsIdleHeartbeat)
+		}
+	})
+	t.Run("Provision preserves explicit positive value", func(t *testing.T) {
+		h := provisionNatsIdleHeartbeat(t, 5)
+		defer h.Cleanup()
+		if h.NatsIdleHeartbeat != 5 {
+			t.Fatalf("post-Provision NatsIdleHeartbeat = %d, want 5", h.NatsIdleHeartbeat)
+		}
+	})
+	t.Run("Provision preserves operator-disable sentinel", func(t *testing.T) {
+		h := provisionNatsIdleHeartbeat(t, -1)
+		defer h.Cleanup()
+		if h.NatsIdleHeartbeat != -1 {
+			t.Fatalf("post-Provision NatsIdleHeartbeat = %d, want -1 (disable sentinel preserved)", h.NatsIdleHeartbeat)
+		}
+	})
+	t.Run("Validate accepts boundary value 14", func(t *testing.T) {
+		// 15 is exactly InactiveThreshold/2 and rejected by the upper
+		// bound; 14 is the largest accepted positive value. Pinning the
+		// boundary on the accepted side guards against an inclusive-vs-
+		// exclusive comparison regression in Validate.
+		h := Handler{NatsURL: "nats://localhost:4222", StreamName: "EVENTS", NatsIdleHeartbeat: 14}
+		if err := h.Validate(); err != nil {
+			t.Fatalf("Validate rejected boundary-1 value: %v", err)
+		}
+	})
+	t.Run("Validate accepts 1", func(t *testing.T) {
+		h := Handler{NatsURL: "nats://localhost:4222", StreamName: "EVENTS", NatsIdleHeartbeat: 1}
+		if err := h.Validate(); err != nil {
+			t.Fatalf("Validate rejected low positive value: %v", err)
+		}
+	})
+	t.Run("Validate accepts zero (Provision normalises)", func(t *testing.T) {
+		h := Handler{NatsURL: "nats://localhost:4222", StreamName: "EVENTS", NatsIdleHeartbeat: 0}
+		if err := h.Validate(); err != nil {
+			t.Fatalf("Validate rejected zero (must pass — Provision normalises): %v", err)
+		}
+	})
+	t.Run("Validate accepts operator-disable sentinel", func(t *testing.T) {
+		h := Handler{NatsURL: "nats://localhost:4222", StreamName: "EVENTS", NatsIdleHeartbeat: -1}
+		if err := h.Validate(); err != nil {
+			t.Fatalf("Validate rejected disable sentinel: %v", err)
+		}
+	})
+}
+
+// parseNatsIdleHeartbeatCaddyfile runs the Caddyfile parser on a minimal
+// nuts block containing only the nats_idle_heartbeat directive and
+// returns the resulting Handler. Helper used by the
+// TestHandler_NatsIdleHeartbeat_ConfigContract sub-tests.
+func parseNatsIdleHeartbeatCaddyfile(t *testing.T, value string) *Handler {
+	t.Helper()
+	input := "nuts {\n    nats_url nats://localhost:4222\n    stream_name EVENTS\n    nats_idle_heartbeat " + value + "\n}"
+	d := caddyfile.NewTestDispenser(input)
+	h := &Handler{}
+	if err := h.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile(%q): %v", value, err)
+	}
+	return h
+}
+
+// provisionNatsIdleHeartbeat dials a real embedded JetStream server and
+// runs Provision so the normalisation path is exercised end-to-end —
+// the alternative (calling validateConfigValues + the normalisation
+// block directly) would skip the public Provision contract that
+// integration with Caddy depends on. The caller is responsible for
+// Cleanup().
+func provisionNatsIdleHeartbeat(t *testing.T, initial int) *Handler {
+	t.Helper()
+	ns := startJetStreamServer(t)
+	t.Cleanup(ns.Shutdown)
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
+		NatsIdleHeartbeat: initial,
+	}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision(initial=%d): %v", initial, err)
+	}
+	return h
 }
 
 func TestHandler_MethodNotAllowed_AllowHeaderOnlyAdvertisesServedMethods(t *testing.T) {

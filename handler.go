@@ -149,6 +149,29 @@ type Handler struct {
 	// ReplayWindow caps replay by time in seconds. 0 preserves retained replay.
 	ReplayWindow int `json:"replay_window,omitempty"`
 
+	// NatsIdleHeartbeat is the interval in seconds at which the JetStream
+	// server emits IdleHeartbeat status messages on a push consumer.
+	// Without it, a server-side ephemeral reaped by InactiveThreshold
+	// during a network blip — or one lost during a leafnode route failover
+	// — stays attached to the SSE handler silently until the client
+	// reconnects for unrelated reasons (the SSE-layer heartbeat only
+	// proves the HTTP socket is open, not that the JetStream push path
+	// is live).
+	//
+	// Default: 10 (seconds). Set to a negative value to disable. 0 (or
+	// unset) is normalised to the default during Provision.
+	//
+	// Constraint enforced by Validate when positive:
+	// NatsIdleHeartbeat < defaultConsumerInactiveThreshold/2 (currently
+	// 15 seconds) so two missed heartbeats are observable before the
+	// server reaps the consumer.
+	//
+	// M9 Batch A surfaces a missed heartbeat as
+	// nuts_nats_async_errors_total{kind="consumer_sequence_mismatch"}
+	// only; Batch B will terminate the affected SSE handler with
+	// disconnect_reason=consumer_invalidated.
+	NatsIdleHeartbeat int `json:"nats_idle_heartbeat,omitempty"`
+
 	// NatsTLSCA is a path to a PEM-encoded CA bundle used to verify the
 	// NATS server certificate.
 	NatsTLSCA string `json:"nats_tls_ca,omitempty"`

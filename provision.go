@@ -90,6 +90,15 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.ReconnectWait <= 0 {
 		h.ReconnectWait = 2
 	}
+	// NatsIdleHeartbeat: 0 means "use default" (10s); a negative value is
+	// the explicit operator-disable sentinel and is preserved as-is so
+	// subscriptionOptions can skip the SubOpt append. Validate has
+	// already rejected positive values >= InactiveThreshold/2 by this
+	// point, so by the time the value is consumed it is guaranteed to
+	// be either a safe positive interval or the disable sentinel.
+	if h.NatsIdleHeartbeat == 0 {
+		h.NatsIdleHeartbeat = 10
+	}
 	// MaxReconnects nil (directive omitted in Caddyfile or absent from JSON)
 	// defaults to -1 (unlimited). An explicit 0 from either source is honoured
 	// as "no reconnects".
@@ -438,6 +447,18 @@ func (h *Handler) validateConfigValues() error {
 	}
 	if h.ReconnectWait < 0 {
 		return fmt.Errorf("reconnect_wait must be >= 0")
+	}
+	// nats_idle_heartbeat upper bound: must leave room for at least two
+	// missed heartbeats before the server reaps the ephemeral via
+	// InactiveThreshold. We pin to the same constant subscriptionOptions
+	// uses (defaultConsumerInactiveThreshold = 30s), so the valid range
+	// is (0, 15). Negative values are the explicit operator-disable
+	// sentinel and skip the bound check. Zero is normalised by Provision
+	// to the default (10), well inside the bound.
+	idleHeartbeatUpperBound := int(defaultConsumerInactiveThreshold/time.Second) / 2
+	if h.NatsIdleHeartbeat > 0 && h.NatsIdleHeartbeat >= idleHeartbeatUpperBound {
+		return fmt.Errorf("nats_idle_heartbeat (%d) must be less than half of InactiveThreshold (%d seconds): two missed heartbeats must be detectable before the server reaps the consumer",
+			h.NatsIdleHeartbeat, int(defaultConsumerInactiveThreshold/time.Second))
 	}
 	if h.SubscriberJWTCookie != "" && h.SubscriberJWTKey == "" {
 		return fmt.Errorf("subscriber_jwt_cookie requires subscriber_jwt_key")

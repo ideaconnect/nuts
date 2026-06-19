@@ -109,6 +109,18 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					h.NatsTLSInsecureSkipVerify = true
 				}
 
+			case "nats_idle_heartbeat":
+				// Range is intentionally not validated here — Provision
+				// normalises 0 to the default, accepts negatives as the
+				// explicit operator-disable sentinel, and Validate
+				// enforces the < InactiveThreshold/2 upper bound. Mirror
+				// the pattern used by reconnect_wait / heartbeat_interval.
+				v, err := parseInt("nats_idle_heartbeat")
+				if err != nil {
+					return err
+				}
+				h.NatsIdleHeartbeat = v
+
 			// --- Optional tuning ---
 
 			case "topic_prefix":
