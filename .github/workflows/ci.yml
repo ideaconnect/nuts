@@ -326,7 +326,7 @@ jobs:
           # Match the pin in release.yml so both signing surfaces
           # (docker image here, checksums.txt in release.yml) use the
           # same cosign binary version.
-          cosign-release: 'v2.4.1'
+          cosign-release: 'v2.6.3'
 
       - name: Sign release image
         if: startsWith(github.ref, 'refs/tags/v')

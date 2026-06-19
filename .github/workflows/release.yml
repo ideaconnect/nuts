@@ -60,7 +60,7 @@ jobs:
           # change in a new cosign minor (e.g. flag rename in
           # sign-blob, OIDC issuer URL handling) cannot land mid-
           # release. Bump in lockstep with the other tools.
-          cosign-release: 'v2.4.1'
+          cosign-release: 'v2.6.3'
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
