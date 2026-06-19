@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-19
+
 ### Added
 - **M9 Batch A — JetStream consumer-invalidation detection.** Closes
   the first half of a two-batch milestone (#9) addressing a silent-
