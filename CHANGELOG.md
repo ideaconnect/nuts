@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README `Compatibility` table (Go, Caddy, NATS minimum tested) and a
   `Versioning policy` section documenting semver discipline, deprecation
   and removal cadence, and the `:latest` Docker-tag warning.
+- Expanded `.github/dependabot.yml` with labels (`dependencies`, `go`/`ci`/`docker`),
+  per-ecosystem `commit-message` prefixes (`deps(go)`, `deps(actions)`,
+  `deps(docker)`), and security-vs-version-update group splitting so
+  CVE-fix PRs aren't held back by churning minor bumps. Same weekly
+  Monday-04:00-UTC cadence so bumps land before the Sunday-03:00-UTC
+  mutation workflow re-tests the resulting tree.
 - New nightly fuzz workflow (`.github/workflows/fuzz.yml`) — five
   matrix jobs, one per `Fuzz*` target in `fuzz_test.go`
   (`FuzzIsValidTopic`, `FuzzIsValidTopicFilter`, `FuzzIsValidCookieName`,
@@ -21,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New live-handshake mTLS integration test
   (`TestHandler_ConnectNATS_TLS_LiveHandshake`) drives `connectNATS`
   against an embedded TLS-enabled NATS server, asserting both
-  positive (`InsecureSkipVerify`) and negative (hostname-mismatch
-  rejection) paths. Catches regressions where `nats.Secure(tlsCfg)`
+  positive (handshake succeeds when the test client trusts the
+  embedded server cert) and negative (hostname-mismatch rejection)
+  paths. Catches regressions where `nats.Secure(tlsCfg)`
   is unwired (e.g. replaced with `nats.RootCAs(...)`), which would
   pass every prior `buildTLSConfig`-only test.
 - New `codecov.yml` with project (`auto` target, 0.5% threshold) and

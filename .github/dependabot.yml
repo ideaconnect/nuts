@@ -1,33 +1,105 @@
+## Dependabot configuration.
+##
+## Covers the three surfaces that ship security risk into the repo:
+##   1. Go module dependencies (go.mod) — runtime + dev deps.
+##   2. GitHub Actions versions — supply-chain risk if an action repo is
+##      compromised under its major tag. Dependabot understands SHA pins
+##      with `# v6`-style trailing comments and bumps both in lockstep,
+##      enabling the SHA-pin hardening pass 8's review flagged.
+##   3. Docker base images (Dockerfile, Dockerfile.test) — Alpine/Caddy
+##      CVE-2026-45135 landed via a base-image float; Dependabot is the
+##      first-line defense ahead of the Trivy scan in ci.yml.
+##
+## Conventions:
+## - Weekly cadence, Monday 04:00 UTC: bumps land before the weekly
+##   Sunday-03:00-UTC mutation cron's next cycle, so a flaky bump can
+##   trip the MSI gate before it merges.
+## - Separate minor+patch vs security-update groups: minor+patch can
+##   land as a single PR per ecosystem to keep the review queue lean;
+##   security updates land separately so a CVE fix isn't held back by
+##   a churning minor bump.
+## - Labels: route PRs to the right reviewer surface without manual
+##   triage.
+## - commit-message prefix: keeps `git log` readable (deps(go), etc.).
+
 version: 2
 updates:
+  # Go module dependencies — runtime + test deps.
   - package-ecosystem: gomod
     directory: /
     schedule:
       interval: weekly
       day: monday
-      time: "06:00"
+      time: '04:00'
+      timezone: Etc/UTC
     open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - go
+    commit-message:
+      # `prefix` alone produces `deps(go): bump x`. Don't set
+      # `include: scope` here — Dependabot would append its own
+      # `(deps)` scope, producing `deps(go)(deps): bump x` (double
+      # parens, ugly, and inconsistent with the documented format).
+      prefix: deps(go)
     groups:
-      go-dependencies:
+      go-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+      go-security:
+        applies-to: security-updates
         patterns:
-          - "*"
+          - '*'
 
-  - package-ecosystem: docker
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-      time: "06:15"
-    open-pull-requests-limit: 5
-
+  # GitHub Actions in .github/workflows/*.yml.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
       day: monday
-      time: "06:30"
+      time: '04:00'
+      timezone: Etc/UTC
     open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: deps(actions)
     groups:
-      github-actions:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+      actions-security:
+        applies-to: security-updates
         patterns:
-          - "*"
+          - '*'
+
+  # Docker base images for both Dockerfile and Dockerfile.test (a single
+  # gomod-style entry covers all Dockerfiles in the directory).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:00'
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - docker
+    commit-message:
+      prefix: deps(docker)
+    groups:
+      docker-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+      docker-security:
+        applies-to: security-updates
+        patterns:
+          - '*'

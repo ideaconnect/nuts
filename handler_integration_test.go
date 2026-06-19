@@ -457,7 +457,7 @@ func generateSelfSignedPEM(t *testing.T) (certPEM, keyPEM []byte) {
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "nuts-test"},
 		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
@@ -609,6 +609,11 @@ func startJetStreamServerWithTLS(t *testing.T, certPEM, keyPEM []byte) *server.S
 		t.Fatalf("server.NewServer: %v", err)
 	}
 	go ns.Start()
+	// Register shutdown BEFORE the readiness check so a 5 s flake
+	// (e.g. under heavy CI load) doesn't t.Fatal with the server
+	// goroutine and its listening socket still alive — repeated under
+	// stress runs that leaks ports and breaks sibling tests.
+	t.Cleanup(ns.Shutdown)
 	if !ns.ReadyForConnections(5 * time.Second) {
 		t.Fatal("TLS NATS server not ready")
 	}
@@ -625,7 +630,6 @@ func startJetStreamServerWithTLS(t *testing.T, certPEM, keyPEM []byte) *server.S
 func TestHandler_ConnectNATS_TLS_LiveHandshake(t *testing.T) {
 	certPEM, keyPEM := generateSelfSignedPEM(t)
 	ns := startJetStreamServerWithTLS(t, certPEM, keyPEM)
-	defer ns.Shutdown()
 
 	t.Run("InsecureSkipVerify connects against self-signed CN-only cert", func(t *testing.T) {
 		h := &Handler{
@@ -663,12 +667,17 @@ func TestHandler_ConnectNATS_TLS_LiveHandshake(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected handshake failure for hostname-mismatched self-signed CA")
 		}
-		// nats.go wraps the verifier error; the underlying x509 error
-		// mentions either "valid for" or "doesn't contain any IP SANs".
-		// Either substring confirms TLS verification ran.
+		// nats.go wraps the verifier error; the underlying x509 error for
+		// our CN-only cert dialled by IP is:
+		//   "x509: cannot validate certificate for 127.0.0.1 because it
+		//    doesn't contain any IP SANs"
+		// We pin to the IP-SAN phrase: it is emitted only by the x509
+		// verifier during the handshake, so a pass here cannot be faked
+		// by a setup-time error from buildTLSConfig (which uses phrases
+		// like "no certificates found in" or "read nats_tls_ca").
 		msg := err.Error()
-		if !strings.Contains(msg, "valid") && !strings.Contains(msg, "SAN") && !strings.Contains(msg, "certificate") {
-			t.Fatalf("error %q doesn't look like a TLS verification failure; nats.Secure(tlsCfg) may not be wiring buildTLSConfig's output", msg)
+		if !strings.Contains(msg, "doesn't contain any IP SANs") {
+			t.Fatalf("error %q doesn't look like an x509 hostname-mismatch failure; nats.Secure(tlsCfg) may not be wiring buildTLSConfig's output", msg)
 		}
 	})
 }

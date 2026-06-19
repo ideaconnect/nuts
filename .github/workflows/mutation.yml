@@ -122,13 +122,20 @@ jobs:
           # the previous-run lookup matches the dispatched branch (usually
           # zero successful runs) and silently sets has_previous=false,
           # making the regression check a no-op on non-main dispatches.
+          #
+          # Use `.[0]` (not `.[1]`): the current run is still in progress
+          # here so it is not yet `--status=success` and therefore not in
+          # the list; on a feature-branch workflow_dispatch it isn't a main
+          # run at all. In both cases `.[0]` is the most recent prior
+          # successful main run — the correct baseline. `.[1]` would pick
+          # the second-newest, an off-by-one too-old comparison.
           prev=$(gh run list \
             --workflow=mutation.yml \
             --branch=main \
             --status=success \
-            --limit=2 \
+            --limit=1 \
             --json databaseId \
-            --jq '.[1].databaseId' || echo "")
+            --jq '.[0].databaseId' || echo "")
           if [ -z "$prev" ] || [ "$prev" = "null" ]; then
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
             exit 0
