@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-05
+
+Documentation and project-site release. **No module code changes** — the `nuts`
+handler behaviour, Caddyfile directives, JSON fields, and metrics are identical
+to 0.4.0. Upgrade urgency: none.
+
+### Added
+- Project marketing/documentation website integrated in-repo under `website/`
+  (Jekyll + Tailwind CSS), published to <https://idct.tech/nuts> via GitHub Pages
+  on tagged releases ([.github/workflows/website.yml](.github/workflows/website.yml)).
+  Containerised local build with no host Ruby/Node required:
+  `make website-build` / `make website-serve` / `make website-clean`.
+
+### Fixed
+- Website documentation brought in line with the current module: the
+  `max_connections` rejection is documented as `429 Too Many Requests` (not the
+  pre-0.4.0 `503`), the `nats_idle_heartbeat` directive is added, and the
+  Prometheus metrics reference is completed (all 16 `nuts_*` series). Corrected
+  the README project-site link to `https://idct.tech/nuts` and the
+  `max_connections` status note in `AGENTS.md`.
+
+### Changed
+- `.dockerignore` excludes `website/` from the production image build context so
+  website-only edits no longer invalidate the Go builder-layer cache. The
+  released `idcttech/nuts` image is unaffected (multi-stage build copies only the
+  binary).
+
 ## [0.4.0] - 2026-06-19
 
 ### Added
