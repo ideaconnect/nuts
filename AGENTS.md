@@ -36,7 +36,7 @@ to replace it.
   `subscriber_jwt_cookie`) with HMAC-signed tokens and a `subscribe` claim
   for per-topic authorisation.
 - Configurable CORS (`allowed_origins`, `allowed_headers`, `allowed_methods`).
-- Connection cap (`max_connections`) with `503` + `Retry-After` rejection.
+- Connection cap (`max_connections`) with `429` + `Retry-After` rejection.
 - Per-frame write deadlines (`write_timeout`) and slow-client signal bounds
   (`dispatch_timeout`).
 - Probes: `live_path` (`/livez`), `ready_path` (`/readyz`), and the legacy
@@ -90,6 +90,7 @@ Operational and deployment assets:
 | [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml), [ops/grafana-dashboard.json](ops/grafana-dashboard.json) | Reference alerts and dashboard. |
 | [scripts/](scripts/) | Helper scripts (e.g. `setup-dev.sh`). |
 | [docs/](docs/) | All in-depth documentation; see the index in [README.md](README.md#further-documentation). |
+| [website/](website/) | Marketing/docs site (Jekyll + Tailwind) published to `https://idct.tech/nuts`. Has its own guidelines in [website/AGENTS.md](website/AGENTS.md). |
 
 ## How to run things
 
@@ -136,6 +137,25 @@ make lint
 ```
 
 The full PR checklist is [CONTRIBUTING.md § Contribution checklist](CONTRIBUTING.md#contribution-checklist).
+
+### Website
+
+The site under [website/](website/) is a Jekyll + Tailwind project served at
+`https://idct.tech/nuts` (the org's `idct.tech` Pages custom domain makes this
+project repo resolve at the `/nuts` subpath, so `baseurl` is `/nuts`). Build it
+through the containerised toolchain — Docker is the only prerequisite:
+
+```bash
+make website-build     # production build → website/_site (mirrors CI)
+make website-serve     # livereload dev server at http://localhost:4000/nuts/
+make website-clean     # remove generated output
+```
+
+Deployment is automatic: [.github/workflows/website.yml](.github/workflows/website.yml)
+builds and deploys to GitHub Pages on every `v*` tag. Internal links and assets
+must go through `relative_url` (or `{{ site.baseurl }}`) so the `/nuts` prefix is
+applied — never hard-code root-absolute paths. Deeper conventions are in
+[website/AGENTS.md](website/AGENTS.md).
 
 ## Coding conventions
 
@@ -217,7 +237,8 @@ that gap before review starts, instead of leaking it into review load.
 ## CI and release surfaces
 
 CI is GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml),
-[.github/workflows/release.yml](.github/workflows/release.yml)).
+[.github/workflows/release.yml](.github/workflows/release.yml),
+[.github/workflows/website.yml](.github/workflows/website.yml)).
 
 PRs run, in this order:
 
@@ -240,6 +261,9 @@ Pushes to `main`/`master` and `v*` tags additionally:
    keyless via Cosign + GitHub OIDC.
 3. Update the Docker Hub description from [DOCKERHUB_README.md](DOCKERHUB_README.md).
 4. GoReleaser publishes archives and SBOMs for the tag.
+5. Build the [website/](website/) Jekyll site and deploy it to GitHub Pages at
+   `https://idct.tech/nuts` ([website.yml](.github/workflows/website.yml); also
+   runnable on demand via `workflow_dispatch`).
 
 Release surfaces and verification commands are documented in
 [docs/RELEASE.md](docs/RELEASE.md). Operator-facing release notes follow the

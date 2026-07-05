@@ -1,0 +1,11 @@
+# Keep the build context small and let the image install its own deps.
+.git
+.github
+.bundle
+vendor
+node_modules
+_site
+.jekyll-cache
+.jekyll-metadata
+.sass-cache
+assets/css/dist

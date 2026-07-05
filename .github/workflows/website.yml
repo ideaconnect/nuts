@@ -1,0 +1,78 @@
+name: Website
+
+# Builds the Jekyll site under website/ and deploys it to GitHub Pages at
+# https://idct.tech/nuts. Because the org's Pages custom domain is idct.tech,
+# this project repo is served at the /nuts subpath (baseurl in
+# website/_config.yml). Deploys ship in lockstep with module releases (v* tags);
+# workflow_dispatch allows a manual redeploy without cutting a tag.
+#
+# Prerequisite (one-time, repo Settings → Pages): set the build source to
+# "GitHub Actions". No CNAME lives in this repo — the apex domain belongs to
+# the org's <org>.github.io Pages site, which projects inherit the subpath from.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialize Pages deploys; a newer run supersedes an in-flight one.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: website
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+          working-directory: website
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build site
+        run: make build
+        env:
+          JEKYLL_ENV: production
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # Path is relative to the workspace root, not the working-directory.
+          path: website/_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

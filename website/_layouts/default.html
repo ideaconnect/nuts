@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>
+    // Progressive enhancement: reveal-on-scroll hides .reveal only while JS runs.
+    // If effects.js never initialises (blocked / 404 / throws), drop the flag
+    // after a grace period so no .reveal content is stranded invisible.
+    document.documentElement.classList.add('js');
+    window.setTimeout(function () {
+      if (!window.__nutsReveal) document.documentElement.classList.remove('js');
+    }, 2500);
+  </script>
+  {% seo %}
+  <meta name="theme-color" content="#0B0F1A">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127837;</text></svg>">
+  <link rel="apple-touch-icon" href="{{ '/media/apple-touch-icon.png' | relative_url }}">
+  <link rel="preconnect" href="https://fonts.bunny.net" crossorigin>
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link rel="stylesheet" href="https://fonts.bunny.net/css?family=space-grotesk:600,700|inter:400,500,600|jetbrains-mono:400,500&display=swap">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/styles/atom-one-dark.min.css">
+  <link rel="stylesheet" href="{{ '/assets/css/dist/main.css' | relative_url }}">
+  <style>
+    main .grid > * { min-width: 0; }
+    .code-block,
+    .prose pre { max-width: 100%; }
+    .code-block pre,
+    .prose pre {
+      margin: 0;
+      overflow-x: auto;
+      overscroll-behavior-inline: contain;
+    }
+    .code-block pre code,
+    .code-block pre code.hljs {
+      background: transparent;
+      padding: 1.25rem;
+      font-size: 0.875rem;
+      line-height: 1.6;
+      display: block;
+      min-width: max-content;
+    }
+    .prose :where(code):not(:where(pre code)) {
+      overflow-wrap: anywhere;
+    }
+    .copy-btn.copied { background: #15803d; color: #fff; opacity: 1; }
+  </style>
+</head>
+<body class="bg-base text-ink-200 font-sans antialiased">
+  <a href="#main" class="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-[100] focus:px-4 focus:py-2 focus:rounded-lg focus:bg-elevated focus:text-ink-50 focus:ring-2 focus:ring-focus">Skip to content</a>
+  {% include header.html %}
+
+  <main id="main">
+    {{ content }}
+  </main>
+
+  {% include footer.html %}
+
+  <script defer src="{{ '/assets/js/effects.js' | relative_url }}"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/languages/nginx.min.js"></script>
+  <script>
+    hljs.highlightAll();
+    document.querySelectorAll('.code-block').forEach(function (block) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'copy-btn absolute top-2.5 right-2.5 z-10 px-2.5 py-1 rounded-md bg-white/5 hover:bg-white/10 text-ink-300 border border-white/10 backdrop-blur text-xs font-medium opacity-0 group-hover:opacity-100 focus:opacity-100 transition';
+      btn.setAttribute('aria-label', 'Copy code');
+      btn.innerHTML = '<i class="fa-regular fa-copy"></i> Copy';
+      btn.addEventListener('click', function () {
+        var code = block.querySelector('code');
+        if (!code) return;
+        navigator.clipboard.writeText(code.innerText).then(function () {
+          btn.classList.add('copied');
+          btn.innerHTML = '<i class="fa-solid fa-check"></i> Copied';
+          setTimeout(function () {
+            btn.classList.remove('copied');
+            btn.innerHTML = '<i class="fa-regular fa-copy"></i> Copy';
+          }, 1600);
+        });
+      });
+      block.appendChild(btn);
+    });
+  </script>
+</body>
+</html>

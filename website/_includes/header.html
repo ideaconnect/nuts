@@ -1,0 +1,48 @@
+<header id="site-header" class="sticky top-0 z-50 glass !rounded-none border-x-0 border-t-0 border-b border-hairline">
+  <nav class="max-w-6xl mx-auto px-4 py-3.5 flex items-center justify-between">
+    <a href="{{ '/' | relative_url }}" class="group flex items-center shrink-0" aria-label="NUTS home">
+      <span class="inline-flex items-center rounded-lg bg-white px-2.5 py-1.5 ring-1 ring-black/5 shadow-sm transition-transform duration-200 group-hover:scale-[1.03]">
+        <img src="{{ '/media/nuts-horizontal.png' | relative_url }}" alt="NUTS" class="h-6 w-auto">
+      </span>
+    </a>
+    <div class="hidden md:flex items-center gap-6 text-sm font-medium">
+      <a href="{{ '/features/' | relative_url }}" class="navlink text-ink-300 hover:text-ink-50 transition-colors"{% if page.url == '/features/' %} aria-current="page"{% endif %}>Features</a>
+      <a href="{{ '/docs/building/' | relative_url }}" class="navlink text-ink-300 hover:text-ink-50 transition-colors"{% if page.url == '/docs/building/' %} aria-current="page"{% endif %}>Building</a>
+      <a href="{{ '/docs/usage/' | relative_url }}" class="navlink text-ink-300 hover:text-ink-50 transition-colors"{% if page.url == '/docs/usage/' %} aria-current="page"{% endif %}>Usage</a>
+      <a href="{{ '/docs/contributing/' | relative_url }}" class="navlink text-ink-300 hover:text-ink-50 transition-colors"{% if page.url == '/docs/contributing/' %} aria-current="page"{% endif %}>Contributing</a>
+      <a href="{{ '/contact/' | relative_url }}" class="navlink text-ink-300 hover:text-ink-50 transition-colors"{% if page.url == '/contact/' %} aria-current="page"{% endif %}>Contact</a>
+      <span class="w-px h-5 bg-hairline" aria-hidden="true"></span>
+      <a href="https://github.com/ideaconnect/nuts" class="text-ink-400 hover:text-flux-400 transition-colors" aria-label="GitHub" title="Check the GitHub Source Code"><i class="fa-brands fa-github text-xl"></i></a>
+      <a href="https://discord.gg/uYsuaa8HNm" class="text-ink-400 hover:text-flux-400 transition-colors" aria-label="Discord" title="Join our Discord"><i class="fa-brands fa-discord text-xl"></i></a>
+      <a href="https://github.com/sponsors/ideaconnect" class="text-pink-400 hover:text-pink-300 transition-colors" aria-label="Sponsor" title="Sponsor the project"><i class="fa-solid fa-heart text-xl"></i></a>
+      <a href="https://buymeacoffee.com/idct" class="text-ink-400 hover:text-ink-50 transition-colors" aria-label="Buy Me a Coffee" title="Buy me a coffee"><img src="{{ '/media/bmc-brand-icon.png' | relative_url }}" alt="Buy Me a Coffee" class="h-5 inline-block"></a>
+    </div>
+    <button id="mobile-menu-btn" class="md:hidden p-2 text-ink-300 hover:text-ink-50 transition-colors" aria-label="Toggle menu" aria-expanded="false" aria-controls="mobile-menu">
+      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
+      </svg>
+    </button>
+  </nav>
+  <div id="mobile-menu" class="hidden md:hidden px-4 pb-4 space-y-1 text-sm font-medium border-t border-hairline bg-surface/95">
+    <a href="{{ '/features/' | relative_url }}" class="block py-2 text-ink-300 hover:text-ink-50 aria-[current=page]:text-ink-50 transition-colors"{% if page.url == '/features/' %} aria-current="page"{% endif %}>Features</a>
+    <a href="{{ '/docs/building/' | relative_url }}" class="block py-2 text-ink-300 hover:text-ink-50 aria-[current=page]:text-ink-50 transition-colors"{% if page.url == '/docs/building/' %} aria-current="page"{% endif %}>Building</a>
+    <a href="{{ '/docs/usage/' | relative_url }}" class="block py-2 text-ink-300 hover:text-ink-50 aria-[current=page]:text-ink-50 transition-colors"{% if page.url == '/docs/usage/' %} aria-current="page"{% endif %}>Usage</a>
+    <a href="{{ '/docs/contributing/' | relative_url }}" class="block py-2 text-ink-300 hover:text-ink-50 aria-[current=page]:text-ink-50 transition-colors"{% if page.url == '/docs/contributing/' %} aria-current="page"{% endif %}>Contributing</a>
+    <a href="{{ '/contact/' | relative_url }}" class="block py-2 text-ink-300 hover:text-ink-50 aria-[current=page]:text-ink-50 transition-colors"{% if page.url == '/contact/' %} aria-current="page"{% endif %}>Contact</a>
+    <div class="flex items-center gap-5 pt-3 mt-2 border-t border-hairline">
+      <a href="https://github.com/ideaconnect/nuts" class="text-ink-400 hover:text-flux-400 transition-colors" aria-label="GitHub"><i class="fa-brands fa-github text-xl"></i></a>
+      <a href="https://discord.gg/uYsuaa8HNm" class="text-ink-400 hover:text-flux-400 transition-colors" aria-label="Discord"><i class="fa-brands fa-discord text-xl"></i></a>
+      <a href="https://github.com/sponsors/ideaconnect" class="text-pink-400 hover:text-pink-300 transition-colors" aria-label="Sponsor"><i class="fa-solid fa-heart text-xl"></i></a>
+      <a href="https://buymeacoffee.com/idct" class="text-ink-400 hover:text-ink-50 transition-colors" aria-label="Buy Me a Coffee"><img src="{{ '/media/bmc-brand-icon.png' | relative_url }}" alt="Buy Me a Coffee" class="h-5 inline-block"></a>
+    </div>
+  </div>
+  <script>
+    (function () {
+      var btn = document.getElementById('mobile-menu-btn'), menu = document.getElementById('mobile-menu');
+      btn.addEventListener('click', function () {
+        var open = menu.classList.toggle('hidden') === false;
+        btn.setAttribute('aria-expanded', String(open));
+      });
+    })();
+  </script>
+</header>

@@ -1,0 +1,29 @@
+---
+layout: default
+title: "404 – Page not found"
+description: "The page you're looking for doesn't exist."
+permalink: /404.html
+---
+
+<section class="relative overflow-hidden min-h-[70vh] flex items-center">
+  <div class="aurora" aria-hidden="true">
+    <span class="aurora__blob aurora__blob--warm"></span>
+    <span class="aurora__blob aurora__blob--cool"></span>
+    <span class="aurora__blob aurora__blob--violet"></span>
+    <div class="aurora__grid"></div>
+    <div class="aurora__grain"></div>
+    <div class="aurora__scrim"></div>
+  </div>
+  <div class="relative z-10 max-w-2xl mx-auto px-4 py-24 text-center">
+    <p class="eyebrow justify-center">Error 404</p>
+    <h1 class="mt-5 font-display font-semibold tracking-tightest leading-none text-[clamp(4rem,18vw,9rem)]">
+      <span class="bg-seam bg-clip-text text-transparent">404</span>
+    </h1>
+    <p class="mt-4 text-xl text-ink-100">This page slipped through the stream.</p>
+    <p class="mt-2 text-ink-400">The URL doesn't exist &mdash; it may have moved, or was never published.</p>
+    <div class="mt-8 flex flex-wrap gap-3 justify-center">
+      <a href="{{ '/' | relative_url }}" class="btn btn--primary">Back to Home</a>
+      <a href="{{ '/docs/' | relative_url }}" class="btn btn--ghost">Read the Docs</a>
+    </div>
+  </div>
+</section>

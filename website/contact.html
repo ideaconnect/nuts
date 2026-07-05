@@ -1,0 +1,47 @@
+---
+layout: default
+title: "Contact"
+description: "Get in touch with the NUTS project team"
+---
+
+<section class="max-w-2xl mx-auto px-4 py-20">
+  <div class="text-center reveal">
+    <span class="eyebrow eyebrow--warm justify-center">Get in touch</span>
+    <h1 class="mt-4 font-display font-semibold text-ink-50 tracking-tighter text-4xl md:text-5xl">Contact Us</h1>
+    <p class="mt-4 text-ink-300">Have a question or feedback about NUTS? Send us a message.</p>
+  </div>
+
+  <form id="contact-form" action="https://api.web3forms.com/submit" method="POST" class="reveal glass mt-10 p-6 sm:p-8 space-y-6" style="--i:1">
+    <input type="hidden" name="access_key" value="3bb680f8-d4ed-4eb6-a7e5-f3650c726b8f">
+    <input type="hidden" name="redirect" value="https://idct.tech/nuts/contact/thanks/">
+
+    <div>
+      <label for="name" class="block text-sm font-medium text-ink-300">Name</label>
+      <input type="text" name="name" id="name" required
+        class="mt-1 block w-full rounded-lg bg-surface border border-ink-400 px-4 py-3 text-ink-100 placeholder-ink-400 focus:border-flux-400 focus:ring-1 focus:ring-flux-400 focus:outline-none transition-colors">
+    </div>
+
+    <div>
+      <label for="email" class="block text-sm font-medium text-ink-300">Email</label>
+      <input type="email" name="email" id="email" required
+        class="mt-1 block w-full rounded-lg bg-surface border border-ink-400 px-4 py-3 text-ink-100 placeholder-ink-400 focus:border-flux-400 focus:ring-1 focus:ring-flux-400 focus:outline-none transition-colors">
+    </div>
+
+    <div>
+      <label for="message" class="block text-sm font-medium text-ink-300">Message</label>
+      <textarea name="message" id="message" rows="5" required
+        class="mt-1 block w-full rounded-lg bg-surface border border-ink-400 px-4 py-3 text-ink-100 placeholder-ink-400 focus:border-flux-400 focus:ring-1 focus:ring-flux-400 focus:outline-none transition-colors"></textarea>
+    </div>
+
+    <div class="flex justify-center">
+      <div class="h-captcha" data-captcha="true"></div>
+    </div>
+
+    <div class="text-center">
+      <button type="submit" id="contact-submit" class="btn btn--primary px-8">Send Message</button>
+    </div>
+  </form>
+</section>
+
+<script src="https://web3forms.com/client/script.js" async defer></script>
+<script src="{{ '/assets/js/contact-hcaptcha.js' | relative_url }}" defer></script>

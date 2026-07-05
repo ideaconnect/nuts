@@ -1,0 +1,37 @@
+title: "NUTS – NATS to SSE for Caddy"
+description: "A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Events (SSE)"
+url: "https://idct.tech"
+baseurl: "/nuts"
+
+permalink: pretty
+
+# Social/share preview image. jekyll-seo-tag emits og:image + twitter:image from
+# page.image; this default applies it site-wide (site.image is not read by 2.8).
+# absolute_url resolves it to https://idct.tech/nuts/media/nuts-logo.png.
+defaults:
+  - scope:
+      path: ""
+    values:
+      image: /media/nuts-logo.png
+
+markdown: kramdown
+highlighter: rouge
+
+exclude:
+  - node_modules
+  - Gemfile
+  - Gemfile.lock
+  - package.json
+  - package-lock.json
+  - postcss.config.js
+  - tailwind.config.js
+  - AGENTS.md
+  - README.md
+  - vendor
+  - Dockerfile
+  - Makefile
+  - assets/css/main.css
+
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap

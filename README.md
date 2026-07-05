@@ -1,6 +1,6 @@
 <p align="center">
   <img src="media/nuts-logo.png" alt="NUTS logo" /><br/>
-  <a href="https://nuts.idct.tech">https://nuts.idct.tech</a>
+  <a href="https://idct.tech/nuts">https://idct.tech/nuts</a>
 </p>
 
 # 🥜 NUTS - NATS to SSE for Caddy

@@ -1,4 +1,4 @@
-.PHONY: all build test test-unit test-performance test-functional test-functional-dev test-functional-stress test-functional-matrix release-check docker-up wait-functional-stack docker-down docker-logs mutate mutate-pkg mutate-tools clean
+.PHONY: all build test test-unit test-performance test-functional test-functional-dev test-functional-stress test-functional-matrix release-check docker-up wait-functional-stack docker-down docker-logs mutate mutate-pkg mutate-tools clean website-build website-serve website-clean
 
 DOCKER_COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo docker compose; elif docker-compose version >/dev/null 2>&1; then echo docker-compose; fi)
 FUNCTIONAL_TEST_STRESS_COUNT ?= 3
@@ -7,6 +7,9 @@ GORELEASER_IMAGE ?= goreleaser/goreleaser:v2.8.2
 GOLANGCI_LINT_IMAGE ?= golangci/golangci-lint:v2.11.4
 GREMLINS_VERSION ?= v0.6.0
 MUTATION_OUTPUT_DIR ?= docs/mutation/runs
+WEBSITE_DIR ?= website
+WEBSITE_DEV_IMAGE ?= nuts-website:dev
+WEBSITE_SERVE_PORT ?= 4000
 
 # Default target
 all: build test
@@ -193,6 +196,33 @@ fmt:
 lint:
 	docker run --rm -v "$(CURDIR):/app" -w /app $(GOLANGCI_LINT_IMAGE) golangci-lint run
 
+# --- Website (docs/marketing site under website/) -----------------------------
+# The site is a Jekyll + Tailwind project deployed to GitHub Pages at
+# https://idct.tech/nuts on every v* tag (see .github/workflows/website.yml).
+# These targets containerise the Ruby + Node toolchain (website/Dockerfile) so
+# no local install is needed — Docker is the only prerequisite.
+
+# Build the production site into website/_site. Mirrors what GitHub Pages runs.
+website-build:
+	DOCKER_BUILDKIT=1 docker build --target artifact \
+		--output "type=local,dest=$(WEBSITE_DIR)/_site" $(WEBSITE_DIR)
+	@echo "Website built to $(WEBSITE_DIR)/_site"
+
+# Serve the site locally with livereload at
+# http://localhost:$(WEBSITE_SERVE_PORT)/nuts/. Source is bind-mounted so edits
+# rebuild live; the anonymous volume keeps the image's node_modules from being
+# shadowed by the mount.
+website-serve:
+	docker build --target dev -t $(WEBSITE_DEV_IMAGE) $(WEBSITE_DIR)
+	docker run --rm -it \
+		-p $(WEBSITE_SERVE_PORT):4000 -p 35729:35729 \
+		-v "$(CURDIR)/$(WEBSITE_DIR):/site" -v /site/node_modules \
+		$(WEBSITE_DEV_IMAGE)
+
+# Remove generated website output.
+website-clean:
+	rm -rf $(WEBSITE_DIR)/_site $(WEBSITE_DIR)/assets/css/dist
+
 # Show help
 help:
 	@echo "Available targets:"
@@ -215,3 +245,6 @@ help:
 	@echo "  mutate-tools     - Install gremlins (mutation testing binary)"
 	@echo "  mutate           - Run gremlins on the whole module (Docker NATS up/down)"
 	@echo "  mutate-pkg PKG=… - Run gremlins on a single file/dir (e.g. PKG=auth.go)"
+	@echo "  website-build    - Build the website into website/_site (Docker)"
+	@echo "  website-serve    - Serve the website locally with livereload (Docker)"
+	@echo "  website-clean    - Remove generated website output"

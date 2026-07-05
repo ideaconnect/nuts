@@ -1,0 +1,189 @@
+---
+layout: default
+title: "Features – NUTS"
+description: "Everything NUTS gives you — SSE streaming from NATS JetStream, replay, JWT auth, TLS, Prometheus metrics, slow-client safety, and more."
+permalink: /features/
+---
+
+<!-- ============ HERO ============ -->
+<section class="relative overflow-hidden">
+  <div class="aurora" aria-hidden="true" data-parallax data-speed=".08">
+    <span class="aurora__blob aurora__blob--warm"></span>
+    <span class="aurora__blob aurora__blob--cool"></span>
+    <span class="aurora__blob aurora__blob--violet"></span>
+    <div class="aurora__grid"></div>
+    <div class="aurora__grain"></div>
+    <div class="aurora__scrim"></div>
+  </div>
+  <div class="relative z-10 max-w-4xl mx-auto px-4 pt-24 pb-16 text-center">
+    <span class="eyebrow reveal" style="--i:0">Built for production</span>
+    <h1 class="reveal mt-5 font-display font-semibold text-ink-50 tracking-tightest leading-[1.03] text-[clamp(2.5rem,6vw,4.5rem)]" style="--i:1">
+      Everything, <span class="bg-seam bg-clip-text text-transparent">baked in</span>
+    </h1>
+    <p class="reveal mt-6 text-xl text-ink-300 max-w-3xl mx-auto leading-relaxed" style="--i:2">
+      NUTS turns a NATS JetStream into a browser-friendly, replayable event stream &mdash; with the operational guard rails you need to run it in production.
+    </p>
+  </div>
+</section>
+
+<!-- ============ STREAMING ============ -->
+<section class="max-w-5xl mx-auto px-4 py-16">
+  <span class="eyebrow eyebrow--warm reveal">Streaming</span>
+  <h2 class="reveal mt-4 font-display font-semibold text-ink-50 tracking-tighter text-[clamp(1.75rem,3.5vw,2.5rem)]">Push the moment it happens</h2>
+  <div class="mt-8 grid md:grid-cols-2 gap-6">
+    <div class="card card--cool reveal p-6" style="--i:0">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-flux-400/10 text-flux-300 ring-1 ring-flux-400/25 mb-4"><i class="fa-solid fa-bolt"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">Real-time SSE</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">Stream NATS messages directly to browsers using the standard <code class="font-mono text-flux-300">EventSource</code> API. No WebSocket bridge, no polling, no client SDK.</p>
+    </div>
+    <div class="card card--cool reveal p-6" style="--i:1">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-flux-400/10 text-flux-300 ring-1 ring-flux-400/25 mb-4"><i class="fa-solid fa-layer-group"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">Multiple topics per connection</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">Subscribe to several NATS subjects in a single SSE stream via repeated <code class="font-mono text-flux-300">?topic=</code> params or path-based shorthand.</p>
+    </div>
+    <div class="card reveal p-6" style="--i:0">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-tag"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">Topic prefixing</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">Apply a server-side <code class="font-mono text-nuts-300">topic_prefix</code> so clients use friendly names while NUTS subscribes to the fully-qualified NATS subjects.</p>
+    </div>
+    <div class="card reveal p-6" style="--i:1">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-heart-pulse"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">Heartbeat keep-alives</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">Configurable heartbeat frames keep idle connections open through proxies and CDNs.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PERSISTENCE & REPLAY ============ -->
+<section class="border-y border-hairline bg-surface/40">
+  <div class="max-w-5xl mx-auto px-4 py-16">
+    <span class="eyebrow eyebrow--warm reveal">Persistence &amp; replay</span>
+    <h2 class="reveal mt-4 font-display font-semibold text-ink-50 tracking-tighter text-[clamp(1.75rem,3.5vw,2.5rem)]">Durable by default, resumable by design</h2>
+    <div class="mt-8 grid md:grid-cols-2 gap-6">
+      <div class="card reveal p-6" style="--i:0">
+        <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-database"></i></div>
+        <h3 class="font-semibold text-lg text-ink-50">JetStream-backed durability</h3>
+        <p class="mt-2 text-ink-300 text-sm leading-relaxed">Messages live in JetStream &mdash; NUTS just routes them to subscribers, so retention, deduplication, and storage policies stay in NATS.</p>
+      </div>
+      <div class="card reveal p-6" style="--i:1">
+        <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-clock-rotate-left"></i></div>
+        <h3 class="font-semibold text-lg text-ink-50">Resumable streams</h3>
+        <p class="mt-2 text-ink-300 text-sm leading-relaxed">Reconnecting clients pick up exactly where they left off using <code class="font-mono text-nuts-300">?last-id=</code> or the standard <code class="font-mono text-nuts-300">Last-Event-ID</code> header. Browser <code class="font-mono text-flux-300">EventSource</code> sends the header for free.</p>
+      </div>
+      <div class="card reveal p-6" style="--i:0">
+        <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-shield-halved"></i></div>
+        <h3 class="font-semibold text-lg text-ink-50">Replay storm guards</h3>
+        <p class="mt-2 text-ink-300 text-sm leading-relaxed">Bound large catch-ups with <code class="font-mono text-nuts-300">replay_max_messages</code> and <code class="font-mono text-nuts-300">replay_window</code> so a single stale client can't drag the server through tens of thousands of historical events.</p>
+      </div>
+      <div class="card card--cool reveal p-6" style="--i:1">
+        <div class="w-10 h-10 rounded-lg grid place-items-center bg-flux-400/10 text-flux-300 ring-1 ring-flux-400/25 mb-4"><i class="fa-solid fa-circle-check"></i></div>
+        <h3 class="font-semibold text-lg text-ink-50">No silent message loss</h3>
+        <p class="mt-2 text-ink-300 text-sm leading-relaxed">Slow clients are disconnected before queued messages are dropped &mdash; they reconnect with their last event ID and resume cleanly.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SECURITY & AUTH ============ -->
+<section class="max-w-5xl mx-auto px-4 py-16">
+  <span class="eyebrow reveal">Security &amp; auth</span>
+  <h2 class="reveal mt-4 font-display font-semibold text-ink-50 tracking-tighter text-[clamp(1.75rem,3.5vw,2.5rem)]">Locked down, edge to broker</h2>
+  <div class="mt-8 grid md:grid-cols-2 gap-6">
+    <div class="card card--cool reveal p-6" style="--i:0">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-flux-400/10 text-flux-300 ring-1 ring-flux-400/25 mb-4"><i class="fa-solid fa-user-shield"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">JWT subscriber auth</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">HMAC-signed JWTs with per-topic <code class="font-mono text-flux-300">subscribe</code> claims, accepted from <code class="font-mono text-nuts-300">Authorization: Bearer</code> or a configurable cookie for browser <code class="font-mono text-flux-300">EventSource</code> clients.</p>
+    </div>
+    <div class="card reveal p-6" style="--i:1">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-key"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">NATS authentication</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">Connect to NATS using credentials files, tokens, or user/password &mdash; keep the broker secured independently of subscriber auth.</p>
+    </div>
+    <div class="card reveal p-6" style="--i:0">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-lock"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">NATS TLS &amp; mTLS</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">Optional <code class="font-mono text-nuts-300">nats_tls_ca</code>, <code class="font-mono text-nuts-300">nats_tls_cert</code>, and <code class="font-mono text-nuts-300">nats_tls_key</code> directives for encrypted, mutually authenticated NATS connections.</p>
+    </div>
+    <div class="card card--cool reveal p-6" style="--i:1">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-flux-400/10 text-flux-300 ring-1 ring-flux-400/25 mb-4"><i class="fa-solid fa-globe"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">CORS done right</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">Echoes <code class="font-mono text-flux-300">Origin</code> from the allow-list, adds <code class="font-mono text-flux-300">Vary: Origin</code>, and only advertises credentials for explicitly listed origins &mdash; no accidental wildcard credential leaks.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ OPERATIONS ============ -->
+<section class="border-y border-hairline bg-surface/40">
+  <div class="max-w-5xl mx-auto px-4 py-16">
+    <span class="eyebrow eyebrow--warm reveal">Operations</span>
+    <h2 class="reveal mt-4 font-display font-semibold text-ink-50 tracking-tighter text-[clamp(1.75rem,3.5vw,2.5rem)]">Observable and safe to run</h2>
+    <div class="mt-8 grid md:grid-cols-2 gap-6">
+      <div class="card card--cool reveal p-6" style="--i:0">
+        <div class="w-10 h-10 rounded-lg grid place-items-center bg-flux-400/10 text-flux-300 ring-1 ring-flux-400/25 mb-4"><i class="fa-solid fa-chart-line"></i></div>
+        <h3 class="font-semibold text-lg text-ink-50">Prometheus metrics</h3>
+        <p class="mt-2 text-ink-300 text-sm leading-relaxed">Built-in <code class="font-mono text-nuts-300">nuts_*</code> counters and gauges &mdash; active connections, messages delivered, slow-client disconnects, replay stats, rejected connections, and more.</p>
+      </div>
+      <div class="card card--cool reveal p-6" style="--i:1">
+        <div class="w-10 h-10 rounded-lg grid place-items-center bg-flux-400/10 text-flux-300 ring-1 ring-flux-400/25 mb-4"><i class="fa-solid fa-stethoscope"></i></div>
+        <h3 class="font-semibold text-lg text-ink-50">Liveness &amp; readiness probes</h3>
+        <p class="mt-2 text-ink-300 text-sm leading-relaxed">Separate <code class="font-mono text-nuts-300">/livez</code> and <code class="font-mono text-nuts-300">/readyz</code> endpoints for Kubernetes probes and load-balancer health checks &mdash; readiness actually verifies the NATS connection and stream.</p>
+      </div>
+      <div class="card reveal p-6" style="--i:0">
+        <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-gauge-high"></i></div>
+        <h3 class="font-semibold text-lg text-ink-50">Connection caps</h3>
+        <p class="mt-2 text-ink-300 text-sm leading-relaxed"><code class="font-mono text-nuts-300">max_connections</code> bounds concurrent SSE streams; rejected clients receive <code class="font-mono text-nuts-300">429</code> with <code class="font-mono text-nuts-300">Retry-After</code> instead of degrading the whole instance.</p>
+      </div>
+      <div class="card reveal p-6" style="--i:1">
+        <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-stopwatch"></i></div>
+        <h3 class="font-semibold text-lg text-ink-50">Per-frame write bounds</h3>
+        <p class="mt-2 text-ink-300 text-sm leading-relaxed">Optional <code class="font-mono text-nuts-300">dispatch_timeout</code> and <code class="font-mono text-nuts-300">write_timeout</code> keep slow downstream connections from tying up a handler indefinitely.</p>
+      </div>
+      <div class="card card--cool reveal p-6" style="--i:0">
+        <div class="w-10 h-10 rounded-lg grid place-items-center bg-flux-400/10 text-flux-300 ring-1 ring-flux-400/25 mb-4"><i class="fa-solid fa-diagram-project"></i></div>
+        <h3 class="font-semibold text-lg text-ink-50">Hub discovery</h3>
+        <p class="mt-2 text-ink-300 text-sm leading-relaxed">Optional <code class="font-mono text-flux-300">Link</code> header with <code class="font-mono text-flux-300">rel="nuts"</code> lets clients discover the hub URL automatically from any response that carries it.</p>
+      </div>
+      <div class="card reveal p-6" style="--i:1">
+        <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-list-check"></i></div>
+        <h3 class="font-semibold text-lg text-ink-50">Structured logs</h3>
+        <p class="mt-2 text-ink-300 text-sm leading-relaxed">Every stream emits structured fields &mdash; <code class="font-mono text-nuts-300">topics</code>, <code class="font-mono text-nuts-300">subjects</code>, <code class="font-mono text-nuts-300">replay_mode</code>, <code class="font-mono text-nuts-300">disconnect_reason</code> &mdash; ready for log aggregation and incident response.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ DEPLOYMENT ============ -->
+<section class="max-w-5xl mx-auto px-4 py-16">
+  <span class="eyebrow reveal">Deployment</span>
+  <h2 class="reveal mt-4 font-display font-semibold text-ink-50 tracking-tighter text-[clamp(1.75rem,3.5vw,2.5rem)]">Ship it your way</h2>
+  <div class="mt-8 grid md:grid-cols-3 gap-6">
+    <div class="card card--cool reveal p-6" style="--i:0">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-flux-400/10 text-flux-300 ring-1 ring-flux-400/25 mb-4"><i class="fa-solid fa-plug"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">Caddy native</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">First-class Caddy module &mdash; install with <code class="font-mono text-nuts-300">xcaddy</code>, configure via Caddyfile or JSON, and inherit Caddy's TLS and routing.</p>
+    </div>
+    <div class="card reveal p-6" style="--i:1">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-brands fa-docker"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">Prebuilt Docker image</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">Multi-arch <code class="font-mono text-nuts-300">idcttech/nuts</code> image on Docker Hub for <code class="font-mono text-nuts-300">amd64</code> and <code class="font-mono text-nuts-300">arm64</code> &mdash; mount a Caddyfile and go.</p>
+    </div>
+    <div class="card reveal p-6" style="--i:2">
+      <div class="w-10 h-10 rounded-lg grid place-items-center bg-warm-500/10 text-warm-400 ring-1 ring-warm-500/25 mb-4"><i class="fa-solid fa-cubes-stacked"></i></div>
+      <h3 class="font-semibold text-lg text-ink-50">Compose-ready</h3>
+      <p class="mt-2 text-ink-300 text-sm leading-relaxed">Reference <code class="font-mono text-nuts-300">docker-compose.yml</code> in the repo brings up NATS with JetStream and NUTS together for local development.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CTA ============ -->
+<section class="max-w-5xl mx-auto px-4 py-20">
+  <div class="reveal relative glass overflow-hidden px-6 py-14 text-center shadow-glow-cool">
+    <span aria-hidden="true" class="absolute inset-x-0 top-0 h-0.5 bg-seam"></span>
+    <h2 class="font-display font-semibold text-ink-50 tracking-tighter text-[clamp(1.75rem,3.5vw,2.5rem)]">Ready to wire it up?</h2>
+    <p class="mt-3 text-ink-300">Build with xcaddy or pull the Docker image &mdash; you'll be streaming in minutes.</p>
+    <div class="mt-8 flex flex-wrap gap-3 justify-center">
+      <a href="{{ '/docs/building/' | relative_url }}" class="btn btn--primary">Building &amp; Running</a>
+      <a href="{{ '/docs/usage/' | relative_url }}" class="btn btn--ghost">Configuration Reference</a>
+    </div>
+  </div>
+</section>

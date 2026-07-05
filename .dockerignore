@@ -50,3 +50,8 @@ go.work.sum
 
 # Compose / dev extras
 docker-compose.yml
+
+# Website (separate Jekyll build pipeline in website/Dockerfile; the Go/caddy
+# image never needs it — excluding it keeps the build context small and stops
+# website-only edits from busting the Go builder-layer cache).
+website/
