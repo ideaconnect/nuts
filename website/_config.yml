@@ -3,6 +3,11 @@ description: "A Caddy Server module that bridges NATS.io JetStream messages to S
 url: "https://idct.tech"
 baseurl: "/nuts"
 
+# Google Analytics 4 measurement ID. Emitted only in production builds, gated
+# behind Consent Mode v2 (see _layouts/default.html + _includes/consent.html).
+# Clear this value to disable analytics entirely.
+ga_measurement_id: "G-7Z0SVJG80W"
+
 permalink: pretty
 
 # Social/share preview image. jekyll-seo-tag emits og:image + twitter:image from

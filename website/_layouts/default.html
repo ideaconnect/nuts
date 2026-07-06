@@ -12,6 +12,33 @@
       if (!window.__nutsReveal) document.documentElement.classList.remove('js');
     }, 2500);
   </script>
+  {% if jekyll.environment == "production" and site.ga_measurement_id %}
+  <!-- Google Analytics 4 — prior-consent model. gtag.js is injected ONLY after the
+       visitor Accepts (or on return with a stored, unexpired 'granted' choice), so
+       nothing contacts Google before consent. Reject / no choice => never loaded.
+       Production builds only. See assets/js/consent.js + _includes/consent.html. -->
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){ dataLayer.push(arguments); }
+    window.__gaId = '{{ site.ga_measurement_id }}';
+    window.loadGoogleAnalytics = function () {
+      if (window.__gaLoaded) return;
+      window.__gaLoaded = true;
+      var s = document.createElement('script');
+      s.async = true;
+      s.src = 'https://www.googletagmanager.com/gtag/js?id=' + window.__gaId;
+      document.head.appendChild(s);
+      gtag('js', new Date());
+      gtag('consent', 'default', { ad_storage: 'denied', ad_user_data: 'denied', ad_personalization: 'denied', analytics_storage: 'granted' });
+      gtag('config', window.__gaId);
+    };
+    // Returning visitor with a valid, unexpired 'granted' choice → load now.
+    try {
+      var __c = JSON.parse(localStorage.getItem('nuts-consent') || 'null');
+      if (__c && __c.choice === 'granted' && __c.v === 1 && (Date.now() - __c.ts) < 15552000000) window.loadGoogleAnalytics();
+    } catch (e) {}
+  </script>
+  {% endif %}
   {% seo %}
   <meta name="theme-color" content="#0B0F1A">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127837;</text></svg>">
@@ -57,8 +84,10 @@
   </main>
 
   {% include footer.html %}
+  {% include consent.html %}
 
   <script defer src="{{ '/assets/js/effects.js' | relative_url }}"></script>
+  <script defer src="{{ '/assets/js/consent.js' | relative_url }}"></script>
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/highlight.min.js"></script>
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/languages/nginx.min.js"></script>
   <script>

@@ -2,9 +2,11 @@
   <span aria-hidden="true" class="absolute inset-x-0 top-0 h-px bg-seam opacity-40"></span>
   <div class="max-w-6xl mx-auto px-4 py-8 flex flex-col md:flex-row items-center justify-between gap-4 text-sm text-ink-400">
     <p class="flex items-center gap-2">&copy; {{ site.time | date: '%Y' }} Created by <a href="https://idct.tech" class="group hover:text-flux-400 flex items-center gap-1 transition-colors"><img src="{{ '/media/idct-logo.png' | relative_url }}" alt="IDCT" class="h-5 inline-block opacity-80 [filter:invert(1)]"> <span class="underline decoration-transparent group-hover:decoration-flux-400/50 underline-offset-2 transition-colors">IDCT Bartosz Pachołek</span></a></p>
-    <div class="flex gap-4">
+    <div class="flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
       <a href="https://github.com/ideaconnect/nuts" class="hover:text-flux-400 transition-colors">GitHub</a>
       <a href="https://github.com/ideaconnect/nuts/blob/main/LICENSE" class="hover:text-flux-400 transition-colors">License</a>
+      <a href="{{ '/privacy/' | relative_url }}" class="hover:text-flux-400 transition-colors">Privacy</a>
+      <button type="button" data-consent-open class="hover:text-flux-400 transition-colors">Cookie preferences</button>
     </div>
   </div>
 </footer>

@@ -1,0 +1,91 @@
+---
+layout: page
+title: "Privacy &amp; Cookies"
+description: "How the NUTS website uses cookies and analytics, and how to control them."
+permalink: /privacy/
+---
+
+<p class="lead">This is the documentation and marketing site for the open-source
+<a href="https://github.com/ideaconnect/nuts">NUTS</a> Caddy module. It is a static
+site with no accounts, no logins, and no advertising. The only thing that touches
+your data is <strong>opt-in, anonymous usage analytics</strong> — explained below.</p>
+
+## Who is responsible (data controller)
+
+The data controller for this site is <strong>IDCT Bartosz Pachołek</strong>
+(<a href="https://idct.tech">idct.tech</a>). Contact:
+<a href="mailto:bartosz@idct.tech">bartosz@idct.tech</a>.
+
+## What we collect
+
+Only if you press <strong>Accept</strong> in the cookie banner do we load
+<strong>Google Analytics 4</strong> to measure aggregate, anonymous usage — pages
+viewed, rough geography, device/browser type, and referring links. We use this only
+to understand what's useful and improve the docs. We do <strong>not</strong>:
+
+- serve ads or use advertising cookies;
+- track you across other websites;
+- sell or share your data with third parties for marketing;
+- attempt to identify you personally.
+
+## When analytics loads
+
+We use a **prior-consent** model. Google Analytics is **not loaded at all** until you
+choose **Accept** — so if you **Reject**, or ignore the banner, **nothing is sent to
+Google** and no analytics cookies are set. The site works fully either way.
+
+## Cookies &amp; storage
+
+Nothing analytics-related is stored or sent until you **Accept**. If you do, Google
+Analytics sets:
+
+| Cookie | Purpose | Retention |
+| --- | --- | --- |
+| `_ga` | Distinguishes anonymous visitors | ~2 years |
+| `_ga_{{ site.ga_measurement_id | remove_first: "G-" }}` | Maintains the analytics session state | ~2 years |
+
+Independently of your choice, a small **`localStorage`** entry (`nuts-consent`) records
+your Accept/Reject decision and its date so the banner doesn't reappear every visit.
+That entry is strictly functional (not analytics) and we re-ask for consent after
+about **180 days**.
+
+## Legal basis
+
+Analytics is processed **only on the basis of your consent** (GDPR Art. 6(1)(a)),
+which you can withdraw at any time — see *Your choices* below. Withdrawing consent
+does not affect processing that already happened.
+
+## International transfer
+
+When you Accept, analytics data is processed by <strong>Google LLC</strong> in the
+United States. Google is certified under the
+<a href="https://commission.europa.eu/law/law-topic/data-protection/international-dimension-data-protection/eu-us-data-privacy-framework_en">EU&ndash;U.S. Data Privacy Framework</a>,
+which the transfer relies on (with Google's Standard Contractual Clauses as a
+fallback safeguard). GA4 does not store IP addresses.
+
+## Your choices
+
+- **Accept** or **Reject** in the banner — Reject keeps analytics fully off.
+- Change your mind anytime via **Cookie preferences** in the footer, or by clearing
+  this site's data in your browser.
+- Install Google's
+  <a href="https://tools.google.com/dlpage/gaoptout">Analytics opt-out add-on</a>.
+
+## Your rights
+
+Under the GDPR you have the right to access, rectify, erase, restrict, or object to
+processing of your data, to withdraw consent, and to
+<strong>lodge a complaint with your data-protection supervisory authority</strong>
+(in Poland, the <a href="https://uodo.gov.pl/en">UODO</a>). To exercise any of these,
+contact <a href="mailto:bartosz@idct.tech">bartosz@idct.tech</a>.
+
+## More information
+
+Analytics data is handled per
+<a href="https://policies.google.com/privacy">Google's Privacy Policy</a> and
+<a href="https://business.safety.google/adsprocessorterms/">data-processing terms</a>.
+Questions? Use the <a href="{{ '/contact/' | relative_url }}">contact page</a>.
+
+<p class="text-sm opacity-70">This is a plain-language notice for a low-risk static
+site. Review and adapt it to your own circumstances (e.g. add a postal address) before
+relying on it.</p>

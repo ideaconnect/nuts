@@ -1,0 +1,14 @@
+<div id="consent-banner" class="fixed inset-x-0 bottom-0 z-[70] hidden px-3 pb-3 sm:px-4 sm:pb-4 pointer-events-none" role="region" aria-label="Cookie consent">
+  <div class="max-w-3xl mx-auto glass p-4 sm:p-5 shadow-glow-cool pointer-events-auto">
+    <div class="flex flex-col sm:flex-row sm:items-center gap-4">
+      <p class="flex-1 text-sm text-ink-300 leading-relaxed">
+        We use <strong class="text-ink-100 font-medium">anonymous analytics</strong> cookies (Google Analytics) to understand how the site is used &mdash; no ads, no cross-site tracking. See the
+        <a href="{{ '/privacy/' | relative_url }}" class="text-flux-400 underline decoration-flux-400/40 underline-offset-2 hover:text-flux-300">Privacy &amp; Cookies</a> page.
+      </p>
+      <div class="flex gap-2 shrink-0">
+        <button type="button" id="consent-reject" class="btn btn--ghost !px-4 !py-2 text-sm">Reject</button>
+        <button type="button" id="consent-accept" class="btn btn--primary !px-4 !py-2 text-sm">Accept</button>
+      </div>
+    </div>
+  </div>
+</div>
