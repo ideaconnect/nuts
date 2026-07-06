@@ -32,7 +32,7 @@ description: "A Caddy Server module that bridges NATS.io JetStream messages to S
           <a href="{{ '/features/' | relative_url }}" class="btn btn--ghost">See Features</a>
           <a href="https://github.com/ideaconnect/nuts" class="btn btn--ghost btn--icon" aria-label="GitHub" title="View NUTS on GitHub"><i class="fa-brands fa-github text-lg"></i></a>
         </div>
-        <div class="reveal mt-7 max-w-xl code-block group relative" style="--i:4">
+        <div class="reveal mt-7 max-w-xl code-block group relative" style="--i:4" data-download-cmd="xcaddy">
           <pre><code class="language-bash">xcaddy build --with github.com/ideaconnect/nuts</code></pre>
         </div>
       </div>
@@ -91,11 +91,11 @@ description: "A Caddy Server module that bridges NATS.io JetStream messages to S
   <div class="grid md:grid-cols-2 gap-6">
     <div class="reveal" style="--i:0">
       <p class="eyebrow eyebrow--warm mb-3">Build with xcaddy</p>
-      <div class="code-block group relative overflow-hidden"><pre><code class="language-bash">xcaddy build --with github.com/ideaconnect/nuts</code></pre></div>
+      <div class="code-block group relative overflow-hidden" data-download-cmd="xcaddy"><pre><code class="language-bash">xcaddy build --with github.com/ideaconnect/nuts</code></pre></div>
     </div>
     <div class="reveal" style="--i:1">
       <p class="eyebrow mb-3">Or run with Docker</p>
-      <div class="code-block group relative overflow-hidden"><pre><code class="language-bash">docker run -d -p 8080:8080 \
+      <div class="code-block group relative overflow-hidden" data-download-cmd="docker"><pre><code class="language-bash">docker run -d -p 8080:8080 \
   -e NATS_URL=nats://host.docker.internal:4222 \
   -v ./Caddyfile:/app/Caddyfile:ro \
   idcttech/nuts:latest</code></pre></div>
