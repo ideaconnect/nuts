@@ -212,6 +212,11 @@
   .btn--ghost:hover {
     border-color: #4a5a80;
   }
+  /* square icon-only button (equal padding) */
+  .btn--icon {
+    padding-left: 0.7rem;
+    padding-right: 0.7rem;
+  }
 
   /* nav underline sweep */
   .navlink {
