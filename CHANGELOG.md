@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The project website at <https://idct.tech/nuts> is now served from Cloudflare
+  instead of GitHub Pages: a static-assets Worker bound to `idct.tech/nuts/*`
+  ([website/wrangler.jsonc](website/wrangler.jsonc)), deployed by
+  [.github/workflows/website.yml](.github/workflows/website.yml) on the same
+  triggers as before, which now also verifies the live URL serves the build.
+  The URL is unchanged. The website toolchain moves from Node 20 to Node 22.
+
 ## [0.4.1] - 2026-07-05
 
 Documentation and project-site release. **No module code changes** — the `nuts`

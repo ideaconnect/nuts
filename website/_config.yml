@@ -31,6 +31,7 @@ exclude:
   - postcss.config.js
   - tailwind.config.js
   - AGENTS.md
+  - wrangler.jsonc
   - README.md
   - vendor
   - Dockerfile

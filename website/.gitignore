@@ -6,4 +6,8 @@ node_modules/
 vendor/
 .bundle/
 assets/css/dist/
+# The tree the website deploy uploads (_site/ copied to _deploy/nuts/), assembled by
+# .github/workflows/website.yml; anything here locally is a leftover.
+_deploy/
+.wrangler/
 .claude/

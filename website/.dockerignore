@@ -9,3 +9,5 @@ _site
 .jekyll-metadata
 .sass-cache
 assets/css/dist
+_deploy
+.wrangler

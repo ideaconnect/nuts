@@ -1,14 +1,17 @@
 name: Website
 
-# Builds the Jekyll site under website/ and deploys it to GitHub Pages at
-# https://idct.tech/nuts. Because the org's Pages custom domain is idct.tech,
-# this project repo is served at the /nuts subpath (baseurl in
-# website/_config.yml). Deploys ship in lockstep with module releases (v* tags);
+# Builds the Jekyll site under website/ and publishes it to Cloudflare, served at
+# https://idct.tech/nuts/ by a Worker that is nothing but static assets, bound to that path by
+# the routes in website/wrangler.jsonc. The rest of idct.tech is the org's apex site (repo:
+# ideaconnect.github.io), still on GitHub Pages, and every path outside /nuts/ carries on
+# through to it untouched. Deploys ship in lockstep with module releases (v* tags);
 # workflow_dispatch allows a manual redeploy without cutting a tag.
 #
-# Prerequisite (one-time, repo Settings → Pages): set the build source to
-# "GitHub Actions". No CNAME lives in this repo — the apex domain belongs to
-# the org's <org>.github.io Pages site, which projects inherit the subpath from.
+# One-time setup (already done on this repo): the CLOUDFLARE_API_TOKEN secret, a token from
+# the "Edit Cloudflare Workers" template scoped to this account and the idct.tech zone, and
+# CLOUDFLARE_ACCOUNT_ID. Nothing is set up in the Cloudflare dashboard: the first deploy
+# creates the Worker and its routes. Cloudflare's own Git integration is deliberately not
+# used — it would deploy on every push to main rather than on releases.
 
 on:
   push:
@@ -18,13 +21,11 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# Serialize Pages deploys; a newer run supersedes an in-flight one.
+# One deployment at a time, and never cancel a publish that is already running.
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: website
+  cancel-in-progress: false
 
 defaults:
   run:
@@ -45,10 +46,12 @@ jobs:
           bundler-cache: true
           working-directory: website
 
+      # 22, not 20: the pinned Wrangler below requires Node >= 22. Keep in step with
+      # website/Dockerfile so `make website-build` still mirrors this build.
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
           cache-dependency-path: website/package-lock.json
 
@@ -60,19 +63,54 @@ jobs:
         env:
           JEKYLL_ENV: production
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          # Path is relative to the workspace root, not the working-directory.
-          path: website/_site
+      # The GitHub Pages environment used to restrict deploys to main; without it, a manual
+      # run from any other branch would publish that branch. Such a run still builds, so a
+      # broken site shows up, but only a release tag or main reaches the domain.
+      - name: Assemble the tree Cloudflare serves
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+        run: |
+          mkdir _deploy
+          cp -r _site _deploy/nuts
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      # Wrangler is pinned so a release of it cannot change what a deploy does between two
+      # runs that changed nothing here.
+      - name: Deploy to Cloudflare
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.136.3'
+          workingDirectory: website
+          command: deploy
+
+      # A green deploy only means Cloudflare accepted the upload. This asks the live address:
+      # the page has to come from Cloudflare rather than GitHub, which is what a missing or
+      # mis-typed route looks like, and it has to be byte-for-byte the index.html this run
+      # built, which is what a deploy that went somewhere else looks like. The zone does not
+      # rewrite HTML, so any difference is real. Retried, because a new route takes a few
+      # seconds to reach every edge.
+      #
+      # Each response is captured before it is tested, not piped into grep: without pipefail a
+      # curl that got nothing would hand grep an empty string, every "is it wrong" test would
+      # come back no, and a site that is down would pass.
+      - name: Verify the live site is the one just deployed
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            headers=$(curl -fsSI https://idct.tech/nuts/ || true)
+            curl -fsS https://idct.tech/nuts/ -o live-index.html || rm -f live-index.html
+            if [ -z "$headers" ] || [ ! -s live-index.html ]; then
+              echo "attempt $attempt: https://idct.tech/nuts/ did not answer"
+            elif grep -qi '^x-github-request-id:' <<<"$headers"; then
+              echo "attempt $attempt: https://idct.tech/nuts/ is still served by GitHub"
+            elif ! cmp -s live-index.html _site/index.html; then
+              echo "attempt $attempt: the live index.html is not the one this run built"
+            else
+              echo 'https://idct.tech/nuts/ is served by Cloudflare, from this build'
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::https://idct.tech/nuts/ is not serving this deploy"
+          exit 1

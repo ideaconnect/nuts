@@ -2,8 +2,8 @@
 #
 # Local build/dev image for the NUTS website (Jekyll + Tailwind via PostCSS).
 # Driven by the repo-root Makefile targets `website-build` and `website-serve`;
-# it is not a deployment artefact (GitHub Pages builds the site itself — see
-# .github/workflows/website.yml). Keeping the toolchain in a container means
+# it is not a deployment artefact (CI builds the site itself and deploys it to
+# Cloudflare — see .github/workflows/website.yml). Keeping the toolchain in a container means
 # contributors need only Docker, not local Ruby + Node.
 
 # --- base: Ruby + Node with all site dependencies installed -------------------
@@ -14,7 +14,7 @@ ENV BUNDLE_PATH=/usr/local/bundle
 WORKDIR /site
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential curl ca-certificates \
- && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
 # Dependency manifests first for layer caching.

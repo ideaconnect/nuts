@@ -197,12 +197,12 @@ lint:
 	docker run --rm -v "$(CURDIR):/app" -w /app $(GOLANGCI_LINT_IMAGE) golangci-lint run
 
 # --- Website (docs/marketing site under website/) -----------------------------
-# The site is a Jekyll + Tailwind project deployed to GitHub Pages at
+# The site is a Jekyll + Tailwind project deployed to Cloudflare at
 # https://idct.tech/nuts on every v* tag (see .github/workflows/website.yml).
 # These targets containerise the Ruby + Node toolchain (website/Dockerfile) so
 # no local install is needed — Docker is the only prerequisite.
 
-# Build the production site into website/_site. Mirrors what GitHub Pages runs.
+# Build the production site into website/_site. Mirrors what CI builds.
 website-build:
 	DOCKER_BUILDKIT=1 docker build --target artifact \
 		--output "type=local,dest=$(WEBSITE_DIR)/_site" $(WEBSITE_DIR)
@@ -221,7 +221,7 @@ website-serve:
 
 # Remove generated website output.
 website-clean:
-	rm -rf $(WEBSITE_DIR)/_site $(WEBSITE_DIR)/assets/css/dist
+	rm -rf $(WEBSITE_DIR)/_site $(WEBSITE_DIR)/assets/css/dist $(WEBSITE_DIR)/_deploy
 
 # Show help
 help:

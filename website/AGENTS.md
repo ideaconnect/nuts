@@ -13,10 +13,13 @@ sources are its siblings one level up. Repo-wide agent rules are in the
 - **Static site generator:** Jekyll
 - **CSS framework:** Tailwind CSS (via PostCSS)
 - **Language:** English
-- **Hosting:** GitHub Pages, served at `https://idct.tech/nuts`. The org's
-  `idct.tech` Pages custom domain makes this project repo resolve at the `/nuts`
-  subpath, so `_config.yml` sets `baseurl: /nuts`. Deployed on every `v*` tag by
-  [.github/workflows/website.yml](../.github/workflows/website.yml).
+- **Hosting:** Cloudflare, served at `https://idct.tech/nuts`. A static-assets
+  Worker ([wrangler.jsonc](wrangler.jsonc)) is routed to `idct.tech/nuts/*` only;
+  the rest of `idct.tech` is the org's apex site on GitHub Pages. The route keeps
+  the `/nuts` prefix, so `_config.yml` sets `baseurl: /nuts` and CI uploads
+  `_site/` as `_deploy/nuts/`. Deployed on every `v*` tag by
+  [.github/workflows/website.yml](../.github/workflows/website.yml) — never with
+  `wrangler` by hand.
 
 ## Build and Test
 

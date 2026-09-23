@@ -1,0 +1,34 @@
+// The built site (_site/), served at https://idct.tech/nuts/ by a Cloudflare Worker that is
+// nothing but static assets. Deployed by .github/workflows/website.yml and never any other way —
+// not by hand, and not by Cloudflare's own Git integration, which would publish on every push
+// to main instead of in lockstep with module releases.
+//
+// It lives in website/ rather than at the repo root because the root dist/ belongs to
+// GoReleaser, and because Jekyll needs to be told to leave it out of _site (see _config.yml).
+{
+  "name": "nuts-site",
+  "compatibility_date": "2026-09-23",
+
+  // Routes, not a custom domain. The site is a path on idct.tech, and the root of that domain
+  // belongs to the org's apex site (repo: ideaconnect.github.io). A custom domain would claim
+  // the whole hostname; these claim /nuts and everything under it, and every other path on
+  // idct.tech carries on through to GitHub untouched.
+  "routes": [
+    { "pattern": "idct.tech/nuts", "zone_name": "idct.tech" },
+    { "pattern": "idct.tech/nuts/*", "zone_name": "idct.tech" }
+  ],
+
+  // No second copy of the site on a workers.dev address for anyone to find and link to.
+  "workers_dev": false,
+  "preview_urls": false,
+
+  "assets": {
+    // The workflow copies _site/ to _deploy/nuts/: the route keeps the /nuts/ prefix on every
+    // request, and baseurl bakes that prefix into every link Jekyll writes.
+    "directory": "./_deploy",
+    // The nearest 404.html, with a real 404 status. There is one, at /nuts/404.html, so it
+    // answers for every missing URL beneath /nuts/ at any depth — which works only because
+    // relative_url makes every link inside it root-absolute.
+    "not_found_handling": "404-page"
+  }
+}

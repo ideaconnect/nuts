@@ -141,9 +141,12 @@ The full PR checklist is [CONTRIBUTING.md § Contribution checklist](CONTRIBUTIN
 ### Website
 
 The site under [website/](website/) is a Jekyll + Tailwind project served at
-`https://idct.tech/nuts` (the org's `idct.tech` Pages custom domain makes this
-project repo resolve at the `/nuts` subpath, so `baseurl` is `/nuts`). Build it
-through the containerised toolchain — Docker is the only prerequisite:
+`https://idct.tech/nuts`. That is a path on the org's domain, not a site of its
+own: a Cloudflare Worker holding nothing but the built site answers
+`idct.tech/nuts/*` ([website/wrangler.jsonc](website/wrangler.jsonc)), and every
+other path on `idct.tech` goes to the org's apex site on GitHub Pages — hence
+`baseurl: /nuts`. Build it through the containerised toolchain — Docker is the
+only prerequisite:
 
 ```bash
 make website-build     # production build → website/_site (mirrors CI)
@@ -152,7 +155,9 @@ make website-clean     # remove generated output
 ```
 
 Deployment is automatic: [.github/workflows/website.yml](.github/workflows/website.yml)
-builds and deploys to GitHub Pages on every `v*` tag. Internal links and assets
+builds and deploys to Cloudflare on every `v*` tag (or `workflow_dispatch` from
+`main`), then checks the live URL serves that build. Never deploy with
+`wrangler` by hand. Internal links and assets
 must go through `relative_url` (or `{{ site.baseurl }}`) so the `/nuts` prefix is
 applied — never hard-code root-absolute paths. Deeper conventions are in
 [website/AGENTS.md](website/AGENTS.md).
@@ -261,7 +266,7 @@ Pushes to `main`/`master` and `v*` tags additionally:
    keyless via Cosign + GitHub OIDC.
 3. Update the Docker Hub description from [DOCKERHUB_README.md](DOCKERHUB_README.md).
 4. GoReleaser publishes archives and SBOMs for the tag.
-5. Build the [website/](website/) Jekyll site and deploy it to GitHub Pages at
+5. Build the [website/](website/) Jekyll site and deploy it to Cloudflare at
    `https://idct.tech/nuts` ([website.yml](.github/workflows/website.yml); also
    runnable on demand via `workflow_dispatch`).
 
