@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-23
+
+Project-site release. **No module code changes** — the `nuts` handler
+behaviour, Caddyfile directives, JSON fields, and metrics are identical to
+0.4.1. Upgrade urgency: none.
+
+### Added
+- Website: opt-in cookie consent banner with Google Analytics 4 loaded only
+  after the visitor accepts (prior-consent model; nothing contacts Google on
+  reject or no choice), withdrawable via the footer's *Cookie preferences*,
+  and a new [privacy page](https://idct.tech/nuts/privacy/). Four anonymous
+  interaction events (install-command copy, GitHub link, contact submit,
+  features-page scroll) fire only under that consent.
+
 ### Changed
+- Website: sponsor and Buy-Me-a-Coffee header icons sit on white chips, and the
+  hero GitHub button is icon-only for a better fit on narrow phones.
 - The project website at <https://idct.tech/nuts> is now served from Cloudflare
   instead of GitHub Pages: a static-assets Worker bound to `idct.tech/nuts/*`
   ([website/wrangler.jsonc](website/wrangler.jsonc)), deployed by
