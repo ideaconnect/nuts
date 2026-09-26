@@ -140,6 +140,12 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   per frame (#121). To let batches form, each connection's feed hands up to
   16 formatted frames ahead to its writer. Catching up on a 3000-message
   backlog now takes about half as long.
+- Subject matching no longer allocates (#124). Authorizing 32 topics against
+  a JWT claim of 128 filters took 0.46 ms and 8,192 allocations per request,
+  before the `max_connections` check; it now takes about 55 µs and none. The
+  fuzz tests for the matchers assert their contract, including equivalence
+  with the previous implementation, instead of only the absence of panics
+  (#61).
 - Message frames are built in one pass (#122): the payload is validated once
   and copied once into the frame, instead of being compacted, re-encoded by
   `json.Marshal` and copied three more times. A small JSON message takes

@@ -1222,20 +1222,23 @@ func subjectMatchesFilter(subject, filter string) bool {
 	if subject == "" || filter == "" {
 		return false
 	}
-	subjectTokens := strings.Split(subject, ".")
-	filterTokens := strings.Split(filter, ".")
-	for idx, filterToken := range filterTokens {
+	// Walk both token by token without allocating (#124). A subject token
+	// is always left to compare: the loop only continues while both have
+	// more, and a subject ends with at least one (possibly empty) token.
+	for {
+		filterToken, filterRest, filterMore := strings.Cut(filter, ".")
 		if filterToken == ">" {
-			return idx < len(subjectTokens)
+			return true
 		}
-		if idx >= len(subjectTokens) {
+		subjectToken, subjectRest, subjectMore := strings.Cut(subject, ".")
+		if filterToken != "*" && filterToken != subjectToken {
 			return false
 		}
-		if filterToken != "*" && filterToken != subjectTokens[idx] {
-			return false
+		if !filterMore || !subjectMore {
+			return filterMore == subjectMore
 		}
+		filter, subject = filterRest, subjectRest
 	}
-	return len(subjectTokens) == len(filterTokens)
 }
 
 // matchesHealthPath returns true when the request path equals HealthPath or

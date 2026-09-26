@@ -13,6 +13,7 @@
 package nuts
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -184,26 +185,70 @@ func FuzzIsValidCookieName(f *testing.F) {
 	})
 }
 
-// FuzzSubjectMatchesFilter throws random subject/filter pairs at the
-// matcher and asserts the matcher does not panic. We do not re-derive
-// the matching contract — that's a separate reasoning task — but
-// catching panics covers the most dangerous regression class.
+// referenceSubjectMatchesFilter is the matcher as it was before it stopped
+// allocating (#124), kept to pin the rewrite to the same answers.
+func referenceSubjectMatchesFilter(subject, filter string) bool {
+	if subject == "" || filter == "" {
+		return false
+	}
+	subjectTokens := strings.Split(subject, ".")
+	filterTokens := strings.Split(filter, ".")
+	for idx, filterToken := range filterTokens {
+		if filterToken == ">" {
+			return idx < len(subjectTokens)
+		}
+		if idx >= len(subjectTokens) {
+			return false
+		}
+		if filterToken != "*" && filterToken != subjectTokens[idx] {
+			return false
+		}
+	}
+	return len(subjectTokens) == len(filterTokens)
+}
+
+// FuzzSubjectMatchesFilter checks the matcher against its reference and
+// against properties of NATS subject matching (#61): an empty subject or
+// filter never matches, ">" matches any subject, a subject matches itself,
+// and "*" stands for exactly one token.
 func FuzzSubjectMatchesFilter(f *testing.F) {
 	for _, pair := range []struct{ subject, filter string }{
 		{"", ""}, {"orders", "orders.>"}, {"orders.created", "orders.*"},
 		{"orders.created", ">"}, {"a.b.c", "a.b.c"}, {"a", "a.*"},
-		{"a.b", "*.b"}, {".", "."}, {"a..b", "a..b"},
-		{"orders", ""}, {"", "orders"},
+		{"a.b", "*.b"}, {".", "."}, {"a..b", "a..b"}, {"a..b", "a.*.b"},
+		{"orders", ""}, {"", "orders"}, {"a.b", "a.>.c"}, {"a.", "a.*"},
+		{"a.b.c", "*.*"}, {"a", "*.*"}, {"a.b", "a.b.c"},
 	} {
 		f.Add(pair.subject, pair.filter)
 	}
 	f.Fuzz(func(t *testing.T, subject, filter string) {
-		_ = subjectMatchesFilter(subject, filter)
+		got := subjectMatchesFilter(subject, filter)
+		if want := referenceSubjectMatchesFilter(subject, filter); got != want {
+			t.Fatalf("subjectMatchesFilter(%q, %q) = %v, reference says %v", subject, filter, got, want)
+		}
+		if (subject == "" || filter == "") && got {
+			t.Fatalf("subjectMatchesFilter(%q, %q) matched an empty subject or filter", subject, filter)
+		}
+		if subject != "" && !subjectMatchesFilter(subject, ">") {
+			t.Fatalf("subjectMatchesFilter(%q, \">\") = false", subject)
+		}
+		if subject != "" && !subjectMatchesFilter(subject, subject) {
+			t.Fatalf("subjectMatchesFilter(%q, itself) = false", subject)
+		}
+		tokens := strings.Split(subject, ".")
+		stars := strings.TrimSuffix(strings.Repeat("*.", len(tokens)), ".")
+		if subject != "" && !subjectMatchesFilter(subject, stars) {
+			t.Fatalf("subjectMatchesFilter(%q, %q) = false, one * per token", subject, stars)
+		}
+		if subject != "" && subjectMatchesFilter(subject, stars+".*") {
+			t.Fatalf("subjectMatchesFilter(%q, %q) = true with one * too many", subject, stars+".*")
+		}
 	})
 }
 
-// FuzzSubscriberTopicMatches ensures the JWT-claim subscriber matcher
-// (used by canSubscribe) doesn't panic on arbitrary inputs.
+// FuzzSubscriberTopicMatches checks the JWT-claim matcher, which gates
+// topic authorization: a bare "*" or ">" allows any topic, and every other
+// filter defers to subjectMatchesFilter.
 func FuzzSubscriberTopicMatches(f *testing.F) {
 	for _, pair := range []struct{ topic, filter string }{
 		{"", ""}, {"orders.created", "orders.>"}, {"orders", "orders.*"},
@@ -213,6 +258,36 @@ func FuzzSubscriberTopicMatches(f *testing.F) {
 		f.Add(pair.topic, pair.filter)
 	}
 	f.Fuzz(func(t *testing.T, topic, filter string) {
-		_ = subscriberTopicMatches(topic, filter)
+		got := subscriberTopicMatches(topic, filter)
+		switch {
+		case filter == "*" || filter == ">":
+			if !got {
+				t.Fatalf("subscriberTopicMatches(%q, %q) = false; a bare wildcard allows any topic", topic, filter)
+			}
+		case got != subjectMatchesFilter(topic, filter):
+			t.Fatalf("subscriberTopicMatches(%q, %q) = %v, subjectMatchesFilter disagrees", topic, filter, got)
+		}
 	})
+}
+
+// BenchmarkCanSubscribeAtTheLimits authorizes 32 topics against a claim of
+// 128 filters that match none of them: the worst case a token holder can
+// ask for per request (#124).
+func BenchmarkCanSubscribeAtTheLimits(b *testing.B) {
+	claims := subscriberClaims{}
+	for i := 0; i < maxSubscribeClaimFilters; i++ {
+		claims.Subscribe = append(claims.Subscribe, "tenant-"+strconv.Itoa(i)+".orders.*")
+	}
+	topics := make([]string, defaultMaxTopicsPerSubscription)
+	for i := range topics {
+		topics[i] = "other-" + strconv.Itoa(i) + ".orders.created"
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		for _, topic := range topics {
+			if claims.canSubscribe(topic) {
+				b.Fatal("unexpected match")
+			}
+		}
+	}
 }

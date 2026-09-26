@@ -481,9 +481,9 @@ documented budgets that hold.
     first and check the first message).
   - [ ] Release the connection slot before the consumer delete, and delete
     asynchronously.
-- [ ] **[#124] Allocation-free subject matcher.** *minor · S*
-  - [ ] Walk the tokens without `strings.Split`.
-  - [ ] Fuzz-test equivalence against the old matcher (after [#61]).
+- [x] **[#124] Allocation-free subject matcher.** *minor · S*
+  - [x] Walk the tokens without `strings.Split`.
+  - [x] Fuzz-test equivalence against the old matcher (after [#61]).
 - [ ] **Re-measure performance.**
   - [ ] Update the `docs/PERFORMANCE.md` budgets and the per-connection memory
     formula, backed by a test.
@@ -536,8 +536,8 @@ Several of these are good first issues.
   - [ ] Fix documentation drift in CONTRIBUTING, the AGENTS.md race-test note
     and the `fuzz_test.go` comment.
   - [ ] Stop restart tests from reusing a port after releasing it.
-- [ ] **[#61] Fuzz properties.** *minor · S*
-  - [ ] Add property assertions to `FuzzSubjectMatchesFilter` and
+- [x] **[#61] Fuzz properties.** *minor · S*
+  - [x] Add property assertions to `FuzzSubjectMatchesFilter` and
     `FuzzSubscriberTopicMatches`. This is needed before [#124].
 - [x] **[#63]** `TestTryParseJSON` asserts the parsed content. *minor · S*
   Obsolete: `tryParseJSON` left the formatter (#122); `TestWriteJSONPayload`
