@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -79,23 +80,26 @@ func TestStreamFeed_DropsOversizedPayloadsBeforeTheWriter(t *testing.T) {
 
 // TestStreamFeed_StopsPullingWhileTheWriterIsBusy is the backpressure
 // contract: with the writer not reading, the feed fills the hand-off, holds
-// one more frame in hand, and stops pulling from JetStream.
+// one more frame in hand, and stops pulling from JetStream. synctest.Wait
+// returns once the feed is blocked for good, so the count is exact.
 func TestStreamFeed_StopsPullingWhileTheWriterIsBusy(t *testing.T) {
-	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
-	it := newFakeIterator(100)
-	for seq := uint64(1); seq <= 100; seq++ {
-		it.msgs <- newFakeJSMsg("events.alpha", seq, "c_1", `{}`)
-	}
-	feed := h.startStreamFeed(it, testFeedPlan)
-	defer feed.stop()
+	synctest.Test(t, func(t *testing.T) {
+		h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
+		it := newFakeIterator(100)
+		for seq := uint64(1); seq <= 100; seq++ {
+			it.msgs <- newFakeJSMsg("events.alpha", seq, "c_1", `{}`)
+		}
+		feed := h.startStreamFeed(it, testFeedPlan)
+		defer feed.stop()
 
-	time.Sleep(100 * time.Millisecond)
-	if got := it.nextCalls(); got != feedHandoffFrames+1 {
-		t.Fatalf("feed pulled %d messages with nobody reading, want %d (the hand-off plus one in hand)", got, feedHandoffFrames+1)
-	}
-	if got := receiveFrame(t, feed).StreamSequence; got != 1 {
-		t.Fatalf("first frame seq = %d, want 1", got)
-	}
+		synctest.Wait()
+		if got := it.nextCalls(); got != feedHandoffFrames+1 {
+			t.Fatalf("feed pulled %d messages with nobody reading, want %d (the hand-off plus one in hand)", got, feedHandoffFrames+1)
+		}
+		if got := receiveFrame(t, feed).StreamSequence; got != 1 {
+			t.Fatalf("first frame seq = %d, want 1", got)
+		}
+	})
 }
 
 func TestStreamFeed_ReportsIteratorFailureOnce(t *testing.T) {

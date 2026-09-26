@@ -252,6 +252,7 @@ func waitForLogMessage(t *testing.T, logs *observer.ObservedLogs, snippet string
 }
 
 func TestHandler_connectNATS_ReconnectLifecycle(t *testing.T) {
+	t.Parallel() // asserts no process-wide metric
 	ns, restart := startRestartableJetStreamServer(t)
 
 	observedCore, observedLogs := observer.New(zap.DebugLevel)

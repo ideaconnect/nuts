@@ -145,6 +145,7 @@ func TestServeStream_SkipsSubjectDeleteMarkers(t *testing.T) {
 // the schedule definition itself used to reach subscribers of its subject at
 // publish time. The message the schedule produces is delivered.
 func TestServeStream_SkipsScheduleDefinitions(t *testing.T) {
+	t.Parallel() // asserts no process-wide metric
 	h, nc := provisionOnStream(t, jetstream.StreamConfig{
 		Name:              "EVENTS",
 		Subjects:          []string{"events.>"},

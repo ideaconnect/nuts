@@ -38,6 +38,7 @@ var (
 )
 
 func TestPerformance_ConcurrentSSEClientsReceiveRealisticMessageRate(t *testing.T) {
+	t.Parallel() // asserts no process-wide metric
 	h, _, nc := newProvisionedHandler(t)
 	defer nc.Close()
 	defer h.Cleanup()

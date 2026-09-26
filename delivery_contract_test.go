@@ -52,9 +52,11 @@ func TestDeliveryContract_NATSLinkLossLeavesNoHole(t *testing.T) {
 		publishRange(t, js, "events.alpha", 1, 3)
 		assertContiguousIDs(t, stream.collectIDs(3, 3*time.Second), 1, 3)
 
+		admin := mustJetStream(t, nc)
+		waitForConsumer(t, admin, "EVENTS", "has a pull request waiting", func(c *jetstream.ConsumerInfo) bool { return c.NumWaiting > 0 })
 		proxy.discard.Store(true)
 		publishRange(t, js, "events.alpha", 4, 6) // pushed into the dead link
-		time.Sleep(300 * time.Millisecond)
+		waitForConsumer(t, admin, "EVENTS", "was sent 4..6", func(c *jetstream.ConsumerInfo) bool { return c.Delivered.Stream >= 6 })
 		proxy.cut()
 		proxy.discard.Store(false)
 		waitForNATSReconnect(t, h)
@@ -136,9 +138,11 @@ func TestDeliveryContract_LinkLossBeforeFirstMessageNeitherReplaysNorSkips(t *te
 		if connected := stream.collectIDs(1, 3*time.Second); len(connected) != 1 || connected[0] != 3 {
 			t.Fatalf("connected id = %v, want [3]", connected)
 		}
+		admin := mustJetStream(t, nc)
+		waitForConsumer(t, admin, "EVENTS", "has a pull request waiting", func(c *jetstream.ConsumerInfo) bool { return c.NumWaiting > 0 })
 		proxy.discard.Store(true)
 		publishRange(t, js, "events.alpha", 4, 6) // published while NUTS is cut off
-		time.Sleep(300 * time.Millisecond)
+		waitForConsumer(t, admin, "EVENTS", "was sent 4..6", func(c *jetstream.ConsumerInfo) bool { return c.Delivered.Stream >= 6 })
 		proxy.cut()
 		proxy.discard.Store(false)
 		waitForNATSReconnect(t, h)
@@ -146,6 +150,29 @@ func TestDeliveryContract_LinkLossBeforeFirstMessageNeitherReplaysNorSkips(t *te
 
 		assertContiguousIDs(t, stream.collectIDs(5, 15*time.Second), 4, 8)
 	})
+}
+
+// waitForConsumer waits until a consumer of the stream satisfies cond.
+func waitForConsumer(t *testing.T, js jetstream.JetStream, stream, what string, cond func(*jetstream.ConsumerInfo) bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if s, err := js.Stream(ctx, stream); err == nil {
+			lister := s.ListConsumers(ctx)
+			for info := range lister.Info() {
+				if cond(info) {
+					cancel()
+					return
+				}
+			}
+		}
+		cancel()
+		if time.Now().After(deadline) {
+			t.Fatalf("no consumer of %s %s", stream, what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // waitForNATSReconnect waits until the handler's NATS connection has
@@ -325,6 +352,7 @@ func TestDeliveryContract_EventSourceReconnectWithURLCursorMakesProgress(t *test
 // A start past the end is accepted and parks the consumer until the stream
 // reaches it, which is why planning falls back for such cursors (#103).
 func TestJetStream_StartSequenceOutsideTheStream(t *testing.T) {
+	t.Parallel() // asserts no process-wide metric
 	ns := startJetStreamServer(t)
 	nc, err := nats.Connect(ns.ClientURL())
 	if err != nil {

@@ -782,6 +782,7 @@ func TestHandler_ReplayMaxMessages_CapsValidRetainedReplay(t *testing.T) {
 }
 
 func TestHandler_ReplayWindow_BoundsValidRetainedReplay(t *testing.T) {
+	t.Parallel() // asserts no process-wide metric
 	ns := startJetStreamServer(t)
 
 	nc, err := nats.Connect(ns.ClientURL())

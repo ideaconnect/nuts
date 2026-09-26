@@ -974,6 +974,7 @@ func TestHandler_HubDiscovery(t *testing.T) {
 // ── Heartbeat: the SSE stream emits the keep-alive comment ────────────────
 
 func TestHandler_Heartbeat_EmitsFrame(t *testing.T) {
+	t.Parallel() // asserts no process-wide metric
 	h, _, nc := newProvisionedHandler(t)
 	defer nc.Close()
 	defer h.Cleanup()
@@ -1181,6 +1182,7 @@ func TestHandler_NATSReconnect_AllowsSubsequentSSE(t *testing.T) {
 }
 
 func TestHandler_NATSReconnect_ConnectedSSEReceivesPostReconnectMessage(t *testing.T) {
+	t.Parallel() // asserts no process-wide metric
 	// A restart keeps the port and store directory: the handler reconnects to
 	// the same URL and the file-backed stream survives.
 	ns, restart := startRestartableJetStreamServer(t)

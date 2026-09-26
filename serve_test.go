@@ -10,7 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -1465,67 +1467,71 @@ func TestServeStream_ReplayCapEndsTheBatch(t *testing.T) {
 
 // TestStreamReads_LatecomersShareTheNextRead covers #123: callers arriving
 // while a read runs share one later read, and nobody gets a read that
-// started before it arrived.
+// started before it arrived. It runs in a synctest bubble, whose Wait
+// returns once every caller is waiting, and stamps events with a logical
+// clock rather than the bubble's fake one. Each read's result carries its
+// number, so a caller handed an older read's result is caught.
 func TestStreamReads_LatecomersShareTheNextRead(t *testing.T) {
-	var reads streamReads
-	var mu sync.Mutex
-	var starts []time.Time
-	release := make(chan struct{})
-	fetch := func() (jetstream.Stream, error) {
-		mu.Lock()
-		starts = append(starts, time.Now())
-		first := len(starts) == 1
-		mu.Unlock()
-		if first {
-			<-release
-		}
-		return fakeStream{}, nil
-	}
-
-	firstDone := make(chan struct{})
-	go func() {
-		_, _ = reads.read(context.Background(), fetch)
-		close(firstDone)
-	}()
-	for {
-		mu.Lock()
-		started := len(starts) == 1
-		mu.Unlock()
-		if started {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	var wg sync.WaitGroup
-	arrivals := make([]time.Time, 10)
-	for i := range arrivals {
-		wg.Add(1)
-		arrivals[i] = time.Now()
-		go func() {
-			defer wg.Done()
-			if _, err := reads.read(context.Background(), fetch); err != nil {
-				t.Errorf("read: %v", err)
+	synctest.Test(t, func(t *testing.T) {
+		var reads streamReads
+		var clock atomic.Int64
+		var mu sync.Mutex
+		var starts []int64
+		release := make(chan struct{})
+		fetch := func() (jetstream.Stream, error) {
+			mu.Lock()
+			starts = append(starts, clock.Add(1))
+			n := len(starts)
+			mu.Unlock()
+			if n == 1 {
+				<-release
 			}
-		}()
-	}
-	time.Sleep(20 * time.Millisecond) // let the latecomers queue up
-	close(release)
-	<-firstDone
-	wg.Wait()
-
-	if len(starts) != 2 {
-		t.Fatalf("reads = %d, want 2: the first and one shared by the 10 latecomers", len(starts))
-	}
-	for i, arrived := range arrivals {
-		if starts[1].Before(arrived) {
-			t.Fatalf("latecomer %d arrived at %v but got a read started at %v", i, arrived, starts[1])
+			return fakeStream{info: &jetstream.StreamInfo{State: jetstream.StreamState{LastSeq: uint64(n)}}}, nil
 		}
-	}
+		readNumber := func(stream jetstream.Stream) uint64 { return stream.CachedInfo().State.LastSeq }
 
-	if _, err := reads.read(context.Background(), fetch); err != nil || len(starts) != 3 {
-		t.Fatalf("a caller after the storm got reads=%d err=%v, want its own fresh read", len(starts), err)
-	}
+		firstDone := make(chan struct{})
+		go func() {
+			if stream, err := reads.read(context.Background(), fetch); err != nil || readNumber(stream) != 1 {
+				t.Errorf("the first caller got read %v (err %v), want 1", stream, err)
+			}
+			close(firstDone)
+		}()
+		synctest.Wait() // the first read is running, held by release
+
+		var wg sync.WaitGroup
+		arrivals := make([]int64, 10)
+		for i := range arrivals {
+			wg.Add(1)
+			arrivals[i] = clock.Add(1)
+			go func() {
+				defer wg.Done()
+				stream, err := reads.read(context.Background(), fetch)
+				if err != nil {
+					t.Errorf("read: %v", err)
+				} else if n := readNumber(stream); n != 2 {
+					t.Errorf("a latecomer got the result of read %d, want 2: read 1 started before it arrived", n)
+				}
+			}()
+		}
+		synctest.Wait() // every latecomer waits for the next read
+		close(release)
+		<-firstDone
+		wg.Wait()
+
+		if len(starts) != 2 {
+			t.Fatalf("reads = %d, want 2: the first and one shared by the 10 latecomers", len(starts))
+		}
+		for i, arrived := range arrivals {
+			if starts[1] < arrived {
+				t.Fatalf("latecomer %d arrived at %d but got a read started at %d", i, arrived, starts[1])
+			}
+		}
+
+		if stream, err := reads.read(context.Background(), fetch); err != nil || len(starts) != 3 || readNumber(stream) != 3 {
+			t.Fatalf("a caller after the storm got reads=%d err=%v, want its own fresh read", len(starts), err)
+		}
+	})
 }
 
 func TestStreamReads_ErrorsAndCancellation(t *testing.T) {
