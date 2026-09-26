@@ -102,6 +102,24 @@ func TestStreamFeed_StopsPullingWhileTheWriterIsBusy(t *testing.T) {
 	})
 }
 
+// TestStreamFeed_StopReleasesAFeedBlockedOnTheWriter: when a stream whose
+// writer stopped reading ends, its feed is blocked handing over a frame. It
+// must return rather than stay blocked, holding the frame, for good; the
+// bubble fails the test if the feed goroutine is still blocked at the end.
+func TestStreamFeed_StopReleasesAFeedBlockedOnTheWriter(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
+		it := newFakeIterator(100)
+		for seq := uint64(1); seq <= 100; seq++ {
+			it.msgs <- newFakeJSMsg("events.alpha", seq, "c_1", `{}`)
+		}
+		feed := h.startStreamFeed(it, testFeedPlan)
+		synctest.Wait() // the hand-off is full and the feed blocked on it
+		feed.stop()
+		synctest.Wait()
+	})
+}
+
 func TestStreamFeed_ReportsIteratorFailureOnce(t *testing.T) {
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	it := newFakeIterator(1)

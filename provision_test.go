@@ -318,8 +318,14 @@ func TestHandler_Cleanup(t *testing.T) {
 			h.mu.RUnlock()
 
 			for call := 1; call <= 3; call++ {
+				start := time.Now()
 				if err := h.Cleanup(); err != nil {
 					t.Fatalf("Cleanup call %d: %v", call, err)
+				}
+				// With no stream running there is nothing to wait for; the
+				// streams' deadline (cleanupStreamsTimeout) must not apply.
+				if took := time.Since(start); took > time.Second {
+					t.Fatalf("Cleanup call %d took %v with no stream running", call, took)
 				}
 			}
 			h.mu.RLock()

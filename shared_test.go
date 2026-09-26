@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"testing"
@@ -360,4 +362,100 @@ func newSharedContractServer(t *testing.T, configure func(*Handler)) (*Handler, 
 		}
 	})
 	return h, srv, nc
+}
+
+// TestShared_EndedStreamsLeaveNoGoroutinesBehind: whichever way a stream with
+// shared subscriptions ends, nothing it started keeps running. Ten streams
+// each end in one of three ways, so a leak of a goroutine per stream clears
+// the slack: live streams whose subscriptions close with them; stalled
+// streams that write_timeout ends while their feeds wait on the writer; and
+// streams that fell behind, caught up on their own consumers and sit idle
+// there, since a connection that left waits sharedJoinBackoff to rejoin.
+func TestShared_EndedStreamsLeaveNoGoroutinesBehind(t *testing.T) {
+	const streams = 10
+	h, nc := provisionOnStream(t, sharedStreamConfig(), func(h *Handler) {
+		h.SharedSubscriptions = true
+		h.ClientBufferSize = 4
+		h.WriteTimeout = 1
+	})
+	js, _ := nc.JetStream()
+	baseline := runtime.NumGoroutine()
+	serve := func(w http.ResponseWriter, target string) (context.CancelFunc, <-chan error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		done := make(chan error, 1)
+		go func() { done <- h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil).WithContext(ctx), nil) }()
+		return cancel, done
+	}
+	var ends []func()
+
+	// Stalled: the connected event gets through, then every write waits
+	// out write_timeout.
+	stalledDone := make([]<-chan error, streams)
+	for i := range stalledDone {
+		w := newStalledDeadlineWriter(1)
+		var cancel context.CancelFunc
+		cancel, stalledDone[i] = serve(w, "/events?topic=stall")
+		defer cancel()
+		for deadline := time.Now().Add(3 * time.Second); !strings.Contains(w.Body(), "event: connected"); time.Sleep(5 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("stalled stream %d never connected", i)
+			}
+		}
+	}
+	publishRange(t, js, "events.stall", 1, 60) // enough to fill each feed's hand-off
+
+	// Fallen behind, then caught up on their own consumers.
+	gates := make([]*gatedWriter, streams)
+	for i := range gates {
+		gates[i] = &gatedWriter{safeFlushRecorder: newSafeRecorder(), allow: 1, gate: make(chan struct{})}
+		cancel, done := serve(gates[i], "/events?topic=behind")
+		ends = append(ends, func() { cancel(); <-done })
+		if !waitForSSEBody(gates[i].safeFlushRecorder, "event: connected", 3*time.Second) {
+			t.Fatalf("gated stream %d never connected", i)
+		}
+	}
+	publishRange(t, js, "events.behind", 1, 30)
+	for i, g := range gates {
+		close(g.gate)
+		if !waitForSSEBody(g.safeFlushRecorder, `{"n":30}`, 5*time.Second) {
+			t.Fatalf("gated stream %d never caught up; ids=%v", i, lastN(parseSSEIDs(t, g.Body()), 3))
+		}
+	}
+
+	// Live, each on a subscription of its own.
+	for i := 0; i < streams; i++ {
+		topic := "live" + strconv.Itoa(i)
+		rr, cancel, done := startSSE(t, h, "/events?topic="+topic, "")
+		publishRange(t, js, "events."+topic, 1, 1)
+		if !waitForSSEBody(rr, `{"n":1}`, 3*time.Second) {
+			t.Fatalf("live stream %s got nothing", topic)
+		}
+		ends = append(ends, func() { stopSSE(t, cancel, done) })
+	}
+
+	for _, end := range ends {
+		end()
+	}
+	for i, done := range stalledDone {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("stalled stream %d outlived write_timeout", i)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > baseline+3 {
+		if time.Now().After(deadline) {
+			var dump strings.Builder
+			_ = pprof.Lookup("goroutine").WriteTo(&dump, 1)
+			var ours []string
+			for _, stack := range strings.Split(dump.String(), "\n\n") {
+				if strings.Contains(stack, "ideaconnect/nuts.") {
+					ours = append(ours, stack)
+				}
+			}
+			t.Fatalf("goroutines: %d after the streams ended, %d before; NUTS stacks:\n%s", runtime.NumGoroutine(), baseline, strings.Join(ours, "\n\n"))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
