@@ -525,19 +525,21 @@ Several of these are good first issues.
 
 ## Phase 8: Test-suite hardening and hygiene (parallelisable)
 
-- [ ] **[#129] Positive controls and exact metric deltas.** *minor · M*
-  - [ ] Give vacuous tests a positive control, and assert exact metric deltas.
-  - [ ] Assert the series no test covers yet:
+- [x] **[#129] Positive controls and exact metric deltas.** *minor · M*
+  - [x] Give vacuous tests a positive control, and assert exact metric deltas.
+  - [x] Assert the series no test covers yet:
     - `nuts_wildcard_filter_drops_total`;
     - `nuts_write_disconnects_total{site=connected|message}`;
     - `nuts_nats_connection_events_total{event="closed"}`.
-  - [ ] Remove the undocumented `"queue_full"` label.
-- [ ] **[#130] Godog gaps.** *minor · M*
-  - [ ] The invalidation scenario asserts that `consumer_invalidated`
-    increments.
-  - [ ] Add a quiet window to exact-count steps.
-  - [ ] Add a contiguous-ids step.
-  - [ ] Expose a metrics endpoint in the functional stack.
+  - [x] Remove the undocumented `"queue_full"` label (gone with the push
+    pipeline).
+- [x] **[#130] Godog gaps.** *minor · M*
+  - [x] The invalidation scenario asserts that `consumer_invalidated`
+    increments (through Caddy's `/metrics`, which exposed no NUTS metric until
+    this was added).
+  - [x] Add a quiet window to exact-count steps.
+  - [x] Add a contiguous-ids step.
+  - [x] Expose a metrics endpoint in the functional stack.
 - [ ] **[#131] Hygiene.** *nit · M*
   - [ ] Split `nats_test.go` by source file, with a shared `testutil_test.go`.
   - [ ] Keep one server-start helper and one counter reader.
@@ -551,20 +553,20 @@ Several of these are good first issues.
 - [x] **[#63]** `TestTryParseJSON` asserts the parsed content. *minor · S*
   Obsolete: `tryParseJSON` left the formatter (#122); `TestWriteJSONPayload`
   asserts exact output.
-- [ ] **[#64]** The large-payload memory test asserts the payload survives
+- [x] **[#64]** The large-payload memory test asserts the payload survives
   formatting. *nit · S*
-- [ ] **[#65] Readiness failure metric.** *minor · S*
-  - [ ] Force a readiness-probe `StreamInfo` failure, and assert that
+- [x] **[#65] Readiness failure metric.** *minor · S*
+  - [x] Force a readiness-probe `StreamInfo` failure, and assert that
     `cause="stream_info_error"` increments and is logged.
-- [ ] **[#66]** Assert the `disconnect_reason=max_connections` log field.
+- [x] **[#66]** Assert the `disconnect_reason=max_connections` log field.
   *minor · S*
-- [ ] **[#67]** Assert CORS headers on 429 (and on 401, 403 and 503).
+- [x] **[#67]** Assert CORS headers on 429 (and on 401, 403 and 503).
   *minor · S*
-- [ ] **[#68]** Assert `h.shutdown == nil` after a `connectNATS` failure in
+- [x] **[#68]** Assert `h.shutdown == nil` after a `connectNATS` failure in
   `Provision`. *minor · S*
-- [ ] **[#69]** Assert `subscription_failed`, and test or delete the
+- [x] **[#69]** Assert `subscription_failed`, and test or delete the
   unreachable `subscription_empty` branch. *minor · S*
-- [ ] **[#87]** With the cookie configured but absent or empty, the request
+- [x] **[#87]** With the cookie configured but absent or empty, the request
   gets 401. *nit · S*
 
 ## Phase 9: Documentation, metrics and operations (due before each release)

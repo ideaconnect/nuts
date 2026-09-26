@@ -426,3 +426,28 @@ func TestServeHTTP_NATSDownIsRejectedAtOnce(t *testing.T) {
 		t.Fatalf("missing disconnect_reason=jetstream_unavailable: %v", obs.All())
 	}
 }
+
+// TestConnectNATS_ClosedEventCountsTerminalCloses: a connection that gives
+// up reconnecting is counted as closed, unlike the one Cleanup closes (#129).
+func TestConnectNATS_ClosedEventCountsTerminalCloses(t *testing.T) {
+	ns := startJetStreamServer(t)
+	core, obs := observer.New(zap.InfoLevel)
+	h := &Handler{NatsURL: ns.ClientURL(), MaxReconnects: intPtr(0), logger: zap.New(core)}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+	defer h.Cleanup()
+	before := counterValue(metricsNATSConnectionEvents, "closed")
+
+	ns.Shutdown() // with max_reconnects 0 the connection closes for good
+	deadline := time.Now().Add(5 * time.Second)
+	for counterValue(metricsNATSConnectionEvents, "closed") == before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := counterValue(metricsNATSConnectionEvents, "closed"); got != before+1 {
+		t.Fatalf("nats_connection_events_total{closed} = %v, want %v", got, before+1)
+	}
+	if obs.FilterMessage("NATS connection closed").Len() != 1 {
+		t.Fatalf("missing the closed log line: %v", obs.All())
+	}
+}

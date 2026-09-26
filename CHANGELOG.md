@@ -195,6 +195,13 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   next major release.
 
 ### Fixed
+- **No `nuts_*` metric reached a Prometheus scrape of Caddy.** NUTS
+  registered its metrics on Prometheus' default registry, but Caddy's metrics
+  handler and admin `/metrics` endpoint serve a registry of their own,
+  created for every config load, so the documented metrics, alert rules and
+  dashboard saw nothing. Provision now registers every NUTS metric with that
+  registry. Found while adding a metrics endpoint to the functional test
+  stack (#130), which now asserts a NUTS metric through it.
 - **Messages in flight when NUTS' NATS connection dropped were lost for good**,
   and the SSE stream continued with a hole that `Last-Event-ID` could not
   recover (#99). The ordered consumer now resumes after the last message it

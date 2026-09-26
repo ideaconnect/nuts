@@ -569,6 +569,7 @@ func TestHandler_MaxEventSize_DropsOversizedRawPayload(t *testing.T) {
 // ── max_connections cap ───────────────────────────────────────────────────
 
 func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
+	maxConnCore, maxConnLogs := observer.New(zap.WarnLevel)
 	ns := startJetStreamServer(t)
 	defer ns.Shutdown()
 
@@ -585,9 +586,9 @@ func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
 		MaxConnections:    1,
-		AllowedOrigins:    []string{"*"},
+		AllowedOrigins:    []string{"https://app.example.com"},
 		ClientBufferSize:  64,
-		logger:            zap.NewNop(),
+		logger:            zap.New(maxConnCore),
 	}
 	if err := h.connectNATS(); err != nil {
 		t.Fatalf("connectNATS: %v", err)
@@ -624,6 +625,7 @@ func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
 
 	// Second request must be rejected immediately.
 	req2 := httptest.NewRequest(http.MethodGet, "/events?topic=b", nil)
+	req2.Header.Set("Origin", "https://app.example.com")
 	rr2 := httptest.NewRecorder()
 	if err := h.ServeHTTP(rr2, req2, nil); err != nil {
 		t.Fatalf("second ServeHTTP returned err: %v", err)
@@ -632,6 +634,18 @@ func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
 		t.Errorf("expected 429 (RFC 6585) for max_connections, got %d", rr2.Code)
 	}
 	assertRetryAfter(t, rr2.Header())
+	// CORS headers precede the cap check (#67): without them a browser sees
+	// an opaque CORS failure instead of the 429 and never retries.
+	if got := rr2.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Errorf("429 Access-Control-Allow-Origin = %q, want the request origin", got)
+	}
+	if got := rr2.Header().Get("Vary"); got != "Origin" {
+		t.Errorf("429 Vary = %q, want Origin", got)
+	}
+	// The rejection is logged with its reason and the cap (#66).
+	if !hasLogField(maxConnLogs, "disconnect_reason", "max_connections") || !hasIntLogField(maxConnLogs, "max_connections", 1) {
+		t.Errorf("missing disconnect_reason=max_connections / max_connections=1 in %v", maxConnLogs.All())
+	}
 
 	// A native EventSource would give up for good on the 429, so it is told
 	// to retry instead (#105).
@@ -643,7 +657,7 @@ func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
 	}
 	assertRetryStream(t, rr3, "Too many concurrent connections")
 
-	if got := counterValue(metricsConnectionsRejected, "max_connections"); got <= before {
+	if got := counterValue(metricsConnectionsRejected, "max_connections"); got != before+2 { // the plain and the EventSource request
 		t.Errorf("nuts_connections_rejected_total{reason=max_connections} did not increment: %v -> %v", before, got)
 	}
 
@@ -1629,18 +1643,14 @@ func TestHandler_HealthPath_CustomSuffix(t *testing.T) {
 	}
 
 	// Original /healthz should NOT be a health endpoint when HealthPath is /status:
-	// it should fall through to SSE topic handling (topic "healthz").
-	// Just ensure it does not return a JSON health blob.
-	req2 := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-	ctx, cancel := context.WithTimeout(req2.Context(), 200*time.Millisecond)
-	defer cancel()
-	req2 = req2.WithContext(ctx)
-	rr2 := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	done := make(chan error, 1)
-	go func() { done <- h.ServeHTTP(rr2, req2, nil) }()
-	<-done
-	if strings.Contains(rr2.Body.String(), `"nats":"connected"`) {
-		t.Errorf("/healthz should not be a health endpoint when HealthPath=/status")
+	// it falls through to SSE topic handling, as topic "healthz", which the
+	// stream (events.>) does not carry.
+	rr2 := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/healthz", nil), nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr2.Code != http.StatusServiceUnavailable || !strings.Contains(rr2.Body.String(), "Failed to subscribe to requested topics: healthz") {
+		t.Errorf("/healthz with HealthPath=/status should be handled as topic healthz, got %d %q", rr2.Code, rr2.Body.String())
 	}
 }
 
@@ -2577,5 +2587,107 @@ func TestHandler_UnmarshalCaddyfile_SharedSubscriptions(t *testing.T) {
 		if err != nil || h.SharedSubscriptions != c.want {
 			t.Errorf("%q: SharedSubscriptions = %v (err %v), want %v", c.line, h.SharedSubscriptions, err, c.want)
 		}
+	}
+}
+
+// TestHandler_ReadinessProbe_StreamInfoErrorIsCounted covers #65: with NATS
+// connected but the stream gone, the probe reports stream_info_error, once.
+func TestHandler_ReadinessProbe_StreamInfoErrorIsCounted(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+	core, obs := observer.New(zap.WarnLevel)
+	h.logger = zap.New(core)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := mustJetStream(t, nc).DeleteStream(ctx, "EVENTS"); err != nil {
+		t.Fatalf("DeleteStream: %v", err)
+	}
+	before := map[string]float64{}
+	for _, cause := range []string{"stream_info_error", "nats_disconnected", "jetstream_missing"} {
+		before[cause] = counterValue(metricsReadinessFailures, cause)
+	}
+
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil), nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), `"stream":"unavailable"`) || !strings.Contains(rr.Body.String(), `"nats":"connected"`) {
+		t.Fatalf("probe = %d %s, want 503 with the stream unavailable and NATS connected", rr.Code, rr.Body.String())
+	}
+	for cause, want := range map[string]float64{"stream_info_error": 1, "nats_disconnected": 0, "jetstream_missing": 0} {
+		if got := counterValue(metricsReadinessFailures, cause) - before[cause]; got != want {
+			t.Errorf("readiness_failures_total{cause=%s} moved by %v, want %v", cause, got, want)
+		}
+	}
+	if !hasLogField(obs, "cause", "stream_info_error") {
+		t.Errorf("missing cause=stream_info_error warning: %v", obs.All())
+	}
+}
+
+// TestHandler_RejectionsCarryCORSHeaders covers #67 for the other refusals:
+// a browser can only read a 400, 401, 403 or 503 when it carries the CORS
+// headers.
+func TestHandler_RejectionsCarryCORSHeaders(t *testing.T) {
+	secret := "test-secret"
+	forbidden := signTestSubscriberJWT(t, secret, map[string]interface{}{"sub": "a", "subscribe": "other", "exp": time.Now().Add(time.Hour).Unix()})
+	for _, c := range []struct {
+		name   string
+		h      *Handler
+		target string
+		auth   string
+		want   int
+	}{
+		{name: "invalid topic", h: &Handler{}, target: "/events?topic=a*b", want: http.StatusBadRequest},
+		{name: "missing token", h: &Handler{SubscriberJWTKey: secret}, target: "/events?topic=a", want: http.StatusUnauthorized},
+		{name: "forbidden topic", h: &Handler{SubscriberJWTKey: secret}, target: "/events?topic=a", auth: "Bearer " + forbidden, want: http.StatusForbidden},
+		{name: "JetStream unavailable", h: &Handler{}, target: "/events?topic=a", want: http.StatusServiceUnavailable},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			c.h.AllowedOrigins = []string{"https://app.example.com"}
+			c.h.logger = zap.NewNop()
+			req := httptest.NewRequest(http.MethodGet, c.target, nil)
+			req.Header.Set("Origin", "https://app.example.com")
+			if c.auth != "" {
+				req.Header.Set("Authorization", c.auth)
+			}
+			rr := httptest.NewRecorder()
+			if err := c.h.ServeHTTP(rr, req, nil); err != nil {
+				t.Fatalf("ServeHTTP: %v", err)
+			}
+			if rr.Code != c.want {
+				t.Fatalf("status = %d, want %d", rr.Code, c.want)
+			}
+			if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+				t.Fatalf("Access-Control-Allow-Origin = %q, want the request origin", got)
+			}
+		})
+	}
+}
+
+// TestHandler_SubscriberJWT_CookieConfiguredButMissing covers #87: with the
+// cookie transport configured, a request without the cookie, or with an
+// empty one, and no Authorization header is refused.
+func TestHandler_SubscriberJWT_CookieConfiguredButMissing(t *testing.T) {
+	h := &Handler{SubscriberJWTKey: "test-secret", SubscriberJWTCookie: "nuts_session", logger: zap.NewNop()}
+	for name, cookie := range map[string]*http.Cookie{
+		"no cookie":    nil,
+		"empty cookie": {Name: "nuts_session", Value: ""},
+		"other cookie": {Name: "unrelated", Value: "x"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/events?topic=a", nil)
+			if cookie != nil {
+				req.AddCookie(cookie)
+			}
+			rr := httptest.NewRecorder()
+			if err := h.ServeHTTP(rr, req, nil); err != nil {
+				t.Fatalf("ServeHTTP: %v", err)
+			}
+			if rr.Code != http.StatusUnauthorized || rr.Header().Get("WWW-Authenticate") != `Bearer realm="nuts"` {
+				t.Fatalf("response = %d (WWW-Authenticate %q), want 401 with a Bearer challenge", rr.Code, rr.Header().Get("WWW-Authenticate"))
+			}
+		})
 	}
 }

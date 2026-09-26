@@ -370,7 +370,7 @@ func TestHandler_RecordDroppedMessageLogsFormattedEvent(t *testing.T) {
 		DropSize:   128,
 	})
 
-	if got := counterValue(metricsMessagesDropped, dropReasonFormattedSSEMessage); got <= before {
+	if got := counterValue(metricsMessagesDropped, dropReasonFormattedSSEMessage); got != before+1 {
 		t.Fatalf("messages dropped metric (reason=formatted_sse_message) did not increment: before=%v got=%v", before, got)
 	}
 }

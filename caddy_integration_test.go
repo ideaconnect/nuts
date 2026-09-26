@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/standard"
+	_ "github.com/caddyserver/caddy/v2/modules/metrics"
 	"github.com/nats-io/nats.go"
 )
 
@@ -118,4 +120,81 @@ func TestCaddy_StreamsWithAccessLogsAndHTTPMetrics(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCaddy_MetricsEndpointExposesNUTSMetrics: Caddy's metrics handler serves
+// a registry created for each config, not Prometheus' default one, so the
+// nuts_* series only appear there because Provision registers them. Two nuts
+// routes share the collectors.
+func TestCaddy_MetricsEndpointExposesNUTSMetrics(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	nuts := fmt.Sprintf(`{"handler": "nuts", "nats_url": %q, "stream_name": "EVENTS", "topic_prefix": "events."}`, ns.ClientURL())
+	cfg := fmt.Sprintf(`{
+		"admin": {"disabled": true},
+		"logging": {"logs": {"default": {"level": "ERROR"}}},
+		"apps": {"http": {"servers": {"nuts": {
+			"listen": ["127.0.0.1:%d"],
+			"routes": [
+				{"match": [{"path": ["/metrics"]}], "handle": [{"handler": "metrics"}]},
+				{"match": [{"path": ["/a/*"]}], "handle": [{"handler": "rewrite", "strip_path_prefix": "/a"}, %s]},
+				{"handle": [%s]}
+			]
+		}}}}
+	}`, port, nuts, nuts)
+	if err := caddy.Load([]byte(cfg), true); err != nil {
+		t.Fatalf("caddy.Load: %v", err)
+	}
+	t.Cleanup(func() { _ = caddy.Stop() })
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	stream, err := http.Get(base + "/events?topic=alpha")
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer stream.Body.Close()
+	lines := make(chan string, 16)
+	go func() {
+		sc := bufio.NewScanner(stream.Body)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+		close(lines)
+	}()
+	readSSEUntil(t, lines, "event: connected")
+
+	resp, err := http.Get(base + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	for _, want := range []string{"nuts_active_connections 1", "# TYPE nuts_messages_delivered_total counter"} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("/metrics lacks %q; nuts_* series: %v", want, grepLines(string(body), "nuts_"))
+		}
+	}
+}
+
+func grepLines(text, needle string) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, needle) {
+			out = append(out, line)
+		}
+	}
+	return out
 }

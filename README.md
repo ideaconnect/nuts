@@ -854,7 +854,7 @@ Operational runbooks and Kubernetes probe examples are in
 
 ### Prometheus Metrics
 
-NUTS registers the following metrics via `promauto`, which appear automatically on Caddy's `/metrics` endpoint when the [admin API](https://caddyserver.com/docs/caddyfile/options#admin) or a [metrics handler](https://caddyserver.com/docs/caddyfile/directives/metrics) is enabled.
+NUTS registers the following metrics with the metrics registry of the Caddy config it is loaded in, so they appear on Caddy's `/metrics` endpoint when the [admin API](https://caddyserver.com/docs/caddyfile/options#admin) or a [metrics handler](https://caddyserver.com/docs/caddyfile/directives/metrics) is enabled. (They are also registered on Prometheus' default registry, for programs that embed NUTS and serve that one.)
 
 To expose metrics, add a `metrics` handler to your Caddyfile:
 

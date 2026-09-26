@@ -144,6 +144,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// Warn before the connection is opened: by the time Validate runs, the
 	// credentials and the first JetStream requests have already been sent.
 	h.warnAboutTransportSecurity()
+	if err := registerMetrics(ctx.GetMetricsRegistry()); err != nil {
+		return fmt.Errorf("failed to register metrics: %w", err)
+	}
 
 	// Step 1: Normalize optional settings before dialling NATS.
 	if h.HeartbeatInterval <= 0 {

@@ -12,6 +12,11 @@
 		respond 200
 	}
 
+	# Prometheus metrics, nuts_* included, for scenarios that assert them.
+	handle /metrics {
+		metrics
+	}
+
 	handle /events* {
 		uri strip_prefix /events
 		nuts {

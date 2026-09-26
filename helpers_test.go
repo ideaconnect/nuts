@@ -178,39 +178,17 @@ func TestClassifyNATSAsyncError_ConsumerNotActive_PrimaryHeartbeatMissPath(t *te
 }
 
 // TestMetrics_ConsumerInvalidated_RegisteredWithExpectedLabels locks the
-// public contract for the metric Batch B (#M9-5) will populate. Batch A
-// declares the CounterVec so /metrics exposes a zero-value series before
-// the routing code lands — dashboards and alerts can reference the
-// series name without breaking on first deploy.
-//
-// The two reason values (heartbeat_missed, slow_consumer) match the
-// two errors classifyNATSAsyncError surfaces for routed termination
-// (consumer_invalidated and slow_consumer respectively); Batch B
-// maps one to the other inside the serveStream termination arm.
+// metric's label set: dashboards and alerts reference reason="recreated" and
+// reason="unrecoverable". Their increments are asserted, as deltas, by the
+// consumer recovery and unrecoverable-consumer tests.
 func TestMetrics_ConsumerInvalidated_RegisteredWithExpectedLabels(t *testing.T) {
-	for _, reason := range []string{"heartbeat_missed", "slow_consumer"} {
-		t.Run(reason, func(t *testing.T) {
-			// WithLabelValues panics on label-count mismatch or unregistered
-			// vector — recover surfaces both as a test failure with the
-			// pre-panic diagnostic intact.
-			defer func() {
-				if r := recover(); r != nil {
-					t.Fatalf("metricsConsumerInvalidated.WithLabelValues(%q) panicked: %v", reason, r)
-				}
-			}()
-			c := metricsConsumerInvalidated.WithLabelValues(reason)
-			if c == nil {
-				t.Fatalf("metricsConsumerInvalidated.WithLabelValues(%q) returned nil", reason)
-			}
-			// Zero-counted series must be visible in /metrics; assert we
-			// can read the count without registration error. Batch A
-			// MUST NOT increment this metric; the assertion below pins
-			// that contract — if Phase 3 (or any pre-Batch-B change)
-			// starts ticking it, this test will catch it.
-			if v := counterValue(metricsConsumerInvalidated, reason); v != 0 {
-				t.Fatalf("metricsConsumerInvalidated{reason=%q} = %v before Batch B; expected 0 (Batch A is declaration-only)", reason, v)
-			}
-		})
+	for _, reason := range []string{"recreated", "unrecoverable"} {
+		if _, err := metricsConsumerInvalidated.GetMetricWithLabelValues(reason); err != nil {
+			t.Fatalf("consumer_invalidated_total{reason=%q}: %v", reason, err)
+		}
+	}
+	if _, err := metricsConsumerInvalidated.GetMetricWithLabelValues("recreated", "extra"); err == nil {
+		t.Fatal("consumer_invalidated_total accepted two labels, want exactly reason")
 	}
 }
 

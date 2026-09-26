@@ -219,9 +219,8 @@ func TestMetrics_MessagesDelivered_IncrementsPerEvent(t *testing.T) {
 	cancel()
 	<-done
 
-	got := counterVal(t, metricsMessagesDelivered)
-	if got < before+3 {
-		t.Errorf("messages_delivered_total did not advance by 3: before=%v got=%v", before, got)
+	if got := counterVal(t, metricsMessagesDelivered); got != before+3 {
+		t.Errorf("messages_delivered_total = %v, want %v (exactly the 3 messages)", got, before+3)
 	}
 }
 
@@ -261,9 +260,8 @@ func TestMetrics_MessagesDropped_IncrementsOnOversized(t *testing.T) {
 	cancel()
 	<-done
 
-	got := counterValue(metricsMessagesDropped, dropReasonRawPayload)
-	if got <= before {
-		t.Errorf("messages_dropped_total{reason=raw_payload} did not increment: before=%v got=%v body=%s", before, got, rr.Body())
+	if got := counterValue(metricsMessagesDropped, dropReasonRawPayload); got != before+1 {
+		t.Errorf("messages_dropped_total{reason=raw_payload} = %v, want %v; body=%s", got, before+1, rr.Body())
 	}
 }
 
@@ -406,8 +404,8 @@ func TestMetrics_ReplayCapReached_Increments(t *testing.T) {
 	go func() { done <- h.ServeHTTP(rr, req, nil) }()
 	<-done
 
-	if got := counterVal(t, metricsReplayCapReached); got <= before {
-		t.Errorf("replay_cap_reached_total did not increment: before=%v got=%v", before, got)
+	if got := counterVal(t, metricsReplayCapReached); got != before+1 {
+		t.Errorf("replay_cap_reached_total = %v, want %v", got, before+1)
 	}
 }
 
@@ -434,8 +432,8 @@ func TestMetrics_SubscriptionErrors_Increments(t *testing.T) {
 		t.Errorf("expected 503 on subscription failure, got %d", rr.Code)
 	}
 
-	if got := counterVal(t, metricsSubscriptionErrors); got <= before {
-		t.Errorf("subscription_errors_total did not increment: before=%v got=%v", before, got)
+	if got := counterVal(t, metricsSubscriptionErrors); got != before+1 {
+		t.Errorf("subscription_errors_total = %v, want %v", got, before+1)
 	}
 }
 
@@ -1081,7 +1079,8 @@ func TestHandler_JetStreamPersistence_MessagesSurviveHandlerLifetime(t *testing.
 		}
 	}
 
-	// First handler lifetime: provision, do nothing, tear down.
+	// First handler lifetime: deliver the messages to a client, then tear
+	// down. Delivering them must not consume them from the stream.
 	h1 := &Handler{
 		NatsURL:           ns.ClientURL(),
 		StreamName:        "EVENTS",
@@ -1098,6 +1097,11 @@ func TestHandler_JetStreamPersistence_MessagesSurviveHandlerLifetime(t *testing.
 	h1.mu.Lock()
 	h1.js = js1
 	h1.mu.Unlock()
+	first, cancelFirst, doneFirst := startSSE(t, h1, "/events?topic=persist&last-id=0", "")
+	if !waitForSSEBody(first, `"seq":2`, 3*time.Second) {
+		t.Fatalf("first handler did not deliver the messages; body=%s", first.Body())
+	}
+	stopSSE(t, cancelFirst, doneFirst)
 	if err := h1.Cleanup(); err != nil {
 		t.Fatalf("h1 Cleanup: %v", err)
 	}

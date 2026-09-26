@@ -1,11 +1,16 @@
 // metrics.go — Prometheus metrics for NUTS.
 //
-// All metrics are registered on init via promauto, which means they
-// automatically appear on Caddy's /metrics endpoint when the admin API
-// or a metrics handler is enabled.
+// The metrics are package-level collectors, registered on the default
+// Prometheus registry via promauto. Caddy does not serve that registry: its
+// metrics handler and admin /metrics endpoint expose a registry of their own,
+// created for every config load. Provision therefore also registers every
+// collector there (registerMetrics); without that, no nuts_* series ever
+// reaches a scrape.
 package nuts
 
 import (
+	"errors"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -45,7 +50,7 @@ var (
 	// pre-NATS-2.10 multi-topic wildcard fallback filtered client-side. That
 	// fallback is gone (nats-server >= 2.10 is required), so the series stays
 	// at zero until it is removed in the next major release.
-	_ = promauto.NewCounter(prometheus.CounterOpts{
+	metricsWildcardFilterDrops = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "wildcard_filter_drops_total",
 		Help:      "Deprecated, always 0: the pre-NATS-2.10 multi-topic wildcard fallback was removed.",
@@ -105,7 +110,7 @@ var (
 	// nuts_dispatch_timeout_total is deprecated along with dispatch_timeout:
 	// the pull consumer has no queue hand-off that can time out. The series
 	// stays at zero until it is removed in the next major release.
-	_ = promauto.NewCounter(prometheus.CounterOpts{
+	metricsDispatchTimeout = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "dispatch_timeout_total",
 		Help:      "Deprecated, always 0: dispatch_timeout has no effect since the pull consumer replaced the push queue.",
@@ -206,3 +211,46 @@ var (
 		Help:      "Total NATS connection-state transitions, labelled by event (disconnect, reconnect, closed, lame_duck).",
 	}, []string{"event"})
 )
+
+// nutsCollectors lists every NUTS metric for registerMetrics.
+func nutsCollectors() []prometheus.Collector {
+	return []prometheus.Collector{
+		metricsActiveConnections,
+		metricsMessagesDelivered,
+		metricsMessagesDropped,
+		metricsWildcardFilterDrops,
+		metricsSlowClientDisconnects,
+		metricsReplayRequests,
+		metricsReplayFallbacks,
+		metricsSubscriptionErrors,
+		metricsConnectionsRejected,
+		metricsReplayCapReached,
+		metricsDispatchTimeout,
+		metricsNATSAsyncErrors,
+		metricsConsumerInvalidated,
+		metricsWriteDisconnects,
+		metricsReadinessFailures,
+		metricsSharedSubscriptions,
+		metricsSharedTransitions,
+		metricsNATSConnectionEvents,
+	}
+}
+
+// registerMetrics registers the NUTS collectors with a Caddy config's metrics
+// registry. Several nuts handlers in one config share the collectors, so a
+// collector that is already registered is not an error.
+func registerMetrics(registry *prometheus.Registry) error {
+	if registry == nil {
+		return nil
+	}
+	for _, collector := range nutsCollectors() {
+		if err := registry.Register(collector); err != nil {
+			var already prometheus.AlreadyRegisteredError
+			if errors.As(err, &already) {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}

@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"sort"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // metricReference matches the metric names NUTS registers: every counter ends
@@ -83,5 +85,53 @@ func TestRegisteredMetricsAreDocumented(t *testing.T) {
 		if len(missing) > 0 {
 			t.Errorf("%s does not document %v", file, missing)
 		}
+	}
+}
+
+// TestNutsCollectorsCoverEveryMetric: every metric defined in metrics.go
+// must be in nutsCollectors, or Caddy's metrics endpoints never expose it.
+func TestNutsCollectorsCoverEveryMetric(t *testing.T) {
+	listed := map[string]bool{}
+	for _, collector := range nutsCollectors() {
+		descs := make(chan *prometheus.Desc, 4)
+		collector.Describe(descs)
+		close(descs)
+		for desc := range descs {
+			name := regexp.MustCompile(`fqName: "([a-z_]+)"`).FindStringSubmatch(desc.String())
+			if name == nil {
+				t.Fatalf("cannot read the name of %s", desc)
+			}
+			listed[name[1]] = true
+		}
+	}
+	for name := range registeredMetrics(t) {
+		if !listed[name] {
+			t.Errorf("%s is defined in metrics.go but missing from nutsCollectors", name)
+		}
+	}
+}
+
+func TestRegisterMetrics(t *testing.T) {
+	registry := prometheus.NewPedanticRegistry()
+	for i := 0; i < 2; i++ { // a second nuts handler in the same config
+		if err := registerMetrics(registry); err != nil {
+			t.Fatalf("registerMetrics (call %d): %v", i+1, err)
+		}
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	found := false
+	for _, family := range families {
+		if family.GetName() == "nuts_active_connections" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("nuts_active_connections missing from the registry")
+	}
+	if err := registerMetrics(nil); err != nil {
+		t.Fatalf("registerMetrics(nil) = %v, want no-op", err)
 	}
 }

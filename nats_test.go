@@ -816,53 +816,32 @@ func TestHandler_Provision(t *testing.T) {
 		if !strings.Contains(err.Error(), "failed to connect to NATS") {
 			t.Fatalf("expected wrapped connect error, got %v", err)
 		}
+		// The failure path runs Cleanup (#68): nothing Provision created may
+		// be left behind for a hot reload to trip over.
+		h.mu.RLock()
+		shutdownNil, connNil, jsNil := h.shutdown == nil, h.conn == nil, h.js == nil
+		h.mu.RUnlock()
+		if !shutdownNil || !connNil || !jsNil {
+			t.Fatalf("after a failed connect: shutdown nil=%v conn nil=%v js nil=%v, want all nil", shutdownNil, connNil, jsNil)
+		}
 	})
 }
 
-func TestHandler_connectNATS_AuthModes(t *testing.T) {
-	badURL := "nats://127.0.0.1:1"
+// TestHandler_connectNATS_RejectsInvalidCredentialsFile: with a reachable
+// server, the only reason to fail is the credentials file itself. Token and
+// user/password wiring are covered against servers that require them
+// (TestHandler_ConnectNATS_TokenAuth_Integration and _UserPassAuth_).
+func TestHandler_connectNATS_RejectsInvalidCredentialsFile(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
 	credsPath := t.TempDir() + "/user.creds"
 	if err := os.WriteFile(credsPath, []byte("invalid creds"), 0600); err != nil {
 		t.Fatalf("failed to create test creds file: %v", err)
 	}
-
-	tests := []struct {
-		name    string
-		handler *Handler
-	}{
-		{
-			name: "token auth branch",
-			handler: &Handler{
-				NatsURL:   badURL,
-				NatsToken: "token",
-				logger:    zap.NewNop(),
-			},
-		},
-		{
-			name: "user password auth branch",
-			handler: &Handler{
-				NatsURL:      badURL,
-				NatsUser:     "user",
-				NatsPassword: "password",
-				logger:       zap.NewNop(),
-			},
-		},
-		{
-			name: "credentials file branch",
-			handler: &Handler{
-				NatsURL:         badURL,
-				NatsCredentials: credsPath,
-				logger:          zap.NewNop(),
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.handler.connectNATS(); err == nil {
-				t.Fatal("expected connectNATS to fail with invalid test configuration")
-			}
-		})
+	h := &Handler{NatsURL: ns.ClientURL(), NatsCredentials: credsPath, logger: zap.NewNop()}
+	if err := h.connectNATS(); err == nil {
+		_ = h.Cleanup()
+		t.Fatal("connectNATS accepted an invalid credentials file")
 	}
 }
 
@@ -1727,6 +1706,7 @@ func TestHandler_ServeHTTP_ConnectedWriteFailure(t *testing.T) {
 	h.js = js
 	h.mu.Unlock()
 
+	connectedBefore := counterValue(metricsWriteDisconnects, "connected")
 	req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil)
 	w := newFailingFlushRecorder(0)
 
@@ -1745,6 +1725,9 @@ func TestHandler_ServeHTTP_ConnectedWriteFailure(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&h.connCount); got != 0 {
 		t.Fatalf("connCount = %d, want 0 after connected write failure", got)
+	}
+	if got := counterValue(metricsWriteDisconnects, "connected"); got != connectedBefore+1 {
+		t.Fatalf("nuts_write_disconnects_total{site=connected} = %v, want %v", got, connectedBefore+1)
 	}
 	if !waitForConsumerCount(t, js, "TEST_EVENTS", 0, 2*time.Second) {
 		t.Fatalf("ephemeral consumer leaked after connected write failure")
@@ -1864,6 +1847,7 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 	defer cancel()
 	req = req.WithContext(ctx)
 
+	messageBefore := counterValue(metricsWriteDisconnects, "message")
 	w := newFailingFlushRecorder(1)
 	done := make(chan error, 1)
 	go func() {
@@ -1890,6 +1874,9 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&h.connCount); got != 0 {
 		t.Fatalf("connCount = %d, want 0 after message write failure", got)
+	}
+	if got := counterValue(metricsWriteDisconnects, "message"); got != messageBefore+1 {
+		t.Fatalf("nuts_write_disconnects_total{site=message} = %v, want %v", got, messageBefore+1)
 	}
 	if !waitForConsumerCount(t, js, "TEST_EVENTS", 0, 2*time.Second) {
 		t.Fatalf("ephemeral consumer leaked after message write failure")
@@ -2057,8 +2044,8 @@ func TestHandler_ServeHTTP_HeartbeatWriteFailure(t *testing.T) {
 		t.Fatal("ServeHTTP did not return after heartbeat write failure")
 	}
 
-	if got := counterValue(metricsWriteDisconnects, "heartbeat"); got <= before {
-		t.Fatalf("nuts_write_disconnects_total{site=heartbeat} did not increment: before=%v got=%v", before, got)
+	if got := counterValue(metricsWriteDisconnects, "heartbeat"); got != before+1 {
+		t.Fatalf("nuts_write_disconnects_total{site=heartbeat} = %v, want %v", got, before+1)
 	}
 	if got := atomic.LoadInt64(&h.connCount); got != 0 {
 		t.Fatalf("connCount = %d, want 0 after heartbeat write failure", got)

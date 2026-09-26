@@ -53,6 +53,15 @@ Feature: SSE Streaming with JetStream
       | /events/readyz/  | available |
       | /events/healthz/ | connected |
 
+  Scenario: A backlog larger than the prefetch replays on one connection
+    # client_buffer_size is 64 by default; the stream stops pulling while the
+    # client catches up instead of disconnecting it.
+    Given I publish 200 messages to subject "events.backlog"
+    When I connect to SSE endpoint "/events?topic=backlog&last-id=0"
+    Then I should have received 200 SSE message events
+    And the received message event ids should be contiguous
+    And the SSE stream should still be open
+
   Scenario: Path-based topic subscription
     Given I am connected to SSE endpoint "/mypath"
     When I publish message '{"path": "based"}' to subject "events.mypath"

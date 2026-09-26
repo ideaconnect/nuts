@@ -14,6 +14,7 @@ Feature: JetStream consumer recovery
   # seconds and recreates itself after the last delivered message.
   Scenario: SSE stream recovers after the JetStream consumer is deleted
     Given I am connected to SSE endpoint "/events?topic=invalidation"
+    And I note the value of metric 'nuts_consumer_invalidated_total{reason="recreated"}'
     When I publish message '{"phase":"baseline"}' to subject "events.invalidation"
     Then I should receive an SSE event containing 'baseline'
     When I delete the active JetStream consumer for stream "EVENTS"
@@ -21,3 +22,4 @@ Feature: JetStream consumer recovery
     Then I should receive an SSE event containing 'after-delete'
     And the SSE stream should still be open
     And the received message event ids should be contiguous
+    And the metric 'nuts_consumer_invalidated_total{reason="recreated"}' should have increased

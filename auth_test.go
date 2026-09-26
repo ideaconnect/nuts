@@ -383,7 +383,7 @@ func TestAuthorizeStreamRequest_RejectionMetrics(t *testing.T) {
 		if err == nil || err.status != http.StatusUnauthorized {
 			t.Fatalf("want 401 token-missing rejection, got %#v", err)
 		}
-		if got := counterValue(metricsConnectionsRejected, "auth_missing_token"); got <= before {
+		if got := counterValue(metricsConnectionsRejected, "auth_missing_token"); got != before+1 {
 			t.Errorf("auth_missing_token counter did not increment: %v -> %v", before, got)
 		}
 	})
@@ -403,7 +403,7 @@ func TestAuthorizeStreamRequest_RejectionMetrics(t *testing.T) {
 		if err == nil || err.status != http.StatusUnauthorized {
 			t.Fatalf("want 401 invalid-token rejection, got %#v", err)
 		}
-		if got := counterValue(metricsConnectionsRejected, "auth_invalid_token"); got <= before {
+		if got := counterValue(metricsConnectionsRejected, "auth_invalid_token"); got != before+1 {
 			t.Errorf("auth_invalid_token counter did not increment: %v -> %v", before, got)
 		}
 	})
@@ -426,7 +426,7 @@ func TestAuthorizeStreamRequest_RejectionMetrics(t *testing.T) {
 		if err == nil || err.status != http.StatusForbidden {
 			t.Fatalf("want 403 topic-forbidden rejection, got %#v", err)
 		}
-		if got := counterValue(metricsConnectionsRejected, "auth_topic_forbidden"); got <= before {
+		if got := counterValue(metricsConnectionsRejected, "auth_topic_forbidden"); got != before+1 {
 			t.Errorf("auth_topic_forbidden counter did not increment: %v -> %v", before, got)
 		}
 	})

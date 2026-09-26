@@ -43,6 +43,7 @@ type testContext struct {
 	natsURL        string
 	cancelFunc     context.CancelFunc
 	publishedSeqs  map[int]uint64 // maps message index to JetStream sequence
+	notedMetrics   map[string]float64
 	heartbeats     []string
 	clients        map[string]*clientContext
 	streamNames    map[string]struct{}
@@ -915,7 +916,7 @@ func clientShouldHaveReceivedNMessages(name string, expected int) error {
 		return fmt.Errorf("client %q not found", name)
 	}
 
-	return waitUntil(fmt.Sprintf("client %q to receive %d messages", name, expected), functionalWaitTimeout, func() (bool, string) {
+	if err := waitUntil(fmt.Sprintf("client %q to receive %d messages", name, expected), functionalWaitTimeout, func() (bool, string) {
 		got := countMessages(clientEventsSnapshot(cc, false))
 		if got >= expected {
 			if got != expected {
@@ -924,6 +925,15 @@ func clientShouldHaveReceivedNMessages(name string, expected int) error {
 			return true, ""
 		}
 		return false, fmt.Sprintf("got %d messages", got)
+	}); err != nil {
+		return err
+	}
+	// A late duplicate would only show up after the count was reached.
+	return waitForNoEvent(fmt.Sprintf("client %q receiving more than %d messages", name, expected), functionalQuietWindow, func() (bool, string) {
+		if got := countMessages(clientEventsSnapshot(cc, false)); got > expected {
+			return true, fmt.Sprintf("got %d messages", got)
+		}
+		return false, ""
 	})
 }
 
@@ -933,7 +943,7 @@ func clientShouldHaveReceivedNMessagesInTotal(name string, expected int) error {
 		return fmt.Errorf("client %q not found", name)
 	}
 
-	return waitUntil(fmt.Sprintf("client %q to receive %d total messages", name, expected), functionalWaitTimeout, func() (bool, string) {
+	if err := waitUntil(fmt.Sprintf("client %q to receive %d total messages", name, expected), functionalWaitTimeout, func() (bool, string) {
 		got := countMessages(clientEventsSnapshot(cc, true))
 		if got >= expected {
 			if got != expected {
@@ -942,6 +952,14 @@ func clientShouldHaveReceivedNMessagesInTotal(name string, expected int) error {
 			return true, ""
 		}
 		return false, fmt.Sprintf("got %d total messages", got)
+	}); err != nil {
+		return err
+	}
+	return waitForNoEvent(fmt.Sprintf("client %q receiving more than %d total messages", name, expected), functionalQuietWindow, func() (bool, string) {
+		if got := countMessages(clientEventsSnapshot(cc, true)); got > expected {
+			return true, fmt.Sprintf("got %d total messages", got)
+		}
+		return false, ""
 	})
 }
 
@@ -1104,6 +1122,9 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	// M9 Batch A — consumer invalidation observability
 	ctx.Step(`^I delete the active JetStream consumer for stream "([^"]*)"$`, iDeleteTheActiveJetStreamConsumer)
 	ctx.Step(`^the SSE stream should still be open$`, theSSEStreamShouldStillBeOpen)
+	ctx.Step(`^I note the value of metric '([^']*)'$`, iNoteTheValueOfMetric)
+	ctx.Step(`^the metric '([^']*)' should have increased$`, theMetricShouldHaveIncreased)
+	ctx.Step(`^I publish (\d+) messages to subject "([^"]*)"$`, iPublishNMessagesToSubject)
 	ctx.Step(`^the stream "([^"]*)" should have (\d+) consumers?$`, theStreamShouldHaveConsumers)
 	ctx.Step(`^the received message event ids should be contiguous$`, theReceivedMessageEventIDsShouldBeContiguous)
 
@@ -1141,6 +1162,62 @@ func theSSEResponseHeaderShouldBe(name, want string) error {
 	}
 	if got := tc.sseResponse.Header.Get(name); got != want {
 		return fmt.Errorf("SSE response header %s = %q, want %q", name, got, want)
+	}
+	return nil
+}
+
+// metricValue scrapes Caddy's /metrics and returns the value of one series,
+// written as it appears in the exposition format (name{labels}); a series
+// that has not been incremented yet reads as 0.
+func metricValue(series string) (float64, error) {
+	resp, err := http.Get(tc.baseURL + "/metrics")
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if value, ok := strings.CutPrefix(line, series+" "); ok {
+			return strconv.ParseFloat(strings.TrimSpace(value), 64)
+		}
+	}
+	return 0, nil
+}
+
+func iNoteTheValueOfMetric(series string) error {
+	value, err := metricValue(series)
+	if err != nil {
+		return err
+	}
+	if tc.notedMetrics == nil {
+		tc.notedMetrics = map[string]float64{}
+	}
+	tc.notedMetrics[series] = value
+	return nil
+}
+
+func theMetricShouldHaveIncreased(series string) error {
+	before, ok := tc.notedMetrics[series]
+	if !ok {
+		return fmt.Errorf("metric %s was not noted", series)
+	}
+	return waitUntil("metric "+series+" to increase", functionalWaitTimeout, func() (bool, string) {
+		value, err := metricValue(series)
+		if err != nil {
+			return false, err.Error()
+		}
+		return value > before, fmt.Sprintf("%s = %v, noted %v", series, value, before)
+	})
+}
+
+func iPublishNMessagesToSubject(count int, subject string) error {
+	for i := 1; i <= count; i++ {
+		if err := iPublishMessageToSubject(fmt.Sprintf(`{"n":%d}`, i), subject); err != nil {
+			return err
+		}
 	}
 	return nil
 }
