@@ -2546,3 +2546,29 @@ func TestHandler_Provision_LogsDisabledTopicCap(t *testing.T) {
 		}
 	}
 }
+
+func TestHandler_UnmarshalCaddyfile_SharedSubscriptions(t *testing.T) {
+	for _, c := range []struct {
+		line    string
+		want    bool
+		wantErr bool
+	}{
+		{line: "shared_subscriptions", want: true},
+		{line: "shared_subscriptions true", want: true},
+		{line: "shared_subscriptions false", want: false},
+		{line: "shared_subscriptions maybe", wantErr: true},
+	} {
+		d := caddyfile.NewTestDispenser("nuts {\n    nats_url nats://localhost:4222\n    stream_name EVENTS\n    " + c.line + "\n}")
+		h := Handler{}
+		err := h.UnmarshalCaddyfile(d)
+		if c.wantErr {
+			if err == nil || !strings.Contains(err.Error(), "shared_subscriptions") {
+				t.Errorf("%q: error = %v, want an invalid shared_subscriptions error", c.line, err)
+			}
+			continue
+		}
+		if err != nil || h.SharedSubscriptions != c.want {
+			t.Errorf("%q: SharedSubscriptions = %v (err %v), want %v", c.line, h.SharedSubscriptions, err, c.want)
+		}
+	}
+}

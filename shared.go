@@ -376,9 +376,8 @@ func (hf *hybridFeed) run() {
 					}
 					continue
 				}
-				if frame.HasStreamSequence && frame.StreamSequence <= hf.lastSeq {
-					continue
-				}
+				// The subscription only queues frames after the connection's
+				// last sequence, so no de-duplication is needed here.
 				if !hf.forward(frame) {
 					return
 				}
