@@ -93,9 +93,12 @@ func gaugeVal(t *testing.T, g prometheus.Gauge) float64 {
 	return pb.GetGauge().GetValue()
 }
 
-// newProvisionedHandler starts NATS, creates the test stream with memory
-// storage, and wires a Handler to it. Caller is responsible for calling
-// ns.Shutdown() and h.Cleanup().
+// newProvisionedHandler starts NATS, creates the EVENTS test stream with
+// memory storage, and runs the real Provision so streaming tests see the
+// production defaults and lifecycle (idle heartbeat, topic cap, shutdown
+// channel). The logger is swapped for a no-op afterwards to keep test output
+// quiet; tests that assert logs replace it again. Caller is responsible for
+// calling ns.Shutdown() and h.Cleanup().
 func newProvisionedHandler(t *testing.T) (*Handler, *server.Server, *nats.Conn) {
 	t.Helper()
 	ns := startJetStreamServer(t)
@@ -113,23 +116,13 @@ func newProvisionedHandler(t *testing.T) (*Handler, *server.Server, *nats.Conn) 
 		HeartbeatInterval: 30,
 		MaxEventSize:      -1,
 		AllowedOrigins:    []string{"*"},
-		logger:            zap.NewNop(),
 	}
-	if err := h.connectNATS(); err != nil {
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
 		ns.Shutdown()
 		nc.Close()
-		t.Fatalf("connectNATS: %v", err)
+		t.Fatalf("Provision: %v", err)
 	}
-	js, err := h.conn.JetStream()
-	if err != nil {
-		h.Cleanup()
-		ns.Shutdown()
-		nc.Close()
-		t.Fatalf("JetStream: %v", err)
-	}
-	h.mu.Lock()
-	h.js = js
-	h.mu.Unlock()
+	h.logger = zap.NewNop()
 	return h, ns, nc
 }
 

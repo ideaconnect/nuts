@@ -1993,16 +1993,13 @@ func TestHandler_Cleanup_WakesInFlightHandlers(t *testing.T) {
 		HeartbeatInterval: 30, // deliberately long — shutdown must win, not heartbeat
 		MaxEventSize:      -1,
 		AllowedOrigins:    []string{"*"},
-		logger:            zap.NewNop(),
 	}
-	if err := h.connectNATS(); err != nil {
-		t.Fatalf("connectNATS: %v", err)
+	// The real Provision must create the shutdown channel; hand-building it
+	// here would hide a Provision regression.
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
 	}
-	js, _ := h.conn.JetStream()
-	h.mu.Lock()
-	h.js = js
-	h.shutdown = make(chan struct{})
-	h.mu.Unlock()
+	h.logger = zap.NewNop()
 
 	req := httptest.NewRequest(http.MethodGet, "/events?topic=shutdown", nil)
 	req = req.WithContext(context.Background())

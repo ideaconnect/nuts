@@ -2229,21 +2229,32 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 func TestHandler_Cleanup_IsIdempotent(t *testing.T) {
 	ns := startJetStreamServer(t)
 	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
 
 	h := &Handler{
 		NatsURL:    ns.ClientURL(),
 		StreamName: "EVENTS",
-		logger:     zap.NewNop(),
 	}
-	if err := h.connectNATS(); err != nil {
-		t.Fatalf("connectNATS: %v", err)
+	// Provision creates the shutdown channel, so repeated Cleanup calls
+	// exercise the close-once guard rather than a nil channel.
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
 	}
+	h.logger = zap.NewNop()
 
 	if err := h.Cleanup(); err != nil {
 		t.Fatalf("first Cleanup: %v", err)
 	}
-	if h.conn != nil {
-		t.Error("conn should be nil after first Cleanup")
+	h.mu.RLock()
+	connNil, jsNil, shutdownNil := h.conn == nil, h.js == nil, h.shutdown == nil
+	h.mu.RUnlock()
+	if !connNil || !jsNil || !shutdownNil {
+		t.Errorf("after first Cleanup: connNil=%v jsNil=%v shutdownNil=%v, want all true", connNil, jsNil, shutdownNil)
 	}
 
 	// Second call — must be safe.
