@@ -9,10 +9,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 const (
@@ -26,6 +28,7 @@ const (
 	performanceReplayBudget            = 5 * time.Second
 	performanceMemoryGrowthBudgetBytes = 32 * 1024 * 1024
 	performanceLargePayloadBytes       = 64 * 1024
+	performanceSharedBurstBudget       = 2 * time.Second
 )
 
 var (
@@ -379,4 +382,81 @@ func BenchmarkStreamFeed(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		benchmarkFormatted = <-feed.frames
 	}
+}
+
+// TestPerformance_SharedFanOutBurst: with shared_subscriptions, a burst of
+// large messages to many connections crosses the NATS link once. Without
+// sharing, 300 connections × 4 × 64 KiB queue about 75 MiB on NUTS' single
+// NATS connection, past nats-server's 64 MiB slow-consumer limit, and the
+// resulting reconnects take seconds to recover from.
+func TestPerformance_SharedFanOutBurst(t *testing.T) {
+	const clients, messages = 300, 4
+	h, nc := provisionOnStream(t, jetstream.StreamConfig{
+		Name: "EVENTS", Subjects: []string{"events.>"}, Storage: jetstream.MemoryStorage, MaxConsumers: clients + 10,
+	}, func(h *Handler) {
+		h.SharedSubscriptions = true
+		h.MaxEventSize = -1
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = h.ServeHTTP(w, r, nil) }))
+	t.Cleanup(srv.Close) // after the streams' own cleanups close their bodies
+	streams := make([]*sseReader, clients)
+	for i := range streams {
+		streams[i] = openSSEStream(t, srv.URL+"/events?topic=burst", "")
+		streams[i].collectIDs(1, 3*time.Second)
+	}
+	if got := consumerCount(mustJetStream(t, nc), "EVENTS"); got != 1 {
+		t.Fatalf("consumers = %d, want 1 shared", got)
+	}
+	reconnectsBefore := counterValue(metricsNATSConnectionEvents, "reconnect")
+	js, _ := nc.JetStream()
+	payload := []byte(`{"blob":"` + strings.Repeat("x", 64*1024) + `"}`)
+	start := time.Now()
+	for i := 0; i < messages; i++ {
+		if _, err := js.Publish("events.burst", payload); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+	for i, stream := range streams {
+		if ids := stream.collectIDs(messages, performanceSharedBurstBudget); len(ids) != messages {
+			t.Fatalf("client %d got %d of %d messages within %s", i, len(ids), messages, performanceSharedBurstBudget)
+		}
+	}
+	elapsed := time.Since(start)
+	t.Logf("shared fan-out: %d clients × %d × 64 KiB delivered in %s", clients, messages, elapsed)
+	if elapsed > performanceSharedBurstBudget {
+		t.Fatalf("fan-out took %s, budget %s", elapsed, performanceSharedBurstBudget)
+	}
+	if got := counterValue(metricsNATSConnectionEvents, "reconnect"); got != reconnectsBefore {
+		t.Fatalf("NATS reconnected %v times during the burst", got-reconnectsBefore)
+	}
+}
+
+// BenchmarkSharedFanOut measures handing one formatted 1 KiB frame to 100
+// connections on a shared subscription. It replaces pulling and formatting
+// the message once per connection, which the review measured at about 21 µs
+// and 22 allocations per delivery.
+func BenchmarkSharedFanOut(b *testing.B) {
+	const clients = 100
+	sub, _ := newTestSharedSub(0)
+	var wg sync.WaitGroup
+	for i := 0; i < clients; i++ {
+		client := sub.attach(0, 1024)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range client.frames {
+			}
+		}()
+	}
+	frame := formattedMessageEvent{HasStreamSequence: true, Frame: strings.Repeat("x", 1024)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		frame.StreamSequence = uint64(i + 1)
+		sub.publish(frame)
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*clients), "ns/delivery")
+	sub.close(sharedTransitionSharedFailed)
+	wg.Wait()
 }

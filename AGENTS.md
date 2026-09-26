@@ -65,6 +65,7 @@ Top-level Go source is the Caddy module package itself (`package nuts`):
 | [auth.go](auth.go) | Subscriber JWT verification and `subscribe`-claim parsing. |
 | [serve.go](serve.go) | `ServeHTTP`, the SSE streaming loop, replay planning, probes, CORS. |
 | [consumer.go](consumer.go) | The JetStream side of a stream: ordered pull consumer config, pull options, the feed goroutine, consumer teardown. |
+| [shared.go](shared.go) | `shared_subscriptions`: one consumer per topic set shared by caught-up connections, the recent-frame ring, and each connection's hand-offs between its own consumer and the shared one. |
 | [caddyfile.go](caddyfile.go) | Caddyfile parsing (`UnmarshalCaddyfile`, `parseCaddyfile`). |
 | [helpers.go](helpers.go) | Pure helpers: SSE writers, JSON helpers, topic/cookie validation, URL redaction. |
 | [metrics.go](metrics.go) | Prometheus counters and gauges. |
@@ -84,6 +85,7 @@ Tests live alongside the source:
 | [consumer_test.go](consumer_test.go) | Feed unit tests (ordering, oversize drops, backpressure, failure and stop paths) with a fake iterator. |
 | [delivery_contract_test.go](delivery_contract_test.go) | End-to-end delivery contract over real HTTP: no hole after a NATS link loss, large backlogs on one connection, bursts without disconnects, cursor precedence and replay edge cases, plus the server start-sequence behaviour planning relies on. |
 | [caddy_integration_test.go](caddy_integration_test.go) | Caddy-in-the-loop tests via `caddy.Load` (access logs, HTTP metrics). |
+| [shared_test.go](shared_test.go) | Shared-subscription mechanics (ring, gap-free joins, fall-behind, lifecycle) and end-to-end behaviour; the delivery contract tests also run in shared mode. |
 | [server_compat_test.go](server_compat_test.go) | nats-server behaviour NUTS accommodates, on the embedded server: stream consumer limits, consumer inactive-threshold limits, delete markers and schedules, lame duck mode, the multi-topic purge fix, and teardown. |
 | [docs_test.go](docs_test.go) | Keeps metric names in README, website, docs and ops files in step with `metrics.go`. |
 | [testutil_test.go](testutil_test.go) | Shared test doubles and helpers: fake JetStream messages and iterator, stalled writers, the black-hole TCP proxy, retry-response assertions, custom-stream provisioning. |
@@ -221,7 +223,7 @@ is in [docs/mutation/baseline.md](docs/mutation/baseline.md).
 ### Requirement for agents
 
 Any change that adds or modifies code in **`auth.go`, `helpers.go`,
-`handler.go`, `serve.go`, `consumer.go`, `caddyfile.go`, or `provision.go`** must:
+`handler.go`, `serve.go`, `consumer.go`, `shared.go`, `caddyfile.go`, or `provision.go`** must:
 
 1. Run `make mutate-pkg PKG=<changed-file>` locally before declaring the
    task complete.

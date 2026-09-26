@@ -55,6 +55,7 @@ nuts {
     max_event_size <bytes>              # Max SSE frame size (0=default 1 MiB, <0=unlimited)
     max_connections <count>             # Global concurrent-stream cap (default: 0 = unlimited)
     client_buffer_size <count>          # Messages prefetched from JetStream per connection (0=default 64)
+    shared_subscriptions [true|false]   # Share one consumer per topic set among live connections (default: off)
     write_timeout <seconds>             # Deadline for each SSE write/flush (0=default 30, -1=disabled)
 
     # Replay bounds (for catch-up after reconnect)
@@ -149,6 +150,18 @@ whose writes stop completing is disconnected with
 that merely reads slowly is not, because NUTS pulls from JetStream only as fast
 as it reads. `-1` leaves write deadlines to Caddy's server config.
 `dispatch_timeout` is deprecated and has no effect.
+
+### `shared_subscriptions`
+
+Off by default, every connection owns a JetStream consumer, so each message is
+pulled, sent over NUTS' NATS connection and formatted once per subscriber.
+With `shared_subscriptions`, connections that are caught up with the live
+stream share one consumer per topic set and each message is formatted once. A
+connection with history to replay catches up on its own consumer first, and
+one that falls more than `client_buffer_size` frames behind returns to its own
+consumer until it catches up again — without a gap and without being
+disconnected. Use it when many clients subscribe to the same topics,
+especially with large messages.
 
 ### `nats_idle_heartbeat`
 
@@ -283,6 +296,8 @@ NUTS registers the following metrics; expose them via Caddy's `metrics` handler:
 | `nuts_nats_async_errors_total{kind}` | Counter | Asynchronous NATS client errors (`kind`: `slow_consumer`, `timeout`, `connection_state`, `consumer_invalidated` — legacy, stays `0`, `other`) |
 | `nuts_consumer_invalidated_total{reason}` | Counter | Consumers lost under a live stream (`reason`: `recreated` — recovered from the last delivered sequence; `unrecoverable` — recreation failed and the stream closed) |
 | `nuts_readiness_failures_total{cause}` | Counter | `/readyz` responses returning `503` (`cause`: `nats_disconnected`, `jetstream_missing`, `stream_info_error`) |
+| `nuts_shared_subscriptions` | Gauge | Shared subscriptions (one consumer per topic set) with `shared_subscriptions` on |
+| `nuts_shared_transitions_total{transition}` | Counter | Connections joining shared subscriptions (`joined`) or leaving them because they fell behind (`fell_behind`) or the shared consumer failed (`shared_failed`) |
 | `nuts_nats_connection_events_total{event}` | Counter | NATS connection-state transitions (`event`: `disconnect`, `reconnect`, `closed`, `lame_duck`) |
 
 ### Hub Discovery

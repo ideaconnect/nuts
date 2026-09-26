@@ -128,44 +128,53 @@ func newContractServer(t *testing.T, natsURL string, configure func(*Handler)) (
 	return h, srv
 }
 
+// deliveryModes runs a delivery contract test twice: with every connection on
+// its own consumer, and with shared subscriptions.
+func deliveryModes(t *testing.T, test func(t *testing.T, mode func(*Handler))) {
+	t.Run("own consumers", func(t *testing.T) { test(t, func(*Handler) {}) })
+	t.Run("shared subscriptions", func(t *testing.T) { test(t, func(h *Handler) { h.SharedSubscriptions = true }) })
+}
+
 // TestDeliveryContract_NATSLinkLossLeavesNoHole: messages the server pushed
 // into a NATS connection that died silently used to be lost for good (#99).
 // The ordered consumer notices the reconnect and resumes after the last
 // message it actually delivered.
 func TestDeliveryContract_NATSLinkLossLeavesNoHole(t *testing.T) {
-	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
-	nc, err := nats.Connect(ns.ClientURL())
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer nc.Close()
-	createTestStream(t, nc, "EVENTS", []string{"events.>"})
-	js, _ := nc.JetStream()
-	proxy := newBlackholeProxy(t, ns.Addr().String())
-	h, srv := newContractServer(t, proxy.url(), nil)
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns := startJetStreamServer(t)
+		t.Cleanup(ns.Shutdown) // outlives the handler, whose Cleanup deletes consumers
+		nc, err := nats.Connect(ns.ClientURL())
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(nc.Close)
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		js, _ := nc.JetStream()
+		proxy := newBlackholeProxy(t, ns.Addr().String())
+		h, srv := newContractServer(t, proxy.url(), mode)
 
-	stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
-	if connected := stream.collectIDs(1, 3*time.Second); len(connected) != 1 || connected[0] != 0 {
-		t.Fatalf("connected id = %v, want [0]", connected)
-	}
-	publishRange(t, js, "events.alpha", 1, 3)
-	assertContiguousIDs(t, stream.collectIDs(3, 3*time.Second), 1, 3)
+		stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
+		if connected := stream.collectIDs(1, 3*time.Second); len(connected) != 1 || connected[0] != 0 {
+			t.Fatalf("connected id = %v, want [0]", connected)
+		}
+		publishRange(t, js, "events.alpha", 1, 3)
+		assertContiguousIDs(t, stream.collectIDs(3, 3*time.Second), 1, 3)
 
-	proxy.discard.Store(true)
-	publishRange(t, js, "events.alpha", 4, 6) // pushed into the dead link
-	time.Sleep(300 * time.Millisecond)
-	proxy.cut()
-	proxy.discard.Store(false)
-	waitForNATSReconnect(t, h)
-	publishRange(t, js, "events.alpha", 7, 9)
+		proxy.discard.Store(true)
+		publishRange(t, js, "events.alpha", 4, 6) // pushed into the dead link
+		time.Sleep(300 * time.Millisecond)
+		proxy.cut()
+		proxy.discard.Store(false)
+		waitForNATSReconnect(t, h)
+		publishRange(t, js, "events.alpha", 7, 9)
 
-	assertContiguousIDs(t, stream.collectIDs(6, 15*time.Second), 4, 9)
-	select {
-	case <-stream.closed:
-		t.Fatal("stream closed; the client would have had to reconnect")
-	default:
-	}
+		assertContiguousIDs(t, stream.collectIDs(6, 15*time.Second), 4, 9)
+		select {
+		case <-stream.closed:
+			t.Fatal("stream closed; the client would have had to reconnect")
+		default:
+		}
+	})
 }
 
 // TestDeliveryContract_LinkLossBeforeFirstMessageNeitherReplaysNorSkips: an
@@ -175,32 +184,34 @@ func TestDeliveryContract_NATSLinkLossLeavesNoHole(t *testing.T) {
 // sequence 1 and replayed the whole stream. Requests without a cursor start
 // at an explicit LastSeq+1, which survives the reset.
 func TestDeliveryContract_LinkLossBeforeFirstMessageNeitherReplaysNorSkips(t *testing.T) {
-	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
-	nc, err := nats.Connect(ns.ClientURL())
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer nc.Close()
-	createTestStream(t, nc, "EVENTS", []string{"events.>"})
-	js, _ := nc.JetStream()
-	publishRange(t, js, "events.alpha", 1, 3) // history the stream must not replay
-	proxy := newBlackholeProxy(t, ns.Addr().String())
-	h, srv := newContractServer(t, proxy.url(), nil)
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns := startJetStreamServer(t)
+		t.Cleanup(ns.Shutdown) // outlives the handler, whose Cleanup deletes consumers
+		nc, err := nats.Connect(ns.ClientURL())
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(nc.Close)
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		js, _ := nc.JetStream()
+		publishRange(t, js, "events.alpha", 1, 3) // history the stream must not replay
+		proxy := newBlackholeProxy(t, ns.Addr().String())
+		h, srv := newContractServer(t, proxy.url(), mode)
 
-	stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
-	if connected := stream.collectIDs(1, 3*time.Second); len(connected) != 1 || connected[0] != 3 {
-		t.Fatalf("connected id = %v, want [3]", connected)
-	}
-	proxy.discard.Store(true)
-	publishRange(t, js, "events.alpha", 4, 6) // published while NUTS is cut off
-	time.Sleep(300 * time.Millisecond)
-	proxy.cut()
-	proxy.discard.Store(false)
-	waitForNATSReconnect(t, h)
-	publishRange(t, js, "events.alpha", 7, 8)
+		stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
+		if connected := stream.collectIDs(1, 3*time.Second); len(connected) != 1 || connected[0] != 3 {
+			t.Fatalf("connected id = %v, want [3]", connected)
+		}
+		proxy.discard.Store(true)
+		publishRange(t, js, "events.alpha", 4, 6) // published while NUTS is cut off
+		time.Sleep(300 * time.Millisecond)
+		proxy.cut()
+		proxy.discard.Store(false)
+		waitForNATSReconnect(t, h)
+		publishRange(t, js, "events.alpha", 7, 8)
 
-	assertContiguousIDs(t, stream.collectIDs(5, 15*time.Second), 4, 8)
+		assertContiguousIDs(t, stream.collectIDs(5, 15*time.Second), 4, 8)
+	})
 }
 
 // waitForNATSReconnect waits until the handler's NATS connection has
@@ -227,112 +238,120 @@ func waitForNATSReconnect(t *testing.T, h *Handler) {
 // behind a large backlog used to be cut off as a slow client after a handful
 // of messages, needing hundreds of reconnects to catch up (#100).
 func TestDeliveryContract_LargeBacklogOnOneConnection(t *testing.T) {
-	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
-	nc, _ := nats.Connect(ns.ClientURL())
-	defer nc.Close()
-	createTestStream(t, nc, "EVENTS", []string{"events.>"})
-	js, _ := nc.JetStream()
-	_, srv := newContractServer(t, ns.ClientURL(), nil) // default client_buffer_size
-	const backlog = 3000
-	publishRange(t, js, "events.alpha", 1, backlog)
-	slowBefore := counterVal(t, metricsSlowClientDisconnects)
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns := startJetStreamServer(t)
+		t.Cleanup(ns.Shutdown) // outlives the handler, whose Cleanup deletes consumers
+		nc, _ := nats.Connect(ns.ClientURL())
+		t.Cleanup(nc.Close)
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		js, _ := nc.JetStream()
+		_, srv := newContractServer(t, ns.ClientURL(), mode) // default client_buffer_size
+		const backlog = 3000
+		publishRange(t, js, "events.alpha", 1, backlog)
+		slowBefore := counterVal(t, metricsSlowClientDisconnects)
 
-	stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "0")
-	ids := stream.collectIDs(backlog+1, 20*time.Second)
-	if len(ids) == 0 || ids[0] != 0 {
-		t.Fatalf("first id = %v, want the connected cursor 0", head(ids, 1))
-	}
-	assertContiguousIDs(t, ids[1:], 1, backlog)
-	if got := counterVal(t, metricsSlowClientDisconnects); got != slowBefore {
-		t.Fatalf("slow_client_disconnects_total moved %v -> %v during a backlog replay", slowBefore, got)
-	}
+		stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "0")
+		ids := stream.collectIDs(backlog+1, 20*time.Second)
+		if len(ids) == 0 || ids[0] != 0 {
+			t.Fatalf("first id = %v, want the connected cursor 0", head(ids, 1))
+		}
+		assertContiguousIDs(t, ids[1:], 1, backlog)
+		if got := counterVal(t, metricsSlowClientDisconnects); got != slowBefore {
+			t.Fatalf("slow_client_disconnects_total moved %v -> %v during a backlog replay", slowBefore, got)
+		}
+	})
 }
 
 // TestDeliveryContract_LiveBurstKeepsFastClientsConnected: a single publish
 // batch larger than client_buffer_size used to disconnect every connected
 // client (#100).
 func TestDeliveryContract_LiveBurstKeepsFastClientsConnected(t *testing.T) {
-	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
-	nc, _ := nats.Connect(ns.ClientURL())
-	defer nc.Close()
-	createTestStream(t, nc, "EVENTS", []string{"events.>"})
-	js, _ := nc.JetStream()
-	_, srv := newContractServer(t, ns.ClientURL(), nil)
-	slowBefore := counterVal(t, metricsSlowClientDisconnects)
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns := startJetStreamServer(t)
+		t.Cleanup(ns.Shutdown) // outlives the handler, whose Cleanup deletes consumers
+		nc, _ := nats.Connect(ns.ClientURL())
+		t.Cleanup(nc.Close)
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		js, _ := nc.JetStream()
+		_, srv := newContractServer(t, ns.ClientURL(), mode)
+		slowBefore := counterVal(t, metricsSlowClientDisconnects)
 
-	var streams []*sseReader
-	for i := 0; i < 5; i++ {
-		s := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
-		if connected := s.collectIDs(1, 3*time.Second); len(connected) != 1 {
-			t.Fatalf("client %d: no connected event", i)
+		var streams []*sseReader
+		for i := 0; i < 5; i++ {
+			s := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
+			if connected := s.collectIDs(1, 3*time.Second); len(connected) != 1 {
+				t.Fatalf("client %d: no connected event", i)
+			}
+			streams = append(streams, s)
 		}
-		streams = append(streams, s)
-	}
-	const burst = 1000
-	publishRange(t, js, "events.alpha", 1, burst)
-	for i, s := range streams {
-		ids := s.collectIDs(burst, 15*time.Second)
-		if len(ids) != burst {
-			t.Fatalf("client %d received %d of %d burst messages", i, len(ids), burst)
+		const burst = 1000
+		publishRange(t, js, "events.alpha", 1, burst)
+		for i, s := range streams {
+			ids := s.collectIDs(burst, 15*time.Second)
+			if len(ids) != burst {
+				t.Fatalf("client %d received %d of %d burst messages", i, len(ids), burst)
+			}
+			assertContiguousIDs(t, ids, 1, burst)
 		}
-		assertContiguousIDs(t, ids, 1, burst)
-	}
-	if got := counterVal(t, metricsSlowClientDisconnects); got != slowBefore {
-		t.Fatalf("slow_client_disconnects_total moved %v -> %v during a burst", slowBefore, got)
-	}
+		if got := counterVal(t, metricsSlowClientDisconnects); got != slowBefore {
+			t.Fatalf("slow_client_disconnects_total moved %v -> %v during a burst", slowBefore, got)
+		}
+	})
 }
 
 // TestDeliveryContract_CursorFromARecreatedStreamStillDelivers covers #103: a
 // cursor from before the stream was recreated used to park the consumer until
 // the new stream reached it, silently skipping everything before.
 func TestDeliveryContract_CursorFromARecreatedStreamStillDelivers(t *testing.T) {
-	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
-	nc, _ := nats.Connect(ns.ClientURL())
-	defer nc.Close()
-	createTestStream(t, nc, "EVENTS", []string{"events.>"})
-	js, _ := nc.JetStream()
-	_, srv := newContractServer(t, ns.ClientURL(), nil)
-	publishRange(t, js, "events.alpha", 1, 50)
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns := startJetStreamServer(t)
+		t.Cleanup(ns.Shutdown) // outlives the handler, whose Cleanup deletes consumers
+		nc, _ := nats.Connect(ns.ClientURL())
+		t.Cleanup(nc.Close)
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		js, _ := nc.JetStream()
+		_, srv := newContractServer(t, ns.ClientURL(), mode)
+		publishRange(t, js, "events.alpha", 1, 50)
 
-	if err := js.DeleteStream("EVENTS"); err != nil {
-		t.Fatalf("DeleteStream: %v", err)
-	}
-	createTestStream(t, nc, "EVENTS", []string{"events.>"})
-	publishRange(t, js, "events.alpha", 1, 5)
+		if err := js.DeleteStream("EVENTS"); err != nil {
+			t.Fatalf("DeleteStream: %v", err)
+		}
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		publishRange(t, js, "events.alpha", 1, 5)
 
-	stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "50")
-	// The fallback's connected event carries no id, so the first id is
-	// the recreated stream's first message.
-	assertContiguousIDs(t, stream.collectIDs(5, 5*time.Second), 1, 5)
+		stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "50")
+		// The fallback's connected event carries no id, so the first id is
+		// the recreated stream's first message.
+		assertContiguousIDs(t, stream.collectIDs(5, 5*time.Second), 1, 5)
+	})
 }
 
 // TestDeliveryContract_DeletedResumeMessageDoesNotReplayHistory covers #115:
 // with replay_window set, a deleted resume message used to force a
 // time-window fallback that re-sent messages the client already had.
 func TestDeliveryContract_DeletedResumeMessageDoesNotReplayHistory(t *testing.T) {
-	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
-	nc, _ := nats.Connect(ns.ClientURL())
-	defer nc.Close()
-	createTestStream(t, nc, "EVENTS", []string{"events.>"})
-	js, _ := nc.JetStream()
-	_, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) { h.ReplayWindow = 3600 })
-	publishRange(t, js, "events.alpha", 1, 5)
-	if err := js.DeleteMsg("EVENTS", 3); err != nil {
-		t.Fatalf("DeleteMsg: %v", err)
-	}
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns := startJetStreamServer(t)
+		t.Cleanup(ns.Shutdown) // outlives the handler, whose Cleanup deletes consumers
+		nc, _ := nats.Connect(ns.ClientURL())
+		t.Cleanup(nc.Close)
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		js, _ := nc.JetStream()
+		_, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) { mode(h); h.ReplayWindow = 3600 })
+		publishRange(t, js, "events.alpha", 1, 5)
+		if err := js.DeleteMsg("EVENTS", 3); err != nil {
+			t.Fatalf("DeleteMsg: %v", err)
+		}
 
-	stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "2")
-	ids := stream.collectIDs(3, 3*time.Second)
-	if want := []uint64{2, 4, 5}; !reflect.DeepEqual(ids, want) {
-		t.Fatalf("ids = %v, want %v (connected cursor 2, then 4 and 5; nothing before the cursor)", ids, want)
-	}
-	if extra := stream.collectIDs(1, 300*time.Millisecond); len(extra) != 0 {
-		t.Fatalf("unexpected extra ids %v", extra)
-	}
+		stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "2")
+		ids := stream.collectIDs(3, 3*time.Second)
+		if want := []uint64{2, 4, 5}; !reflect.DeepEqual(ids, want) {
+			t.Fatalf("ids = %v, want %v (connected cursor 2, then 4 and 5; nothing before the cursor)", ids, want)
+		}
+		if extra := stream.collectIDs(1, 300*time.Millisecond); len(extra) != 0 {
+			t.Fatalf("unexpected extra ids %v", extra)
+		}
+	})
 }
 
 // TestDeliveryContract_EventSourceReconnectWithURLCursorMakesProgress covers
@@ -340,28 +359,30 @@ func TestDeliveryContract_DeletedResumeMessageDoesNotReplayHistory(t *testing.T)
 // the browser resends on every auto-reconnect. With replay_max_messages the
 // URL cursor used to win, replaying the same first N messages forever.
 func TestDeliveryContract_EventSourceReconnectWithURLCursorMakesProgress(t *testing.T) {
-	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
-	nc, _ := nats.Connect(ns.ClientURL())
-	defer nc.Close()
-	createTestStream(t, nc, "EVENTS", []string{"events.>"})
-	js, _ := nc.JetStream()
-	_, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) { h.ReplayMaxMessages = 5 })
-	publishRange(t, js, "events.alpha", 1, 20)
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns := startJetStreamServer(t)
+		t.Cleanup(ns.Shutdown) // outlives the handler, whose Cleanup deletes consumers
+		nc, _ := nats.Connect(ns.ClientURL())
+		t.Cleanup(nc.Close)
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		js, _ := nc.JetStream()
+		_, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) { mode(h); h.ReplayMaxMessages = 5 })
+		publishRange(t, js, "events.alpha", 1, 20)
 
-	lastEventID := ""
-	var received []uint64
-	for reconnect := 0; reconnect < 4; reconnect++ {
-		stream := openSSEStream(t, srv.URL+"/events?topic=alpha&last-id=0", lastEventID)
-		ids := stream.collectIDs(6, 3*time.Second) // connected cursor + 5 replayed
-		if len(ids) != 6 {
-			t.Fatalf("reconnect %d: ids = %v, want the cursor and 5 messages", reconnect, ids)
+		lastEventID := ""
+		var received []uint64
+		for reconnect := 0; reconnect < 4; reconnect++ {
+			stream := openSSEStream(t, srv.URL+"/events?topic=alpha&last-id=0", lastEventID)
+			ids := stream.collectIDs(6, 3*time.Second) // connected cursor + 5 replayed
+			if len(ids) != 6 {
+				t.Fatalf("reconnect %d: ids = %v, want the cursor and 5 messages", reconnect, ids)
+			}
+			received = append(received, ids[1:]...)
+			lastEventID = strconv.FormatUint(ids[len(ids)-1], 10)
+			<-stream.closed // replay_max_messages closes the stream
 		}
-		received = append(received, ids[1:]...)
-		lastEventID = strconv.FormatUint(ids[len(ids)-1], 10)
-		<-stream.closed // replay_max_messages closes the stream
-	}
-	assertContiguousIDs(t, received, 1, 20)
+		assertContiguousIDs(t, received, 1, 20)
+	})
 }
 
 // TestJetStream_StartSequenceOutsideTheStream pins the server behaviour that

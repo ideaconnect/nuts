@@ -117,13 +117,13 @@ func newProvisionedHandler(t *testing.T) (*Handler, *server.Server, *nats.Conn) 
 		HeartbeatInterval: 30,
 		MaxEventSize:      -1,
 		AllowedOrigins:    []string{"*"},
+		logger:            zap.NewNop(),
 	}
 	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
 		ns.Shutdown()
 		nc.Close()
 		t.Fatalf("Provision: %v", err)
 	}
-	h.logger = zap.NewNop()
 	return h, ns, nc
 }
 

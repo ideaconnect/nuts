@@ -13,6 +13,18 @@ silent message loss, and clients that fall behind no longer get disconnected.
 Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
 
 ### Added
+- **`shared_subscriptions`** (off by default) lets connections that are
+  caught up with the live stream share one JetStream consumer per topic set,
+  pulling and formatting each message once (#119). A connection with history
+  to replay catches up on its own consumer and then joins; one that falls
+  more than `client_buffer_size` frames behind returns to its own consumer
+  until it catches up. Hand-offs go by stream sequence, so nothing is skipped
+  or repeated, and nobody is disconnected for falling behind. Without it,
+  every connection's consumer sends its own copy of each message over NUTS'
+  single NATS connection: 1000 connections receiving 4 × 64 KiB took about
+  14 s, most of it recovering from nats-server's slow-consumer disconnects
+  (#118). With it, 0.25 s. New metrics: `nuts_shared_subscriptions` and
+  `nuts_shared_transitions_total{transition}`.
 - A request refused because the stream reached its consumer limit is counted
   as `nuts_connections_rejected_total{reason="stream_consumer_limit"}` and
   logged with `disconnect_reason=stream_consumer_limit` (#110). NUTS also
@@ -192,6 +204,9 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
 - **A reload left every open stream's consumer on the server** until its
   inactive threshold expired (#75). Cleanup now waits up to 3 seconds for the
   streams it ends to delete their consumers before closing the connection.
+- Consumer deletes are skipped while the NATS connection is down, instead of
+  holding up Cleanup until they time out; the server removes those consumers
+  after their inactive threshold.
 - The NATS closed callback no longer runs after Cleanup has returned, when
   Caddy has already unloaded the handler (#73).
 - A slow-client overflow race could write a message after an earlier one was

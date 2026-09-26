@@ -1103,6 +1103,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	// M9 Batch A — consumer invalidation observability
 	ctx.Step(`^I delete the active JetStream consumer for stream "([^"]*)"$`, iDeleteTheActiveJetStreamConsumer)
 	ctx.Step(`^the SSE stream should still be open$`, theSSEStreamShouldStillBeOpen)
+	ctx.Step(`^the stream "([^"]*)" should have (\d+) consumers?$`, theStreamShouldHaveConsumers)
 	ctx.Step(`^the received message event ids should be contiguous$`, theReceivedMessageEventIDsShouldBeContiguous)
 
 	// Multi-client steps
@@ -1114,4 +1115,19 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^client "([^"]*)" should have received (\d+) messages in total$`, clientShouldHaveReceivedNMessagesInTotal)
 	ctx.Step(`^client "([^"]*)" should have received an event containing '([^']*)'$`, clientShouldHaveReceivedEventContaining)
 	ctx.Step(`^client "([^"]*)" should not have received an event containing '([^']*)'$`, clientShouldNotHaveReceivedEventContaining)
+}
+
+// theStreamShouldHaveConsumers waits until the stream has exactly want
+// consumers; consumer deletes happen in the background.
+func theStreamShouldHaveConsumers(streamName string, want int) error {
+	return waitUntil("consumer count", functionalWaitTimeout, func() (bool, string) {
+		info, err := tc.js.StreamInfo(streamName)
+		if err != nil {
+			return false, err.Error()
+		}
+		if info.State.Consumers == want {
+			return true, ""
+		}
+		return false, fmt.Sprintf("stream %s has %d consumers, want %d", streamName, info.State.Consumers, want)
+	})
 }

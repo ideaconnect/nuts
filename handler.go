@@ -121,9 +121,9 @@ type Handler struct {
 	MaxConnections int `json:"max_connections,omitempty"`
 
 	// MaxTopicsPerSubscription caps how many distinct topics a single SSE
-	// request may subscribe to. 0 (or unset) uses the default. A negative
-	// value disables the limit. Requests exceeding the cap receive HTTP 400.
-	// Default: 32.
+	// request may subscribe to. 0 (or unset) uses the default; -1 disables
+	// the limit, and other negatives are rejected. Requests exceeding the
+	// cap receive HTTP 400. Default: 32.
 	MaxTopicsPerSubscription int `json:"max_topics_per_subscription,omitempty"`
 
 	// ClientBufferSize is how many messages each connection's pull consumer
@@ -146,6 +146,13 @@ type Handler struct {
 	// 30; -1 disables the deadline and leaves stalled writes to the
 	// surrounding HTTP server configuration.
 	WriteTimeout int `json:"write_timeout,omitempty"`
+
+	// SharedSubscriptions lets connections that are caught up with the live
+	// stream share one JetStream consumer per topic set, formatting each
+	// message once, instead of each owning a consumer. Connections with
+	// history to replay, or that fall more than ClientBufferSize frames
+	// behind, use their own consumer until they catch up. Off by default.
+	SharedSubscriptions bool `json:"shared_subscriptions,omitempty"`
 
 	// ReplayMaxMessages caps replay delivery per reconnect. 0 disables the cap.
 	ReplayMaxMessages int `json:"replay_max_messages,omitempty"`
@@ -195,6 +202,9 @@ type Handler struct {
 
 	// logger is scoped to this handler instance.
 	logger *zap.Logger
+
+	// shared holds the shared subscriptions when SharedSubscriptions is on.
+	shared *sharedRegistry
 
 	// mu protects conn, js, shutdown and closing.
 	mu sync.RWMutex

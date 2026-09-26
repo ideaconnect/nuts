@@ -229,6 +229,25 @@ closing the connection, or a proxy that stopped forwarding.
    browsers under heavy main-thread load can stall their event loop
    long enough to trip `write_timeout`.
 
+## Incident: Connections keep falling off shared subscriptions
+
+**Signals**
+
+- `nuts_shared_transitions_total{transition="fell_behind"}` rises steadily
+  (with `shared_subscriptions` on).
+- The stream's consumer count stays above `nuts_shared_subscriptions`:
+  connections that fell behind catch up on their own consumers.
+
+**Actions**
+
+1. Nothing is lost: a connection that falls behind continues on its own
+   consumer and rejoins once caught up. The cost is the extra consumers.
+2. Raise `client_buffer_size`, the per-connection queue on a shared
+   subscription, if bursts are larger than it.
+3. Look for slow clients or proxies, as in "Slow clients" above.
+4. `transition="shared_failed"` means a shared consumer could not be
+   recreated; see "Consumer recreated or unrecoverable".
+
 ## Incident: Multi-topic streams skip messages
 
 **Signals**

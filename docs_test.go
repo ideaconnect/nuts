@@ -9,9 +9,10 @@ import (
 )
 
 // metricReference matches the metric names NUTS registers: every counter ends
-// in _total, and the one gauge is active_connections. Other nuts_ names
-// (consumer names, cookie names) do not match.
-var metricReference = regexp.MustCompile(`\bnuts_(?:[a-z_]+_total|active_connections)\b`)
+// in _total, and the gauges are listed by name. Other nuts_ names (consumer
+// names, cookie names) do not match. A new gauge must be added here, or
+// TestRegisteredMetricsAreDocumented reports it as undocumented.
+var metricReference = regexp.MustCompile(`\bnuts_(?:[a-z_]+_total|active_connections|shared_subscriptions)\b`)
 
 // registeredMetrics reads the metric names out of metrics.go.
 func registeredMetrics(t *testing.T) map[string]bool {

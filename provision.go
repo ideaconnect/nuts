@@ -217,6 +217,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.mu.Lock()
 	h.shutdown = make(chan struct{})
 	h.closing = false
+	h.shared = newSharedRegistry()
 	h.mu.Unlock()
 
 	// Register the failure-cleanup deferred call BEFORE the first step that
@@ -436,6 +437,10 @@ func (h *Handler) connectNATS() error {
 	if h.MaxReconnects != nil {
 		maxReconnects = *h.MaxReconnects
 	}
+	// The callbacks run on nats.go's own goroutine for the life of the
+	// connection, so they use the logger the handler has now rather than
+	// reading the field later.
+	log := h.log()
 	opts := []nats.Option{
 		// nats.Name labels this connection on the NATS server side. It
 		// surfaces in /connz output and in server-side slow-consumer
@@ -450,16 +455,16 @@ func (h *Handler) connectNATS() error {
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			metricsNATSConnectionEvents.WithLabelValues("disconnect").Inc()
 			if err != nil {
-				h.log().Warn("disconnected from NATS", zap.Error(err))
+				log.Warn("disconnected from NATS", zap.Error(err))
 			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			metricsNATSConnectionEvents.WithLabelValues("reconnect").Inc()
-			h.log().Info("reconnected to NATS", zap.String("url", redactURL(nc.ConnectedUrl())))
+			log.Info("reconnected to NATS", zap.String("url", redactURL(nc.ConnectedUrl())))
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			metricsNATSConnectionEvents.WithLabelValues("closed").Inc()
-			h.log().Info("NATS connection closed")
+			log.Info("NATS connection closed")
 		}),
 		// Cleanup closes the connection itself; without this option the
 		// final callbacks run after Close returns, logging through a handler
@@ -469,7 +474,7 @@ func (h *Handler) connectNATS() error {
 		// another server of the cluster and the ordered consumers follow.
 		nats.LameDuckModeHandler(func(nc *nats.Conn) {
 			metricsNATSConnectionEvents.WithLabelValues("lame_duck").Inc()
-			h.log().Warn("NATS server entered lame duck mode; the connection will move to another server",
+			log.Warn("NATS server entered lame duck mode; the connection will move to another server",
 				zap.String("url", redactURL(nc.ConnectedUrl())),
 			)
 		}),
@@ -492,7 +497,7 @@ func (h *Handler) connectNATS() error {
 			if sub != nil {
 				fields = append(fields, zap.String("subject", sub.Subject))
 			}
-			h.log().Warn("NATS async error", fields...)
+			log.Warn("NATS async error", fields...)
 		}),
 	}
 

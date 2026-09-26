@@ -453,20 +453,21 @@ server-side limit is hit.
 Goal: per-message cost that doesn't grow with the number of subscribers, and
 documented budgets that hold.
 
-- [ ] **[#119] Shared live subscriptions.** *major · L*
-  - [ ] Write a design note in `docs/ARCHITECTURE.md`:
+- [x] **[#119] Shared live subscriptions.** *major · L* `shared_subscriptions`, off by default. Connections that fall behind return to their own consumer instead of being disconnected, and the delivery contract tests run in both modes.
+  - [x] Write a design note in `docs/ARCHITECTURE.md`:
     - a registry keyed by the sorted subject set, with one consumer per key;
     - each frame formatted once and pushed to bounded per-client queues;
     - replaying clients hand off by stream sequence, with de-duplication;
     - reference-counted teardown.
-  - [ ] Ship behind an opt-in directive first (MINOR). Make it the default in a
-    later release, after a soak period.
-  - [ ] Add the issue's benchmarks (CPU and allocs per delivery, NATS messages
+  - [x] Ship behind an opt-in directive first (MINOR). Make it the default in a
+    later release, after a soak period. (Opt-in shipped; the default switch
+    waits for the soak.)
+  - [x] Add the issue's benchmarks (CPU and allocs per delivery, NATS messages
     per delivery) to `make test-performance`.
-- [ ] **[#118] One connection carries N copies.** *major · M*
-  - [ ] Resolved by [#119]. If #119 slips, add a small NATS connection pool.
-  - [ ] Document server `max_pending` / `write_deadline` sizing.
-  - [ ] A burst test at the documented scale must not trigger a slow-consumer
+- [x] **[#118] One connection carries N copies.** *major · M* The loss is gone with the pull pipeline; the slow-consumer kicks remain without `shared_subscriptions` and are documented in PERFORMANCE.md.
+  - [x] Resolved by [#119]. If #119 slips, add a small NATS connection pool.
+  - [x] Document server `max_pending` / `write_deadline` sizing.
+  - [x] A burst test at the documented scale must not trigger a slow-consumer
     kick.
 - [ ] **[#122] Single-pass formatter.** *minor · M*
   - [ ] Compact the payload straight into a `[]byte` frame, write the envelope

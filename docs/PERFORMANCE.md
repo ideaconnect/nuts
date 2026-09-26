@@ -17,7 +17,7 @@ go test -run '^TestPerformance_' -timeout 180s .
 Run the hot-path benchmarks with allocation reporting:
 
 ```bash
-go test -run '^$' -bench 'Benchmark(FormatMessageEvent|TryParseJSON|IsValidTopic|StreamFeed)' -benchmem .
+go test -run '^$' -bench 'Benchmark(FormatMessageEvent|TryParseJSON|IsValidTopic|StreamFeed|SharedFanOut)' -benchmem .
 ```
 
 Or run both through Make:
@@ -36,6 +36,7 @@ make test-performance
 | Replay with caps | `replay_max_messages 25` closes the replaying stream after exactly 25 historical message events within 5 seconds | `TestPerformance_ReplayLoadWithAndWithoutFallbackCaps` |
 | Large payload memory | Repeated 64 KiB payload formatting retains less than 32 MiB of extra heap after GC, and the payload survives formatting | `TestPerformance_MemoryGrowthLargePayloadFormattingWithinBudget` |
 | Replay memory | Large retained replay scenarios grow heap by less than 32 MiB during the CI-sized run | `TestPerformance_ReplayLoadWithAndWithoutFallbackCaps` |
+| Shared fan-out | With `shared_subscriptions`, 300 connections receive a burst of 4 × 64 KiB messages within 2 seconds through one consumer, without a NATS reconnect | `TestPerformance_SharedFanOutBurst` |
 
 The delivery contract tests (`delivery_contract_test.go`) add correctness
 budgets under load: a 3000-message backlog replays on one connection at the
@@ -43,7 +44,10 @@ default settings, and a 1000-message burst reaches every connected client
 without a slow-client disconnect.
 
 The benchmarks cover SSE event formatting, JSON compaction, topic validation,
-and the feed that pulls, formats and hands messages to the writer.
+the feed that pulls, formats and hands messages to the writer, and handing a
+formatted frame to the connections of a shared subscription (about 110 ns and
+no allocation per delivery, against about 1.2 µs and 7 allocations to format
+a small message once per connection).
 
 ## Production Targets
 
@@ -71,6 +75,14 @@ Use these as release gates before increasing traffic or connection limits:
   payloads, replay windows, or edge authentication costs are higher; raise it
   only after an environment-specific load run meets the latency and memory
   budgets above.
+- **Fan-out:** without `shared_subscriptions`, every connection's consumer
+  sends its own copy of each message over NUTS' single NATS connection, and
+  nats-server disconnects a client whose pending data exceeds 64 MiB
+  (`max_pending`). 500 connections receiving 4 × 64 KiB took 2.6 s with one
+  such reconnect, 1000 connections about 14 s. With `shared_subscriptions`
+  the same bursts took 0.12 s and 0.25 s. Turn it on when many clients
+  share topics, especially with large messages, or raise the server's
+  `max_pending`.
 - **Replay safety:** configure at least one of `replay_max_messages` or
   `replay_window` for public or multi-tenant routes. A long replay no longer
   disconnects the client, but it keeps a consumer and a connection busy for

@@ -377,6 +377,7 @@ nuts {
     max_connections <count>      # Global concurrent-stream cap (default: 0 = unlimited)
     max_topics_per_subscription <count>  # Per-request topic cap (0=default 32, -1=unlimited)
     client_buffer_size <count>   # Messages prefetched from JetStream per connection (0=default 64)
+    shared_subscriptions [true|false] # Share one consumer per topic set among live connections (default: off)
     write_timeout <seconds>      # Deadline for each SSE write/flush (0=default 30, -1=disabled)
     replay_max_messages <count>  # Cap replayed messages per reconnect (default: 0 = unlimited)
     replay_window <seconds>      # Time-bound replay to the last N seconds (default: 0 = all retained)
@@ -517,6 +518,37 @@ for example when the server reaps it during an outage. The client notices
 nothing. If recreation keeps failing for about 75 seconds, the stream closes
 with `disconnect_reason=consumer_unrecoverable` and the client reconnects with
 its last event ID.
+
+#### `shared_subscriptions`
+
+By default every SSE connection owns a JetStream consumer, so a message sent
+to a topic with N subscribers is pulled from JetStream, sent over NUTS' NATS
+connection and formatted N times. With many subscribers and large messages
+this saturates the link: nats-server allows 64 MiB of pending data per client
+connection by default, and a burst past it disconnects NUTS. The streams
+recover without losing messages, but slowly.
+
+`shared_subscriptions` (off by default) lets connections that are caught up
+with the live stream share one consumer per topic set. Each message is pulled
+and formatted once and handed to every connection's queue:
+
+- A connection with history to replay reads it from its own consumer, then
+  joins the shared subscription. The shared subscription keeps its latest
+  frames (up to 1024 frames or 4 MiB), so the hand-off has no gap.
+- A connection that falls more than `client_buffer_size` frames behind moves
+  back to its own consumer, starting after the last message it was given,
+  and rejoins once it has caught up. It is not disconnected.
+- The shared consumer recovers from reconnects and deletions like any other.
+  If it cannot, its connections move to their own consumers.
+
+With 1000 connections and a burst of 4 × 64 KiB messages, delivery took
+0.25 s with sharing and about 14 s without it, spent recovering from
+slow-consumer disconnects. Sharing also keeps the stream's consumer count
+near the number of topic sets instead of the number of connections. Watch
+`nuts_shared_transitions_total{transition="fell_behind"}`: a steady rate means
+clients cannot keep up with the shared subscription; raise
+`client_buffer_size`. Messages dropped by `max_event_size` or as control
+messages are counted once per shared subscription, not once per connection.
 
 #### Consumer limits on nats-server 2.15
 
@@ -857,6 +889,8 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_consumer_invalidated_total{reason}` | Counter (labeled) | JetStream consumer failures under live streams. `reason` is `recreated` (the consumer recovered after a gap, a NATS reconnect or missed heartbeats; the client noticed nothing) or `unrecoverable` (recreation kept failing and the stream closed with `disconnect_reason=consumer_unrecoverable`). |
 | `nuts_write_disconnects_total{site}` | Counter (labeled) | SSE streams terminated by a response-writer write error (typically the `write_timeout` deadline firing). `site` is one of `connected`, `message`, `heartbeat`. |
 | `nuts_readiness_failures_total{cause}` | Counter (labeled) | `/readyz` probe responses that returned 503 because a dependency was degraded. `cause` is one of `nats_disconnected`, `jetstream_missing`, `stream_info_error`. |
+| `nuts_shared_subscriptions` | Gauge | Shared subscriptions (one JetStream consumer per topic set) with `shared_subscriptions` on. |
+| `nuts_shared_transitions_total{transition}` | Counter (labeled) | Connections moving onto or off shared subscriptions: `joined` (caught up and attached), `fell_behind` (its queue overflowed; it continues on its own consumer), `shared_failed` (the shared consumer could not be recreated). |
 | `nuts_nats_connection_events_total{event}` | Counter (labeled) | NATS connection-state transitions reported by the registered Disconnect/Reconnect/Closed/LameDuckMode handlers. `event` is one of `disconnect`, `reconnect`, `closed`, `lame_duck` (the server announced it is shutting down). `closed` is not counted when NUTS closes the connection itself on shutdown or reload. Use the `reconnect` series to alert on broker flapping (see [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml)). |
 
 Example alert rules and a Grafana dashboard are available in

@@ -81,7 +81,34 @@ flowchart LR
   `InactiveThreshold` (30 s, or the stream's consumer limit when lower) is the
   backstop when NUTS cannot delete it.
 
-## Replay Flow
+### Shared subscriptions
+
+With `shared_subscriptions` on, connections that are caught up with the live
+stream share one ordered consumer per topic set:
+
+```mermaid
+flowchart LR
+  js[Shared consumer per topic set] --> feed[Feed: format once]
+  feed --> ring[Recent frames: 1024 / 4 MiB]
+  feed --> q1[Connection queue] --> w1[Writer]
+  feed --> q2[Connection queue] --> w2[Writer]
+  own[Own consumer while catching up] --> w3[Writer]
+  w3 -. joins when caught up .-> ring
+```
+
+- A connection without a cursor joins at once, after the stream position its
+  `connected` event names. A connection with a cursor replays on its own
+  consumer; when that consumer has nothing pending, it joins, and the frames
+  the shared subscription delivered in the meantime come from the ring.
+  Joining requires every message after the connection's last one to be in
+  the ring or still to come; otherwise it keeps catching up alone.
+- Each connection has a queue of `client_buffer_size` frames. When a queue is
+  full, that connection leaves the shared subscription and continues on its
+  own consumer right after the last frame it was given; the others are not
+  held up. When every connection has left, the shared consumer is deleted.
+- Hand-offs go by stream sequence, and frames at or below a connection's last
+  sequence are skipped, so nothing is delivered twice or skipped.
+
 
 ```mermaid
 sequenceDiagram

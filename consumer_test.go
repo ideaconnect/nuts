@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -189,10 +190,19 @@ func TestServeStream_ClosesWhenTheConsumerCannotBeRecreated(t *testing.T) {
 // fakeDeleteJS is a jetstream.JetStream whose DeleteConsumer returns err.
 type fakeDeleteJS struct {
 	jetstream.JetStream
-	err error
+	err     error
+	conn    *nats.Conn
+	deleted chan struct{}
 }
 
-func (f fakeDeleteJS) DeleteConsumer(context.Context, string, string) error { return f.err }
+func (f fakeDeleteJS) DeleteConsumer(context.Context, string, string) error {
+	if f.deleted != nil {
+		f.deleted <- struct{}{}
+	}
+	return f.err
+}
+
+func (f fakeDeleteJS) Conn() *nats.Conn { return f.conn }
 
 // fakeConsumer is a jetstream.Consumer with fixed cached info.
 type fakeConsumer struct {
@@ -248,4 +258,36 @@ func TestConsumerStream_DeleteFailureIsLogged(t *testing.T) {
 			t.Fatal("a stream without consumer info was not released")
 		}
 	})
+}
+
+// TestConsumerStream_NoDeleteWhileDisconnected: with the NATS connection
+// down, a delete could only time out, holding Cleanup up for nothing.
+func TestConsumerStream_NoDeleteWhileDisconnected(t *testing.T) {
+	ns := startJetStreamServer(t)
+	nc, err := nats.Connect(ns.ClientURL(), nats.MaxReconnects(-1))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	ns.Shutdown()
+	for nc.IsConnected() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	deleted := make(chan struct{}, 1)
+	released := false
+	cs := &consumerStream{
+		js:       fakeDeleteJS{conn: nc, deleted: deleted},
+		consumer: fakeConsumer{info: &jetstream.ConsumerInfo{Name: "nuts_x_1"}},
+		release:  func() { released = true },
+		log:      zap.NewNop(),
+	}
+	cs.deleteConsumer()
+	if !released {
+		t.Fatal("stream not released at once while NATS is down")
+	}
+	select {
+	case <-deleted:
+		t.Fatal("tried to delete the consumer over a dead connection")
+	case <-time.After(50 * time.Millisecond):
+	}
 }

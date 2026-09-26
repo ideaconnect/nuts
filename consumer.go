@@ -39,9 +39,23 @@ type consumerStream struct {
 	consumer jetstream.Consumer
 	feed     *streamFeed
 	// release tells Cleanup that this stream's consumer is gone.
-	release func()
-	log     *zap.Logger
-	plan    streamPlan
+	release   func()
+	log       *zap.Logger
+	plan      streamPlan
+	closeOnce sync.Once
+}
+
+// openFeed starts the frames for one SSE request: from the request's own
+// consumer, or through the shared subscriptions when they are enabled.
+func (h *Handler) openFeed(ctx context.Context, js jetstream.JetStream, plan streamPlan) (*streamFeed, error) {
+	if h.SharedSubscriptions && h.shared != nil {
+		return h.startHybridFeed(ctx, js, plan)
+	}
+	cs, err := h.openConsumerStream(ctx, js, plan)
+	if err != nil {
+		return nil, err
+	}
+	return &streamFeed{frames: cs.feed.frames, errs: cs.feed.errs, stop: cs.close}, nil
 }
 
 // openConsumerStream creates the request's ordered consumer and starts pulling.
@@ -82,10 +96,13 @@ func (h *Handler) trackStream() bool {
 	return true
 }
 
-// close stops pulling and removes the consumer from the server.
+// close stops pulling and removes the consumer from the server. Only the
+// first call does anything.
 func (cs *consumerStream) close() {
-	cs.feed.stop()
-	cs.deleteConsumer()
+	cs.closeOnce.Do(func() {
+		cs.feed.stop()
+		cs.deleteConsumer()
+	})
 }
 
 // deleteConsumer removes the current server-side consumer instead of leaving it
@@ -99,6 +116,12 @@ func (cs *consumerStream) deleteConsumer() {
 		return
 	}
 	name := info.Name
+	if conn := cs.js.Conn(); conn != nil && !conn.IsConnected() {
+		// The delete could only time out; the server removes the consumer
+		// after its inactive threshold.
+		cs.release()
+		return
+	}
 	go func() {
 		defer cs.release()
 		ctx, cancel := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
@@ -231,6 +254,7 @@ func (h *Handler) startStreamFeed(it jetstream.MessagesContext, plan streamPlan)
 	errs := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
+		consumerName := ""
 		for {
 			msg, err := it.Next()
 			if err != nil {
@@ -240,6 +264,7 @@ func (h *Handler) startStreamFeed(it jetstream.MessagesContext, plan streamPlan)
 				return
 			}
 			formatted := h.formatMessageEvent(newStreamMessage(msg), time.Now())
+			consumerName = h.noteConsumerChange(plan, consumerName, formatted)
 			if formatted.MetadataErr != nil {
 				h.log().Warn("failed to read JetStream metadata",
 					appendStreamLogFields(plan,
@@ -270,6 +295,26 @@ func (h *Handler) startStreamFeed(it jetstream.MessagesContext, plan streamPlan)
 			})
 		},
 	}
+}
+
+// noteConsumerChange counts and logs a consumer that the ordered consumer
+// recreated: its messages arrive under a new consumer name. It returns the
+// name to compare the next message with.
+func (h *Handler) noteConsumerChange(plan streamPlan, previous string, formatted formattedMessageEvent) string {
+	if formatted.ConsumerName == "" {
+		return previous
+	}
+	if previous != "" && formatted.ConsumerName != previous {
+		metricsConsumerInvalidated.WithLabelValues("recreated").Inc()
+		h.log().Info("JetStream consumer recreated; delivery resumed after the last delivered message",
+			appendStreamLogFields(plan,
+				zap.String("previous_consumer", previous),
+				zap.String("consumer", formatted.ConsumerName),
+				zap.Uint64("resumed_at_sequence", formatted.StreamSequence),
+			)...,
+		)
+	}
+	return formatted.ConsumerName
 }
 
 // streamMessage is the part of a JetStream message the formatter needs, read

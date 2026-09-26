@@ -181,6 +181,25 @@ var (
 	// when the in-flight client surface is quiet, so this counter is the
 	// canonical signal for clean disconnect+reconnect cycles. Alert on
 	// e.g. increase(...{event="reconnect"}[10m]) > 3 for flap detection.
+	// nuts_shared_subscriptions is the number of shared subscriptions
+	// (shared_subscriptions on): one JetStream consumer per topic set that
+	// caught-up connections share.
+	metricsSharedSubscriptions = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "nuts",
+		Name:      "shared_subscriptions",
+		Help:      "Number of shared subscriptions, each one JetStream consumer shared by the caught-up connections of a topic set (shared_subscriptions on).",
+	})
+
+	// nuts_shared_transitions_total counts connections moving onto and off
+	// shared subscriptions: joined (caught up and attached), fell_behind
+	// (its queue overflowed; it continues on its own consumer), and
+	// shared_failed (the shared consumer could not be recreated).
+	metricsSharedTransitions = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "nuts",
+		Name:      "shared_transitions_total",
+		Help:      "Total number of connections moving onto or off shared subscriptions, labelled by transition (joined, fell_behind, shared_failed).",
+	}, []string{"transition"})
+
 	metricsNATSConnectionEvents = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "nats_connection_events_total",

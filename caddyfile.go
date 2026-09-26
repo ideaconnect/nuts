@@ -109,6 +109,17 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					h.NatsTLSInsecureSkipVerify = true
 				}
 
+			case "shared_subscriptions":
+				if d.NextArg() {
+					b, err := strconv.ParseBool(d.Val())
+					if err != nil {
+						return d.Errf("invalid shared_subscriptions: %v", err)
+					}
+					h.SharedSubscriptions = b
+				} else {
+					h.SharedSubscriptions = true
+				}
+
 			case "nats_idle_heartbeat":
 				// Range is intentionally not validated here — Provision
 				// normalises 0 to the default, accepts negatives as the

@@ -376,14 +376,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
-	stream, err := h.openConsumerStream(r.Context(), runtime.js, plan)
+	feed, err := h.openFeed(r.Context(), runtime.js, plan)
 	if err != nil {
 		h.rejectConsumerFailure(w, r, plan, err)
 		return nil
 	}
-	defer stream.close()
+	defer feed.stop()
 
-	return h.serveStream(w, r, plan, stream.feed, runtime.shutdown)
+	return h.serveStream(w, r, plan, feed, runtime.shutdown)
 }
 
 // transientRetryBase is the average delay a client is asked to wait before
@@ -854,7 +854,6 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 
 	replayDelivered := 0
 	history := newReplayHistory(plan)
-	consumerName := ""
 
 	ctx := r.Context()
 	for {
@@ -885,19 +884,6 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 			return nil
 
 		case formatted := <-feed.frames:
-			if formatted.ConsumerName != "" {
-				if consumerName != "" && formatted.ConsumerName != consumerName {
-					metricsConsumerInvalidated.WithLabelValues("recreated").Inc()
-					h.log().Info("JetStream consumer recreated; delivery resumed after the last delivered message",
-						appendStreamLogFields(plan,
-							zap.String("previous_consumer", consumerName),
-							zap.String("consumer", formatted.ConsumerName),
-							zap.Uint64("resumed_at_sequence", formatted.StreamSequence),
-						)...,
-					)
-				}
-				consumerName = formatted.ConsumerName
-			}
 			historical := history.isHistory(formatted)
 			if historical && shouldSkipReplayWindowMessage(plan, formatted) {
 				metricsMessagesDropped.WithLabelValues(dropReasonReplayWindow).Inc()

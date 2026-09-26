@@ -196,11 +196,19 @@ func waitForLastMsg(t *testing.T, js jetstream.JetStream, subject string, match 
 // NoCallbacksAfterClientClose the closed callback ran after Cleanup returned,
 // logging through a handler Caddy had already unloaded.
 func TestConnectNATS_NoCallbacksAfterCleanup(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
+	ns := startJetStreamServer(t)
 	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
 	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
 	core, obs := observer.New(zap.InfoLevel)
-	h.logger = zap.New(core)
+	h := &Handler{NatsURL: ns.ClientURL(), StreamName: "EVENTS", logger: zap.New(core)}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
 	closedBefore := counterValue(metricsNATSConnectionEvents, "closed")
 
 	if err := h.Cleanup(); err != nil {
@@ -242,13 +250,12 @@ func TestConnectNATS_LameDuckModeIsLoggedAndCounted(t *testing.T) {
 	createTestStream(t, nc, "EVENTS", []string{"events.>"})
 	nc.Close()
 
-	h := &Handler{NatsURL: ns.ClientURL(), StreamName: "EVENTS"}
+	core, obs := observer.New(zap.WarnLevel)
+	h := &Handler{NatsURL: ns.ClientURL(), StreamName: "EVENTS", logger: zap.New(core)}
 	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	defer h.Cleanup()
-	core, obs := observer.New(zap.WarnLevel)
-	h.logger = zap.New(core)
 	before := counterValue(metricsNATSConnectionEvents, "lame_duck")
 
 	go ns.LameDuckShutdown()
