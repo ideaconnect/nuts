@@ -7,10 +7,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -663,51 +665,72 @@ func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
 
 // ── Warnings for cleartext auth + insecure TLS ────────────────────────────
 
-func TestHandler_Validate_WarnsCleartextAuth(t *testing.T) {
-	core, obs := observer.New(zap.WarnLevel)
-	h := &Handler{
-		NatsURL:    "nats://nats.example.com:4222",
-		StreamName: "EVENTS",
-		NatsToken:  "secret-token",
-		logger:     zap.New(core),
+// TestHandler_WarnAboutTransportSecurity covers which settings count as
+// sending credentials unencrypted (#77): every plaintext scheme, servers
+// without a scheme, credentials embedded in the URL, and the nats_tls_*
+// directives that make nats.go use TLS on nats:// and ws:// too.
+func TestHandler_WarnAboutTransportSecurity(t *testing.T) {
+	cases := []struct {
+		name         string
+		h            *Handler
+		wantCleartxt bool
+		wantInsecure bool
+	}{
+		{name: "token over nats://", h: &Handler{NatsURL: "nats://nats.example.com:4222", NatsToken: "secret-token"}, wantCleartxt: true},
+		{name: "creds file over nats://", h: &Handler{NatsURL: "nats://nats.example.com:4222", NatsCredentials: "/etc/nats/user.creds"}, wantCleartxt: true},
+		{name: "user and password over ws://", h: &Handler{NatsURL: "ws://nats.example.com:8080", NatsUser: "u", NatsPassword: "p"}, wantCleartxt: true},
+		{name: "token to a server without a scheme", h: &Handler{NatsURL: "nats.example.com:4222", NatsToken: "t"}, wantCleartxt: true},
+		{name: "credentials embedded in the URL", h: &Handler{NatsURL: "nats://user:secret@nats.example.com:4222"}, wantCleartxt: true},
+		{name: "one plaintext server in a list", h: &Handler{NatsURL: "tls://a:4222,nats://b:4222", NatsToken: "t"}, wantCleartxt: true},
+		{name: "token over tls://", h: &Handler{NatsURL: "tls://nats.example.com:4222", NatsToken: "t"}},
+		{name: "token over wss://", h: &Handler{NatsURL: "wss://nats.example.com:443", NatsToken: "t"}},
+		{name: "token over nats:// with a CA bundle", h: &Handler{NatsURL: "nats://nats.example.com:4222", NatsToken: "t", NatsTLSCA: "/etc/ca.pem"}},
+		{name: "token over ws:// with a client certificate", h: &Handler{NatsURL: "ws://nats.example.com:8080", NatsToken: "t", NatsTLSCert: "/c.pem", NatsTLSKey: "/k.pem"}},
+		{name: "no credentials over nats://", h: &Handler{NatsURL: "nats://nats.example.com:4222"}},
+		{name: "insecure skip verify", h: &Handler{NatsURL: "tls://nats.example.com:4222", NatsTLSInsecureSkipVerify: true}, wantInsecure: true},
 	}
-	if err := h.Validate(); err != nil {
-		t.Fatalf("Validate: %v", err)
-	}
-	if !hasLogContaining(obs, "plaintext") {
-		t.Errorf("expected cleartext warning, entries=%+v", obs.All())
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			core, obs := observer.New(zap.WarnLevel)
+			h := c.h
+			h.logger = zap.New(core)
+			h.warnAboutTransportSecurity()
+			if got := hasLogContaining(obs, "sent unencrypted"); got != c.wantCleartxt {
+				t.Fatalf("cleartext warning = %v, want %v: %v", got, c.wantCleartxt, obs.All())
+			}
+			if got := hasLogContaining(obs, "insecure_skip_verify"); got != c.wantInsecure {
+				t.Fatalf("insecure warning = %v, want %v: %v", got, c.wantInsecure, obs.All())
+			}
+			if strings.Contains(fmt.Sprint(obs.All()), "secret") {
+				t.Fatalf("a warning leaked a credential: %v", obs.All())
+			}
+		})
 	}
 }
 
-func TestHandler_Validate_WarnsCleartextCredentialsFile(t *testing.T) {
+// TestHandler_Provision_WarnsBeforeDialling covers #82: the transport
+// warnings used to come from Validate, which Caddy runs after Provision has
+// already sent the credentials and the first JetStream requests.
+func TestHandler_Provision_WarnsBeforeDialling(t *testing.T) {
 	core, obs := observer.New(zap.WarnLevel)
 	h := &Handler{
-		NatsURL:         "nats://nats.example.com:4222",
-		StreamName:      "EVENTS",
-		NatsCredentials: "/etc/nats/user.creds",
-		logger:          zap.New(core),
-	}
-	if err := h.Validate(); err != nil {
-		t.Fatalf("Validate: %v", err)
-	}
-	if !hasLogContaining(obs, "plaintext") {
-		t.Errorf("expected cleartext credentials warning, entries=%+v", obs.All())
-	}
-}
-
-func TestHandler_Validate_WarnsInsecureSkipVerify(t *testing.T) {
-	core, obs := observer.New(zap.WarnLevel)
-	h := &Handler{
-		NatsURL:                   "tls://nats.example.com:4222",
+		NatsURL:                   "tls://127.0.0.1:1",
 		StreamName:                "EVENTS",
+		NatsToken:                 "t",
 		NatsTLSInsecureSkipVerify: true,
 		logger:                    zap.New(core),
 	}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err == nil {
+		t.Fatal("Provision against a closed port succeeded")
+	}
+	if !hasLogContaining(obs, "insecure_skip_verify") {
+		t.Fatalf("no insecure_skip_verify warning although the dial failed: %v", obs.All())
+	}
 	if err := h.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	if !hasLogContaining(obs, "insecure_skip_verify") {
-		t.Errorf("expected insecure_skip_verify warning, entries=%+v", obs.All())
+	if n := obs.FilterMessageSnippet("insecure_skip_verify").Len(); n != 1 {
+		t.Fatalf("insecure_skip_verify warned %d times, want once (Validate must not repeat it)", n)
 	}
 }
 
@@ -906,6 +929,39 @@ func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
 			name:        "subscriber cookie validates name",
 			line:        "subscriber_jwt_key secret\n    subscriber_jwt_cookie bad;name",
 			wantErr:     "subscriber_jwt_cookie",
+			validateErr: true,
+		},
+		{
+			name:    "negative heartbeat interval at parse time",
+			line:    "heartbeat_interval -30",
+			wantErr: "heartbeat_interval must be >= 0",
+		},
+		{
+			name:    "negative reconnect wait at parse time",
+			line:    "reconnect_wait -1",
+			wantErr: "reconnect_wait must be >= 0",
+		},
+		{
+			name:    "topic cap below the -1 sentinel",
+			line:    "max_topics_per_subscription -2",
+			wantErr: "max_topics_per_subscription",
+		},
+		{
+			name:        "CA bundle with verification disabled",
+			line:        "nats_tls_ca /etc/nats/ca.pem\n    nats_tls_insecure_skip_verify",
+			wantErr:     "nats_tls_ca cannot be combined with nats_tls_insecure_skip_verify",
+			validateErr: true,
+		},
+		{
+			name:        "unsupported nats_url scheme",
+			line:        "nats_url http://localhost:4222",
+			wantErr:     `nats_url scheme "http" is not supported`,
+			validateErr: true,
+		},
+		{
+			name:        "comma-joined allowed origins",
+			line:        "allowed_origins https://a.example.com,https://b.example.com",
+			wantErr:     "allowed_origins",
 			validateErr: true,
 		},
 	}
@@ -1202,6 +1258,26 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			name:     "nats_idle_heartbeat large-magnitude negative typo",
 			fragment: `"nats_idle_heartbeat": -100`,
 			wantErr:  "nats_idle_heartbeat",
+		},
+		{
+			name:     "topic cap below the -1 sentinel",
+			fragment: `"max_topics_per_subscription": -2`,
+			wantErr:  "max_topics_per_subscription",
+		},
+		{
+			name:     "CA bundle with verification disabled",
+			fragment: `"nats_tls_ca": "/etc/nats/ca.pem", "nats_tls_insecure_skip_verify": true`,
+			wantErr:  "nats_tls_ca",
+		},
+		{
+			name:     "mistyped nats_url scheme",
+			fragment: `"nats_url": "tsl://127.0.0.1:1"`,
+			wantErr:  "nats_url",
+		},
+		{
+			name:     "allowed origin with a path",
+			fragment: `"allowed_origins": ["https://app.example.com/"]`,
+			wantErr:  "allowed_origins",
 		},
 	}
 
@@ -2377,6 +2453,96 @@ func TestHandler_WarnAboutServerVersion(t *testing.T) {
 		h.warnAboutServerVersion(version)
 		if got := hasLogField(obs, "server_version", version); got != wantWarn {
 			t.Errorf("server %q: warned=%v, want %v (%v)", version, got, wantWarn, obs.All())
+		}
+	}
+}
+
+func TestNatsServerSchemes(t *testing.T) {
+	cases := []struct {
+		raw     string
+		want    []string
+		wantErr string
+	}{
+		{raw: "nats://a:4222", want: []string{"nats"}},
+		{raw: "tls://a:4222", want: []string{"tls"}},
+		{raw: "ws://a:8080", want: []string{"ws"}},
+		{raw: "wss://a:443", want: []string{"wss"}},
+		{raw: "NATS://a:4222", want: []string{"nats"}},
+		{raw: "a:4222", want: []string{"nats"}},
+		{raw: "nats://user:pass@a:4222", want: []string{"nats"}},
+		{raw: "tls://a:4222, nats://b:4222,c:4222", want: []string{"tls", "nats", "nats"}},
+		{raw: "http://a:4222", wantErr: `scheme "http" is not supported`},
+		{raw: "tsl://a:4222", wantErr: `scheme "tsl" is not supported`},
+		{raw: "nats://", wantErr: "has no host"},
+		{raw: "nats://a:4222,,nats://b:4222", wantErr: "empty server entry"},
+		{raw: "nats://user:pa ss@a:4222", wantErr: "is not a valid URL"},
+	}
+	for _, c := range cases {
+		got, err := natsServerSchemes(c.raw)
+		if c.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("natsServerSchemes(%q) error = %v, want %q", c.raw, err, c.wantErr)
+			}
+			if err != nil && strings.Contains(err.Error(), "pa ss") {
+				t.Errorf("natsServerSchemes(%q) error leaks the password: %v", c.raw, err)
+			}
+			continue
+		}
+		if err != nil || !reflect.DeepEqual(got, c.want) {
+			t.Errorf("natsServerSchemes(%q) = %v, %v; want %v", c.raw, got, err, c.want)
+		}
+	}
+}
+
+func TestValidateAllowedOrigins(t *testing.T) {
+	valid := [][]string{
+		nil,
+		{"*"},
+		{"https://app.example.com"},
+		{"http://localhost:3000", "https://app.example.com", "*"},
+		{"https://[::1]:8443"},
+	}
+	for _, origins := range valid {
+		if err := validateAllowedOrigins(origins); err != nil {
+			t.Errorf("validateAllowedOrigins(%q) = %v, want nil", origins, err)
+		}
+	}
+	invalid := map[string]string{
+		"": "empty entry",
+		"https://a.example.com,https://b.example.com": "comma or whitespace",
+		"https://a.example.com ":                      "comma or whitespace",
+		"https://a.example.com\r\n":                   "comma or whitespace",
+		"app.example.com":                             "not an origin",
+		"https://app.example.com/":                    "not an origin",
+		"https://app.example.com/path":                "not an origin",
+		"https://app.example.com?x=1":                 "not an origin",
+		"https://app.example.com?":                    "not an origin",
+		"https://app.example.com#top":                 "not an origin",
+		"https://user@app.example.com":                "not an origin",
+		"null":                                        "not an origin",
+		"mailto:someone@example.com":                  "not an origin",
+		"https://App.Example.com":                     "must be lowercase",
+	}
+	for origin, wantErr := range invalid {
+		err := validateAllowedOrigins([]string{"https://ok.example.com", origin})
+		if err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Errorf("validateAllowedOrigins(%q) = %v, want an error containing %q", origin, err, wantErr)
+		}
+	}
+}
+
+// TestHandler_Provision_LogsDisabledTopicCap covers #81: switching the topic
+// cap off is visible in the logs.
+func TestHandler_Provision_LogsDisabledTopicCap(t *testing.T) {
+	for _, c := range []struct {
+		cap     int
+		wantLog bool
+	}{{-1, true}, {0, false}, {5, false}} {
+		core, obs := observer.New(zap.InfoLevel)
+		h := &Handler{NatsURL: "nats://127.0.0.1:1", StreamName: "EVENTS", MaxTopicsPerSubscription: c.cap, logger: zap.New(core)}
+		_ = h.Provision(caddy.Context{Context: context.Background()}) // the dial fails; the log comes first
+		if got := hasLogContaining(obs, "max_topics_per_subscription is -1"); got != c.wantLog {
+			t.Errorf("cap %d: logged=%v, want %v", c.cap, got, c.wantLog)
 		}
 	}
 }

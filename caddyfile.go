@@ -152,12 +152,18 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if err != nil {
 					return err
 				}
+				if v < 0 {
+					return d.Errf("heartbeat_interval must be >= 0 (0 uses the default)")
+				}
 				h.HeartbeatInterval = v
 
 			case "reconnect_wait":
 				v, err := parseInt("reconnect_wait")
 				if err != nil {
 					return err
+				}
+				if v < 0 {
+					return d.Errf("reconnect_wait must be >= 0 (0 uses the default)")
 				}
 				h.ReconnectWait = v
 
@@ -189,6 +195,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				v, err := parseInt("max_topics_per_subscription")
 				if err != nil {
 					return err
+				}
+				if v < maxTopicsDisabledSentinel {
+					return d.Errf("max_topics_per_subscription must be >= 0, or -1 for no limit")
 				}
 				h.MaxTopicsPerSubscription = v
 

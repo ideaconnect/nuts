@@ -5,9 +5,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -124,7 +127,11 @@ const minRecommendedJWTKeyLen = 32
 
 // Provision sets up the handler.
 func (h *Handler) Provision(ctx caddy.Context) error {
-	h.logger = ctx.Logger(h)
+	// Caddy hands every config load a fresh Handler, so the logger is only
+	// set beforehand by tests that need to observe Provision.
+	if h.logger == nil {
+		h.logger = ctx.Logger(h)
+	}
 
 	// Step 0: validate configuration BEFORE normalizing defaults or opening any
 	// sockets so that a bad config can't leak resources.
@@ -134,6 +141,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if err := h.validateConfigValues(); err != nil {
 		return err
 	}
+	// Warn before the connection is opened: by the time Validate runs, the
+	// credentials and the first JetStream requests have already been sent.
+	h.warnAboutTransportSecurity()
 
 	// Step 1: Normalize optional settings before dialling NATS.
 	if h.HeartbeatInterval <= 0 {
@@ -197,6 +207,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	//   >0 → user-defined limit
 	if h.MaxTopicsPerSubscription == 0 {
 		h.MaxTopicsPerSubscription = defaultMaxTopicsPerSubscription
+	}
+	if h.MaxTopicsPerSubscription == maxTopicsDisabledSentinel {
+		h.log().Info("max_topics_per_subscription is -1: requests may subscribe to any number of topics")
 	}
 
 	// Create the shutdown signal before opening any sockets so that if
@@ -265,6 +278,97 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	)
 
 	return nil
+}
+
+// maxTopicsDisabledSentinel turns max_topics_per_subscription off. Other
+// negative values are rejected as typos.
+const maxTopicsDisabledSentinel = -1
+
+// natsSchemes are the nats_url schemes nats.go dials: nats and tls over TCP,
+// ws and wss over WebSocket.
+var natsSchemes = []string{"nats", "tls", "ws", "wss"}
+
+// natsServerSchemes validates nats_url, a comma-separated server list as
+// nats.go accepts it, and returns the scheme of each server. A server
+// without a scheme is dialled as nats://, as nats.go does. nats.go itself
+// dials unknown schemes such as http:// or a mistyped tls:// as plain
+// nats://, so they are rejected here rather than silently downgraded.
+func natsServerSchemes(raw string) ([]string, error) {
+	var schemes []string
+	for _, server := range strings.Split(raw, ",") {
+		server = strings.TrimSpace(server)
+		if server == "" {
+			return nil, fmt.Errorf("nats_url contains an empty server entry")
+		}
+		server = withNATSScheme(server)
+		u, err := url.Parse(server)
+		if err != nil {
+			// url.Error repeats the URL, credentials included; keep only
+			// the reason.
+			var urlErr *url.Error
+			if errors.As(err, &urlErr) {
+				err = urlErr.Err
+			}
+			return nil, fmt.Errorf("nats_url entry %q is not a valid URL: %w", redactURL(server), err)
+		}
+		if !slices.Contains(natsSchemes, u.Scheme) {
+			return nil, fmt.Errorf("nats_url scheme %q is not supported: use nats://, tls://, ws:// or wss://", u.Scheme)
+		}
+		if u.Host == "" {
+			return nil, fmt.Errorf("nats_url entry %q has no host", redactURL(server))
+		}
+		schemes = append(schemes, u.Scheme)
+	}
+	return schemes, nil
+}
+
+// warnAboutTransportSecurity flags NATS settings that expose the connection.
+// Provision calls it before dialling (#82).
+func (h *Handler) warnAboutTransportSecurity() {
+	if h.NatsTLSInsecureSkipVerify {
+		h.log().Warn("nats_tls_insecure_skip_verify is enabled: the NATS server certificate will not be verified")
+	}
+	if h.natsCredentialsConfigured() && h.natsPlaintextServer() {
+		h.log().Warn("NATS credentials will be sent unencrypted; use tls:// or wss://, or the nats_tls_* directives",
+			zap.String("nats_url", redactURL(h.NatsURL)))
+	}
+}
+
+// natsCredentialsConfigured reports whether any credentials go to the server:
+// a directive, or user information embedded in nats_url.
+func (h *Handler) natsCredentialsConfigured() bool {
+	if h.NatsCredentials != "" || h.NatsToken != "" || h.NatsUser != "" || h.NatsPassword != "" {
+		return true
+	}
+	for _, server := range strings.Split(h.NatsURL, ",") {
+		if u, err := url.Parse(withNATSScheme(strings.TrimSpace(server))); err == nil && u.User != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// natsPlaintextServer reports whether any configured server is dialled
+// without TLS: nats:// or ws:// with none of the nats_tls_* directives, which
+// make nats.go use TLS on those schemes too.
+func (h *Handler) natsPlaintextServer() bool {
+	if h.NatsTLSCA != "" || h.NatsTLSCert != "" || h.NatsTLSKey != "" || h.NatsTLSInsecureSkipVerify {
+		return false
+	}
+	schemes, err := natsServerSchemes(h.NatsURL)
+	if err != nil {
+		return false
+	}
+	return slices.Contains(schemes, "nats") || slices.Contains(schemes, "ws")
+}
+
+// withNATSScheme adds the nats:// scheme nats.go assumes for a server given
+// as host:port.
+func withNATSScheme(server string) string {
+	if strings.Contains(server, "://") {
+		return server
+	}
+	return "nats://" + server
 }
 
 // multiFilterPurgeFixed is the first nats-server release whose multi-filter
@@ -571,6 +675,33 @@ func validateTopicPrefix(prefix string) error {
 	return nil
 }
 
+// validateAllowedOrigins accepts "*" or origins exactly as browsers send them
+// in the Origin header: scheme://host[:port] in lowercase, with no path,
+// query or trailing slash. setCORSHeaders compares origins literally, so any
+// other spelling would silently never match (#79).
+func validateAllowedOrigins(origins []string) error {
+	for _, origin := range origins {
+		if origin == "*" {
+			continue
+		}
+		if origin == "" {
+			return fmt.Errorf("allowed_origins contains an empty entry")
+		}
+		if strings.ContainsAny(origin, ", \t\r\n") {
+			return fmt.Errorf("allowed_origins entry %q contains a comma or whitespace; list origins as separate arguments", origin)
+		}
+		u, err := url.Parse(origin)
+		if err != nil || u.Scheme == "" || u.Host == "" || u.Opaque != "" || u.User != nil ||
+			u.Path != "" || u.RawQuery != "" || u.Fragment != "" || strings.HasSuffix(origin, "?") || strings.HasSuffix(origin, "#") {
+			return fmt.Errorf("allowed_origins entry %q is not an origin: use scheme://host[:port], or *", origin)
+		}
+		if origin != strings.ToLower(origin) {
+			return fmt.Errorf("allowed_origins entry %q must be lowercase, as browsers send it", origin)
+		}
+	}
+	return nil
+}
+
 // validateConfigValues checks semantic constraints that must be identical
 // whether config was supplied through a Caddyfile or Caddy's JSON API.
 func (h *Handler) validateConfigValues() error {
@@ -594,6 +725,21 @@ func (h *Handler) validateConfigValues() error {
 	}
 	if h.ReplayWindow < 0 {
 		return fmt.Errorf("replay_window must be >= 0")
+	}
+	if h.MaxTopicsPerSubscription < maxTopicsDisabledSentinel {
+		return fmt.Errorf("max_topics_per_subscription (%d) is invalid: the only accepted negative value is -1 (no limit); other negatives are rejected as typos",
+			h.MaxTopicsPerSubscription)
+	}
+	if h.NatsURL != "" {
+		if _, err := natsServerSchemes(h.NatsURL); err != nil {
+			return err
+		}
+	}
+	if h.NatsTLSInsecureSkipVerify && h.NatsTLSCA != "" {
+		return fmt.Errorf("nats_tls_ca cannot be combined with nats_tls_insecure_skip_verify: without verification the CA bundle is ignored and any certificate is accepted; remove one of the two")
+	}
+	if err := validateAllowedOrigins(h.AllowedOrigins); err != nil {
+		return err
 	}
 	// HeartbeatInterval and ReconnectWait are silently rewritten to
 	// defaults at Provision-time when <= 0 (see provision.go:77-82),
@@ -662,16 +808,6 @@ func (h *Handler) Validate() error {
 				"CORS (cookies, Authorization headers), list explicit origins instead.")
 			break
 		}
-	}
-
-	if (h.NatsCredentials != "" || h.NatsToken != "" || (h.NatsUser != "" && h.NatsPassword != "")) &&
-		strings.HasPrefix(h.NatsURL, "nats://") {
-		h.log().Warn("NATS credentials sent over plaintext nats:// URL; consider tls:// or nats_tls_* directives",
-			zap.String("nats_url", redactURL(h.NatsURL)))
-	}
-
-	if h.NatsTLSInsecureSkipVerify {
-		h.log().Warn("nats_tls_insecure_skip_verify is enabled — server certificate is not verified")
 	}
 
 	if h.DispatchTimeout > 0 {

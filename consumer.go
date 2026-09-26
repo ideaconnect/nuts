@@ -40,6 +40,8 @@ type consumerStream struct {
 	feed     *streamFeed
 	// release tells Cleanup that this stream's consumer is gone.
 	release func()
+	log     *zap.Logger
+	plan    streamPlan
 }
 
 // openConsumerStream creates the request's ordered consumer and starts pulling.
@@ -57,7 +59,7 @@ func (h *Handler) openConsumerStream(ctx context.Context, js jetstream.JetStream
 		h.streams.Done()
 		return nil, err
 	}
-	cs := &consumerStream{js: js, stream: h.StreamName, consumer: consumer, release: h.streams.Done}
+	cs := &consumerStream{js: js, stream: h.StreamName, consumer: consumer, release: h.streams.Done, log: h.log(), plan: plan}
 	iterator, err := consumer.Messages(h.pullOptions()...)
 	if err != nil {
 		cs.deleteConsumer()
@@ -101,7 +103,13 @@ func (cs *consumerStream) deleteConsumer() {
 		defer cs.release()
 		ctx, cancel := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
 		defer cancel()
-		_ = cs.js.DeleteConsumer(ctx, cs.stream, name)
+		// A consumer that is already gone (reaped, or deleted by hand) needs
+		// no mention; any other failure leaves it until InactiveThreshold.
+		if err := cs.js.DeleteConsumer(ctx, cs.stream, name); err != nil && !errors.Is(err, jetstream.ErrConsumerNotFound) {
+			cs.log.Warn("failed to delete JetStream consumer; the server removes it after its inactive threshold",
+				appendStreamLogFields(cs.plan, zap.String("consumer", name), zap.Error(err))...,
+			)
+		}
 	}()
 }
 

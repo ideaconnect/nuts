@@ -349,7 +349,8 @@ validation rules, and production notes, see
 
 ```caddyfile
 nuts {
-    # NATS server URL (required)
+    # NATS server URL (required): nats://, tls://, ws:// or wss://, or a
+    # comma-separated list of servers
     nats_url <url>
 
     # JetStream stream name (required)
@@ -363,18 +364,18 @@ nuts {
 
     # Optional settings
     topic_prefix <prefix>        # Prefix for all subscriptions
-    allowed_origins <origins...> # CORS origins (default: *)
+    allowed_origins <origins...> # CORS origins as scheme://host[:port], or * (default: *)
     allowed_headers <headers...> # CORS request headers (default: Cache-Control Last-Event-ID)
     allowed_methods <methods...> # CORS methods; only GET OPTIONS are supported
     subscriber_jwt_key <secret>  # Enable HMAC JWT subscriber auth and topic claims
     subscriber_jwt_cookie <name> # Optional JWT cookie for browser EventSource clients
-    heartbeat_interval <seconds> # SSE keep-alive ticker interval (default: 30)
-    reconnect_wait <seconds>     # Reconnect wait time (default: 2)
+    heartbeat_interval <seconds> # SSE keep-alive ticker interval (0=default 30)
+    reconnect_wait <seconds>     # Reconnect wait time (0=default 2)
     nats_idle_heartbeat <seconds># Pull-consumer heartbeat: default 10, must be < 15
     max_reconnects <count>       # Max reconnects, 0=none, -1=infinite (default: -1)
     max_event_size <bytes>       # Max SSE event size (0=default 1 MiB, <0=unlimited)
     max_connections <count>      # Global concurrent-stream cap (default: 0 = unlimited)
-    max_topics_per_subscription <count>  # Per-request topic cap (0=default 32, <0=unlimited)
+    max_topics_per_subscription <count>  # Per-request topic cap (0=default 32, -1=unlimited)
     client_buffer_size <count>   # Messages prefetched from JetStream per connection (0=default 64)
     write_timeout <seconds>      # Deadline for each SSE write/flush (0=default 30, -1=disabled)
     replay_max_messages <count>  # Cap replayed messages per reconnect (default: 0 = unlimited)
@@ -385,7 +386,7 @@ nuts {
     hub_url <url>                # URL for Link header hub discovery (disabled by default)
 
     # Optional NATS TLS
-    nats_tls_ca <path>                  # CA bundle for verifying the server
+    nats_tls_ca <path>                  # CA bundle for verifying the server (not with insecure_skip_verify)
     nats_tls_cert <path>                # Client certificate (mTLS)
     nats_tls_key <path>                 # Client key (mTLS)
     nats_tls_insecure_skip_verify       # Disable server verification (DEV ONLY)
@@ -565,6 +566,12 @@ Explicit — credentials allowed for these origins:
 ```caddyfile
 allowed_origins https://app.example.com https://admin.example.com
 ```
+
+Write each origin exactly as browsers send it in the `Origin` header:
+`scheme://host[:port]` in lowercase, with no path or trailing slash, as
+separate arguments. NUTS compares origins literally, so it rejects entries
+that could never match: an empty entry, a comma-joined list, a path, or
+uppercase letters.
 
 `allowed_methods` is intentionally limited to `GET` and `OPTIONS`, because
 NUTS only serves SSE streams and CORS preflight requests. Subscriber

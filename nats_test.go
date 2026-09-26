@@ -1805,6 +1805,12 @@ func TestRedactURL(t *testing.T) {
 		{"with token", "nats://secret@localhost:4222", "nats://REDACTED@localhost:4222"},
 		{"with user:pass", "nats://user:pass@localhost:4222", "nats://REDACTED@localhost:4222"},
 		{"invalid url", "://broken", "://broken"},
+		{"credentials in a later server of a list", "nats://a:4222,nats://user:pass@b:4222", "nats://a:4222,nats://REDACTED@b:4222"},
+		{"credentials in every server of a list", "nats://u:p@a:4222, tls://t@b:4222", "nats://REDACTED@a:4222,tls://REDACTED@b:4222"},
+		{"server without a scheme", "user:pass@localhost:4222", "REDACTED@localhost:4222"},
+		{"server without a scheme or credentials", "localhost:4222", "localhost:4222"},
+		{"unparseable with credentials", "nats://user:pa ss@localhost:4222", "nats://REDACTED@localhost:4222"},
+		{"unparseable without credentials", "nats://local host:4222", "nats://local host:4222"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

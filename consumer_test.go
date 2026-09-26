@@ -1,6 +1,7 @@
 package nuts
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -183,4 +184,68 @@ func TestServeStream_ClosesWhenTheConsumerCannotBeRecreated(t *testing.T) {
 	if !hasLogField(obs, "disconnect_reason", "consumer_unrecoverable") {
 		t.Fatalf("missing disconnect_reason=consumer_unrecoverable: %v", obs.All())
 	}
+}
+
+// fakeDeleteJS is a jetstream.JetStream whose DeleteConsumer returns err.
+type fakeDeleteJS struct {
+	jetstream.JetStream
+	err error
+}
+
+func (f fakeDeleteJS) DeleteConsumer(context.Context, string, string) error { return f.err }
+
+// fakeConsumer is a jetstream.Consumer with fixed cached info.
+type fakeConsumer struct {
+	jetstream.Consumer
+	info *jetstream.ConsumerInfo
+}
+
+func (f fakeConsumer) CachedInfo() *jetstream.ConsumerInfo { return f.info }
+
+// TestConsumerStream_DeleteFailureIsLogged covers #84: a failed consumer
+// delete names the stream's topics and the consumer, so the lingering
+// consumer can be traced to its request. A consumer that is already gone is
+// not worth a warning.
+func TestConsumerStream_DeleteFailureIsLogged(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		err     error
+		wantLog bool
+	}{
+		{name: "delete failed", err: errors.New("timeout"), wantLog: true},
+		{name: "consumer already gone", err: jetstream.ErrConsumerNotFound},
+		{name: "deleted", err: nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			core, obs := observer.New(zap.WarnLevel)
+			released := make(chan struct{})
+			cs := &consumerStream{
+				js:       fakeDeleteJS{err: c.err},
+				stream:   "EVENTS",
+				consumer: fakeConsumer{info: &jetstream.ConsumerInfo{Name: "nuts_x_1"}},
+				release:  func() { close(released) },
+				log:      zap.New(core),
+				plan:     testFeedPlan,
+			}
+			cs.deleteConsumer()
+			select {
+			case <-released:
+			case <-time.After(2 * time.Second):
+				t.Fatal("delete never released the stream")
+			}
+			logged := hasLogField(obs, "consumer", "nuts_x_1") && hasLogField(obs, "subject_label", "events.alpha")
+			if logged != c.wantLog || obs.Len() != btoi(c.wantLog) {
+				t.Fatalf("logs = %v, want a warning naming the consumer and topics: %v", obs.All(), c.wantLog)
+			}
+		})
+	}
+
+	t.Run("no consumer info", func(t *testing.T) {
+		released := false
+		cs := &consumerStream{consumer: fakeConsumer{}, release: func() { released = true }, log: zap.NewNop()}
+		cs.deleteConsumer()
+		if !released {
+			t.Fatal("a stream without consumer info was not released")
+		}
+	})
 }

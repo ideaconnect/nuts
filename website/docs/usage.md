@@ -13,7 +13,8 @@ NUTS is configured through the Caddyfile or Caddy's JSON config.
 
 ```caddyfile
 nuts {
-    # NATS server URL (required)
+    # NATS server URL (required): nats://, tls://, ws:// or wss://,
+    # or a comma-separated list of servers
     nats_url <url>
 
     # JetStream stream name (required)
@@ -26,7 +27,7 @@ nuts {
     nats_password <password>
 
     # Optional NATS TLS / mTLS
-    nats_tls_ca <path>                  # CA bundle for verifying the server
+    nats_tls_ca <path>                  # CA bundle for verifying the server (not with insecure_skip_verify)
     nats_tls_cert <path>                # Client certificate (mTLS)
     nats_tls_key <path>                 # Client key (mTLS)
     nats_tls_insecure_skip_verify       # Disable server verification (DEV ONLY)
@@ -36,26 +37,25 @@ nuts {
     subscriber_jwt_cookie <name>        # Cookie name for browser EventSource clients
 
     # CORS
-    allowed_origins <origins...>        # Default: *
+    allowed_origins <origins...>        # scheme://host[:port], or *. Default: *
     allowed_headers <headers...>        # Default: Cache-Control Last-Event-ID
     allowed_methods <methods...>        # Only GET / OPTIONS are supported
 
     # Routing & topic shape
     topic_prefix <prefix>               # Prefix for all subscriptions
-    max_topics_per_subscription <count> # Per-request topic cap (0=default 32, <0=unlimited)
+    max_topics_per_subscription <count> # Per-request topic cap (0=default 32, -1=unlimited)
 
     # Streaming behaviour
-    heartbeat_interval <seconds>        # SSE keep-alive interval (default: 30)
-    reconnect_wait <seconds>            # NATS reconnect wait (default: 2)
+    heartbeat_interval <seconds>        # SSE keep-alive interval (0=default 30)
+    reconnect_wait <seconds>            # NATS reconnect wait (0=default 2)
     max_reconnects <count>              # Max NATS reconnects, 0=none, -1=infinite (default: -1)
-    nats_idle_heartbeat <seconds>       # JetStream consumer idle heartbeat (default: 10, 0=default, -1=disable)
+    nats_idle_heartbeat <seconds>       # Pull-consumer heartbeat (0=default 10, must be < 15)
 
     # Per-event / per-connection limits
     max_event_size <bytes>              # Max SSE frame size (0=default 1 MiB, <0=unlimited)
     max_connections <count>             # Global concurrent-stream cap (default: 0 = unlimited)
-    client_buffer_size <count>          # Per-connection send buffer (0=default 64)
-    dispatch_timeout <seconds>          # Cap slow-client signal wait in NATS callbacks
-    write_timeout <seconds>             # Cap each SSE write/flush
+    client_buffer_size <count>          # Messages prefetched from JetStream per connection (0=default 64)
+    write_timeout <seconds>             # Deadline for each SSE write/flush (0=default 30, -1=disabled)
 
     # Replay bounds (for catch-up after reconnect)
     replay_max_messages <count>         # Cap replayed messages per reconnect (default: 0 = unlimited)

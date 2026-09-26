@@ -21,7 +21,7 @@ Caddy lifecycle management — connecting to NATS and tearing down on shutdown. 
 - `connectNATS()` — builds NATS connection options (reconnect, auth, TLS, lifecycle callbacks) and dials the server.
 - `buildTLSConfig()` — assembles a `*tls.Config` (TLS 1.2 minimum) from `nats_tls_ca`, `nats_tls_cert`, `nats_tls_key`, `nats_tls_insecure_skip_verify`.
 - `Cleanup()` — mutex-protected teardown: closes the `shutdown` channel (waking any in-flight SSE handlers), closes the NATS connection and nils cached state. Idempotent.
-- `Validate()` — checks required fields, rejects conflicting auth methods and invalid subscriber JWT cookie config, validates non-negative timeout/replay/buffer values, warns about wildcard CORS with credentials, cleartext `nats://` with auth, and `insecure_skip_verify`.
+- `Validate()` — re-runs the checks Provision applies before dialling (required fields, one auth mode, numeric ranges and sentinels, `nats_url` schemes, `allowed_origins` format, `nats_tls_ca` without `nats_tls_insecure_skip_verify`, subscriber JWT cookie config), and warns about wildcard CORS, the deprecated `dispatch_timeout`, `nats_idle_heartbeat -1` and short JWT keys. The transport warnings (credentials sent unencrypted, `insecure_skip_verify`) come from Provision before it connects.
 
 ### auth.go
 

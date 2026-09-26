@@ -38,6 +38,30 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   (3–8 s; `max_connections` used a fixed 5). While the NATS connection is
   down, these answers come at once instead of after the JetStream timeouts
   (about 7 seconds).
+- **Breaking: configurations that could never work as intended are
+  rejected at load time.**
+  - `nats_tls_ca` together with `nats_tls_insecure_skip_verify` (#78): Go
+    ignores the CA bundle when verification is off, so the connection
+    accepted any certificate while looking pinned.
+  - `nats_url` schemes other than `nats`, `tls`, `ws` and `wss` (#77).
+    nats.go dials an unknown scheme, such as a mistyped `tsl://`, as
+    plaintext `nats://`.
+  - `allowed_origins` entries that can never match a browser's `Origin`
+    header (#79): empty, comma-joined, with a path or trailing slash, or with
+    uppercase letters.
+  - `max_topics_per_subscription` below `-1` (#81). Only `-1` turns the cap
+    off, which is now logged at startup; other negatives were typos that
+    silently disabled it.
+- The warnings about credentials sent unencrypted and about
+  `nats_tls_insecure_skip_verify` are logged by Provision before NUTS
+  connects, rather than by Validate after the credentials have been sent
+  (#82). The unencrypted-credentials warning now also covers `ws://`,
+  servers without a scheme and credentials embedded in `nats_url`, and no
+  longer fires when `nats_tls_*` directives make nats.go use TLS.
+- Negative `heartbeat_interval` and `reconnect_wait` values are rejected when
+  the Caddyfile is parsed, with the directive's location (#80).
+- A failed consumer delete is logged with the stream's topics and the
+  consumer name (#84).
 - **Breaking: server control messages are no longer forwarded** (#112).
   Subject delete markers (`Nats-Marker-Reason`) and message schedule
   definitions (`Nats-Schedule`) used to reach clients as ordinary, often
@@ -105,6 +129,12 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   exists, rather than attempts (#71 D).
 - Provision's stream check is bounded to 2 seconds (#72), and every JetStream
   API call has a default deadline.
+
+### Security
+- Credentials in `nats_url` were logged in clear when they appeared in a
+  server after the first of a comma-separated list, or in a server given
+  without a scheme (`user:pass@host:4222`). Every server of the list is now
+  redacted, and so are the credentials of a URL that does not parse.
 
 ### Deprecated
 - `dispatch_timeout` has no effect, because there is no queue hand-off left to

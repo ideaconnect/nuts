@@ -216,14 +216,42 @@ func isValidTopic(topic string) bool {
 	return true
 }
 
-// redactURL strips embedded credentials from a URL string before it is
-// written to logs.
+// redactURL strips embedded credentials from a URL string, or from each
+// server of a comma-separated list as nats_url accepts, before it is written
+// to logs.
 func redactURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
-		return raw
+	servers := strings.Split(raw, ",")
+	for i, server := range servers {
+		servers[i] = redactServerURL(server)
+	}
+	return strings.Join(servers, ",")
+}
+
+// redactServerURL redacts the user information of one server URL. A server
+// without a scheme is parsed as nats://, as nats.go dials it; otherwise
+// "user:pass@host" would parse as scheme "user" and keep the password. In a
+// URL that does not parse, everything up to the last '@' is redacted.
+func redactServerURL(server string) string {
+	trimmed := strings.TrimSpace(server)
+	u, err := url.Parse(withNATSScheme(trimmed))
+	if err != nil {
+		at := strings.LastIndex(trimmed, "@")
+		if at < 0 {
+			return server
+		}
+		scheme := ""
+		if i := strings.Index(trimmed, "://"); i >= 0 && i < at {
+			scheme = trimmed[:i+3]
+		}
+		return scheme + "REDACTED" + trimmed[at:]
+	}
+	if u.User == nil {
+		return server
 	}
 	u.User = url.User("REDACTED")
+	if !strings.Contains(trimmed, "://") {
+		return strings.TrimPrefix(u.String(), "nats://")
+	}
 	return u.String()
 }
 
