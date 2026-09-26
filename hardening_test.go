@@ -868,8 +868,8 @@ func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
 			wantErr: "dispatch_timeout",
 		},
 		{
-			name:    "negative write timeout",
-			line:    "write_timeout -1",
+			name:    "write timeout below the -1 disable sentinel",
+			line:    "write_timeout -2",
 			wantErr: "write_timeout",
 		},
 		{
@@ -974,8 +974,8 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 			wantErr: "dispatch_timeout",
 		},
 		{
-			name:    "negative write timeout",
-			mutate:  func(h *Handler) { h.WriteTimeout = -1 },
+			name:    "write timeout below the -1 disable sentinel",
+			mutate:  func(h *Handler) { h.WriteTimeout = -2 },
 			wantErr: "write_timeout",
 		},
 		{
@@ -1136,8 +1136,8 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			wantErr:  "dispatch_timeout",
 		},
 		{
-			name:     "negative write timeout",
-			fragment: `"write_timeout": -1`,
+			name:     "write timeout below the -1 disable sentinel",
+			fragment: `"write_timeout": -2`,
 			wantErr:  "write_timeout",
 		},
 		{
@@ -1229,6 +1229,22 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 				t.Fatalf("expected no runtime state after validation rejection, got connNil=%v jsNil=%v shutdownNil=%v", connNil, jsNil, shutdownNil)
 			}
 		})
+	}
+}
+
+// TestWriteSSEChunkWithTimeout_DisabledSetsNoDeadline pins write_timeout -1:
+// a negative timeout writes without touching the connection deadline.
+func TestWriteSSEChunkWithTimeout_DisabledSetsNoDeadline(t *testing.T) {
+	rr := &deadlineFlushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	timeout := time.Duration(writeTimeoutDisabledSentinel) * time.Second
+	if err := writeSSEChunkWithTimeout(rr, http.NewResponseController(rr), "event: ping\n\n", timeout); err != nil {
+		t.Fatalf("writeSSEChunkWithTimeout: %v", err)
+	}
+	if len(rr.deadlines) != 0 {
+		t.Fatalf("deadline calls = %d, want 0 with write_timeout disabled", len(rr.deadlines))
+	}
+	if got := rr.Body.String(); got != "event: ping\n\n" {
+		t.Fatalf("body = %q", got)
 	}
 }
 
@@ -2221,5 +2237,44 @@ func TestHandler_SubscriberJWT_RejectionCreatesNoConsumer(t *testing.T) {
 	// not allocate JetStream state on the way out.
 	if got := consumerCount(js, "EVENTS"); got != 0 {
 		t.Fatalf("post-rejection: consumer count = %d, want 0 (auth must run before the consumer is created)", got)
+	}
+}
+
+// TestHandler_Validate_WarnsAboutIneffectiveSettings covers the warnings for
+// settings the pull consumer made meaningless: dispatch_timeout, and
+// nats_idle_heartbeat -1 (heartbeats can no longer be turned off).
+func TestHandler_Validate_WarnsAboutIneffectiveSettings(t *testing.T) {
+	cases := []struct {
+		name     string
+		mutate   func(*Handler)
+		wantWarn string
+	}{
+		{name: "dispatch_timeout set", mutate: func(h *Handler) { h.DispatchTimeout = 5 }, wantWarn: "dispatch_timeout is deprecated"},
+		{name: "nats_idle_heartbeat disabled", mutate: func(h *Handler) { h.NatsIdleHeartbeat = natsIdleHeartbeatDisabledSentinel }, wantWarn: "nats_idle_heartbeat -1 no longer disables"},
+		{name: "defaults stay quiet", mutate: func(*Handler) {}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			core, obs := observer.New(zap.WarnLevel)
+			h := &Handler{NatsURL: "tls://127.0.0.1:4222", StreamName: "EVENTS", NatsIdleHeartbeat: 10, AllowedOrigins: []string{"https://app.example"}, logger: zap.New(core)}
+			c.mutate(h)
+			if err := h.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			var messages []string
+			for _, entry := range obs.All() {
+				messages = append(messages, entry.Message)
+			}
+			joined := strings.Join(messages, "\n")
+			if c.wantWarn == "" {
+				if len(messages) != 0 {
+					t.Fatalf("unexpected warnings: %v", messages)
+				}
+				return
+			}
+			if !strings.Contains(joined, c.wantWarn) {
+				t.Fatalf("warnings %v do not mention %q", messages, c.wantWarn)
+			}
+		})
 	}
 }

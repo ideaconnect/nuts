@@ -217,8 +217,8 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if err != nil {
 					return err
 				}
-				if v < 0 {
-					return d.Errf("write_timeout must be >= 0")
+				if v < writeTimeoutDisabledSentinel {
+					return d.Errf("write_timeout must be >= 0, or -1 to disable")
 				}
 				h.WriteTimeout = v
 

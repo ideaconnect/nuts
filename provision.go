@@ -24,6 +24,16 @@ const defaultMaxEventSize = 1048576 // 1 MiB
 // used when ClientBufferSize is unset.
 const defaultClientBufferSize = 64
 
+// defaultWriteTimeoutSeconds is the per-frame write deadline applied when
+// write_timeout is unset. With backpressure in the pull consumer, a write that
+// cannot complete is the only sign of a client that stopped reading, so it
+// needs a bound by default. writeTimeoutDisabledSentinel (-1) turns the
+// deadline off.
+const (
+	defaultWriteTimeoutSeconds   = 30
+	writeTimeoutDisabledSentinel = -1
+)
+
 // defaultHealthPath is used when no health_path directive is configured.
 const defaultHealthPath = "/healthz"
 
@@ -161,6 +171,10 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	if h.ClientBufferSize <= 0 {
 		h.ClientBufferSize = defaultClientBufferSize
+	}
+	// WriteTimeout semantics: 0 → default, -1 → no deadline (sentinel kept).
+	if h.WriteTimeout == 0 {
+		h.WriteTimeout = defaultWriteTimeoutSeconds
 	}
 	if h.HealthPath == "" {
 		h.HealthPath = defaultHealthPath
@@ -468,8 +482,8 @@ func (h *Handler) validateConfigValues() error {
 	if h.DispatchTimeout < 0 {
 		return fmt.Errorf("dispatch_timeout must be >= 0")
 	}
-	if h.WriteTimeout < 0 {
-		return fmt.Errorf("write_timeout must be >= 0")
+	if h.WriteTimeout < writeTimeoutDisabledSentinel {
+		return fmt.Errorf("write_timeout must be >= 0, or -1 to disable")
 	}
 	if h.ReplayMaxMessages < 0 {
 		return fmt.Errorf("replay_max_messages must be >= 0")

@@ -23,6 +23,10 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   A full per-connection queue no longer disconnects the client, because the
   queue can no longer overflow. `nuts_slow_client_disconnects_total` and
   `disconnect_reason=slow_client` now mean "a write hit its deadline".
+- **Breaking: `write_timeout` defaults to 30 seconds** (previously 0, meaning
+  no deadline). With backpressure, a write that cannot complete is the only
+  sign of a client that stopped reading, so it needs a bound by default. `0`
+  or omitted now means the default; `-1` disables the deadline (#85).
 - **Breaking: `client_buffer_size` is the per-connection prefetch** from
   JetStream (default 64). It bounds per-connection memory at roughly
   `client_buffer_size` × the largest message.

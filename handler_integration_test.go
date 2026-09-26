@@ -1458,3 +1458,35 @@ func TestHandler_ServeHTTP_TopicOutsideStreamIsRejected(t *testing.T) {
 		t.Fatalf("consumers after rejection = %d, want 0", got)
 	}
 }
+
+func TestHandler_Provision_WriteTimeoutDefaults(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	for _, c := range []struct {
+		name       string
+		configured int
+		want       int
+	}{
+		{name: "omitted uses the 30s default", configured: 0, want: defaultWriteTimeoutSeconds},
+		{name: "explicit value is kept", configured: 5, want: 5},
+		{name: "-1 keeps deadlines disabled", configured: writeTimeoutDisabledSentinel, want: writeTimeoutDisabledSentinel},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := &Handler{NatsURL: ns.ClientURL(), StreamName: "EVENTS", WriteTimeout: c.configured}
+			if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			defer h.Cleanup()
+			if h.WriteTimeout != c.want {
+				t.Fatalf("WriteTimeout = %d, want %d", h.WriteTimeout, c.want)
+			}
+		})
+	}
+}

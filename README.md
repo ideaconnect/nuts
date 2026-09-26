@@ -23,15 +23,15 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 - **[JetStream Persistence](#jetstream-setup)**: Messages are persisted in NATS JetStream for replay
 - **[Message Replay](#message-replay-with-last-id-or-last-event-id)**: Clients can reconnect and replay messages from a specific ID using `?last-id=` or the standard `Last-Event-ID` header. Replay can be bounded by `replay_max_messages` or `replay_window` when configured.
 - **Multiple Topics**: Subscribe to multiple NATS subjects simultaneously
-- **Automatic Reconnection**: Built-in NATS reconnection handling
+- **Automatic Reconnection**: Built-in NATS reconnection handling; after a reconnect each stream resumes after the last message it delivered, without gaps
 - **[CORS Support](#cors-and-allowed_origins)**: Configurable cross-origin resource sharing
 - **Heartbeat**: Keep-alive mechanism to prevent connection timeouts
-- **[No Silent Drops For Slow Clients](#slow-clients-and-replay)**: When a client falls behind, NUTS disconnects that SSE session before dropping queued messages so the client can resume from the last delivered event ID. Oversized events can still be rejected by `max_event_size`.
+- **[Backpressure, Not Drops](#slow-clients-and-replay)**: Each stream pulls from JetStream only as fast as its client reads, so bursts and long replays wait in the stream instead of being dropped or disconnecting the client. A client that stops reading is disconnected by `write_timeout` and resumes from its last event ID. Oversized events can still be rejected by `max_event_size`.
 - **[NATS Authentication](#with-nats-authentication)**: Credentials file, token, or user/password auth for the NUTS-to-NATS connection
 - **NATS TLS / mTLS**: Optional `nats_tls_ca`, `nats_tls_cert`, `nats_tls_key` directives for an encrypted and mutually authenticated NATS connection
 - **[Subscriber JWT Authorization](#subscriber-authentication-and-topic-authorization)**: Optional HMAC-signed JWT auth with per-topic `subscribe` claims, accepted from `Authorization: Bearer` or a configurable cookie
 - **[Connection Caps](#max_connections)**: `max_connections` bounds concurrent SSE streams; rejected clients receive `429 Too Many Requests` with `Retry-After`
-- **[Per-frame Write Bounds](#dispatch_timeout-and-write_timeout)**: Optional `dispatch_timeout` and `write_timeout` keep slow downstream connections from tying up a handler indefinitely
+- **[Per-frame Write Bounds](#write_timeout)**: `write_timeout` (default 30 s) bounds every SSE write, so a client that stopped reading cannot tie up a handler indefinitely
 - **Topic Prefixing**: Optional prefix for all NATS subscriptions
 - **[Prometheus Metrics](#prometheus-metrics)**: Built-in `nuts_*` counters and gauges (active connections, messages delivered, slow-client disconnects, replay stats)
 - **[Liveness And Readiness Checks](#liveness-and-readiness-checks)**: `/livez`, `/readyz`, and legacy `/healthz` probe endpoints
@@ -54,7 +54,7 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
   - [Path-shorthand and `route`](#path-shorthand-and-route)
   - [`max_event_size`](#max_event_size)
   - [`max_connections`](#max_connections)
-  - [`dispatch_timeout` and `write_timeout`](#dispatch_timeout-and-write_timeout)
+  - [`write_timeout`](#write_timeout)
   - [`replay_max_messages` and `replay_window`](#replay_max_messages-and-replay_window)
   - [CORS and `allowed_origins`](#cors-and-allowed_origins)
   - [Subscriber authentication and topic authorization](#subscriber-authentication-and-topic-authorization)
@@ -109,7 +109,7 @@ directory:
 | --- | --- | --- |
 | Go (build) | 1.26.8 (`go.mod`) | Matches the toolchain `Dockerfile` uses. |
 | Caddy | 2.11.x | Embedded via `xcaddy`. Patch bumps tracked in `CHANGELOG.md`. |
-| NATS server | 2.9-alpine | Functional matrix covers `nats:2.9-alpine`, `nats:2.12-alpine`, and `nats:2.14-alpine` (see [`Makefile`](Makefile) `test-functional-matrix`). The in-process unit suite uses the embedded `nats-server/v2` library pinned in `go.mod` (same major.minor as the 2.14 matrix line). **Recommendation:** run NATS ≥ 2.10. Pre-2.10 servers lack `ConsumerFilterSubjects`, so multi-topic subscriptions fall back to wildcard-subscribe with client-side filtering — observe `nuts_wildcard_filter_drops_total` to size the impact. |
+| NATS server | 2.10 (required) | Each stream uses an ordered pull consumer with server-side `FilterSubjects`, which needs nats-server 2.10 or newer. **Multi-topic subscriptions need 2.14.7 or newer (2.15 recommended):** older servers, including every 2.12.x release, can skip messages on one requested subject when another is purged or rolled up (nats-server#8572). On 2.15 and newer, raise the stream's `max_consumers`; see [Consumer limits on nats-server 2.15](#consumer-limits-on-nats-server-215). Functional matrix: see [`Makefile`](Makefile) `test-functional-matrix`. |
 
 ## Versioning policy
 
@@ -368,14 +368,13 @@ nuts {
     subscriber_jwt_cookie <name> # Optional JWT cookie for browser EventSource clients
     heartbeat_interval <seconds> # SSE keep-alive ticker interval (default: 30)
     reconnect_wait <seconds>     # Reconnect wait time (default: 2)
-    nats_idle_heartbeat <seconds># JetStream consumer IdleHeartbeat: default 10s, -1 disables, must be < 15
+    nats_idle_heartbeat <seconds># Pull-consumer heartbeat: default 10, must be < 15
     max_reconnects <count>       # Max reconnects, 0=none, -1=infinite (default: -1)
     max_event_size <bytes>       # Max SSE event size (0=default 1 MiB, <0=unlimited)
     max_connections <count>      # Global concurrent-stream cap (default: 0 = unlimited)
     max_topics_per_subscription <count>  # Per-request topic cap (0=default 32, <0=unlimited)
-    client_buffer_size <count>   # Per-connection send buffer (0=default 64)
-    dispatch_timeout <seconds>   # Cap slow-client signal wait in NATS callbacks (default: 0 = disabled)
-    write_timeout <seconds>      # Cap each SSE write/flush when supported (default: 0 = disabled)
+    client_buffer_size <count>   # Messages prefetched from JetStream per connection (0=default 64)
+    write_timeout <seconds>      # Deadline for each SSE write/flush (0=default 30, -1=disabled)
     replay_max_messages <count>  # Cap replayed messages per reconnect (default: 0 = unlimited)
     replay_window <seconds>      # Time-bound replay to the last N seconds (default: 0 = all retained)
     health_path <path>           # Legacy readiness endpoint (empty/default: /healthz)
@@ -425,48 +424,66 @@ distinguishes a client-side concurrency cap from genuine `503` paths
 client-side circuit breakers can keep retrying rather than opening the
 circuit on a healthy backend.
 
-**Sizing memory.** The buffered-message footprint is bounded by
-`max_connections × client_buffer_size × max_event_size`. With defaults
-(`client_buffer_size 64`, `max_event_size 1048576`) each connection can hold
-up to 64 MiB of queued payloads, so `max_connections 1000` implies a ~64 GiB
-worst-case ceiling before slow-client disconnects kick in. Lower
-`client_buffer_size` or `max_event_size` if that ceiling is unacceptable;
-`max_event_size -1` (unlimited) removes the per-event bound entirely and
-makes the ceiling unbounded.
+**Sizing memory.** Each connection holds at most `client_buffer_size`
+messages prefetched from JetStream, plus the frame being written. Prefetched
+messages are raw NATS messages, so their size is bounded by the NATS server's
+`max_payload` (1 MiB by default), not by `max_event_size`: oversized ones are
+dropped only once they are read. The worst case is therefore about
+`max_connections × client_buffer_size × max_payload`. With defaults that is
+64 MiB per connection; the production profile in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (`client_buffer_size 8`, 64 KiB
+payloads) needs about 0.5 MiB. A slow client never grows this: the stream
+stops pulling instead.
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for latency, memory, and
 per-instance client-count budgets plus the load and benchmark commands used to
 validate them.
 
-#### `dispatch_timeout` and `write_timeout`
+#### `write_timeout`
 
-These optional guards keep slow or blocked downstream connections from tying up
-NUTS indefinitely:
+`write_timeout <seconds>` sets a deadline for writing and flushing each SSE
+frame (connected, message and heartbeat). A write that misses it means the
+client stopped reading, so NUTS closes the stream with
+`disconnect_reason=slow_client` and counts it in
+`nuts_slow_client_disconnects_total`; the client resumes from its last event
+ID. The default is 30 seconds (`0` or omitted). `-1` disables the deadline and
+leaves stalled writes to Caddy and the surrounding HTTP server configuration.
 
-- `dispatch_timeout <seconds>` caps how long a NATS callback waits to notify
-  the streaming loop after the client's queue is already full. `0` preserves
-  the original unbounded wait.
-- `write_timeout <seconds>` sets a per-frame write deadline before each SSE
-  connected, message, and heartbeat frame is written and flushed. `0` leaves
-  write deadlines entirely to Caddy and the surrounding HTTP server config.
+A client that is merely slower than the stream is not disconnected: its
+stream pulls from JetStream only as fast as the client reads.
 
 `write_timeout` uses Go's `http.ResponseController`; if a wrapper in front of
 NUTS does not support per-response write deadlines, NUTS falls back to the
-normal write path. Caddy server-level timeouts and proxy buffering policy still
-matter, but this directive gives the handler its own protection for supported
-HTTP stacks.
+normal write path.
 
-#### Ephemeral consumer hygiene
+`dispatch_timeout` is deprecated and has no effect: the pull consumer has no
+queue hand-off left to time out. Setting it logs a warning; it will be removed
+in the next major release.
 
-Every SSE request opens its own ephemeral JetStream consumer with an
-explicit **`InactiveThreshold` of 30 seconds**. After the SSE subscription
-ends (client disconnect, NUTS shutdown, write error), nats-server retains
-the consumer for 30 s in case the client reconnects, then reaps the
-server-side state. This protects against reconnect-storm accumulation
-that would build up with nats-server's 5 s default.
+#### JetStream consumers
 
-The threshold is not user-configurable today; if 30 s is unsuitable for
-your deployment, open an issue with the scenario you need to support.
+Every SSE request gets its own ordered pull consumer, named
+`nuts_<random id>_<n>`. NUTS deletes it when the stream ends, and a
+reconnecting client always gets a new one. The consumer also has an
+**`InactiveThreshold` of 30 seconds**, so the server reaps it on its own if
+NUTS loses its NATS connection before it can delete it.
+
+The consumer recreates itself from the last delivered sequence after a
+delivery gap, a NATS reconnect, or missed heartbeats (`nats_idle_heartbeat`),
+for example when the server reaps it during an outage. The client notices
+nothing. If recreation keeps failing for about 75 seconds, the stream closes
+with `disconnect_reason=consumer_unrecoverable` and the client reconnects with
+its last event ID.
+
+#### Consumer limits on nats-server 2.15
+
+From nats-server 2.15, a stream accepts at most 1000 consumers unless
+`max_consumers` is set on the stream or the account. Since each SSE
+connection owns one consumer, set a **positive** `max_consumers` sized for
+peak concurrent connections across all NUTS replicas (for example
+`nats stream edit EVENTS --max-consumers 10000`), or set
+`default_max_consumers: -1` in the server's JetStream limits. A stream or
+account value of `-1` does not lift the default.
 
 #### `replay_max_messages` and `replay_window`
 
@@ -759,16 +776,16 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_active_connections` | Gauge | Currently connected SSE clients |
 | `nuts_messages_delivered_total` | Counter | SSE message events successfully written |
 | `nuts_messages_dropped_total{reason}` | Counter (labeled) | Messages dropped during SSE formatting. `reason` is one of `raw_payload` (inbound NATS payload exceeded `max_event_size`) or `formatted_sse_message` (SSE envelope after JSON wrap exceeded `max_event_size`). |
-| `nuts_wildcard_filter_drops_total` | Counter | Messages silently filtered client-side by the multi-topic wildcard fallback (subjects not requested by the client). Non-zero means a server older than NATS 2.10 is wasting bandwidth on unrequested subjects. |
-| `nuts_slow_client_disconnects_total` | Counter | Clients disconnected due to slow consumption |
+| `nuts_wildcard_filter_drops_total` | Counter | Deprecated, always 0: the pre-NATS-2.10 wildcard fallback was removed. |
+| `nuts_slow_client_disconnects_total` | Counter | Clients disconnected because a write missed `write_timeout` (the client stopped reading) |
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
-| `nuts_replay_fallbacks_total` | Counter | Replay requests that used fallback replay (requested sequence was purged or older than `replay_window`) |
+| `nuts_replay_fallbacks_total` | Counter | Replay streams that started in a fallback mode (requested sequence was purged or older than `replay_window`), counted once the consumer exists |
 | `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
 | `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` is one of `max_connections`, `auth_missing_token`, `auth_invalid_token`, `auth_topic_forbidden`. |
 | `nuts_replay_cap_reached_total` | Counter | Replaying SSE connections closed after `replay_max_messages` was reached |
-| `nuts_dispatch_timeout_total` | Counter | NATS callbacks that timed out signalling a slow SSE client (set when `dispatch_timeout` fires before the SSE loop observes the signal) |
-| `nuts_nats_async_errors_total{kind}` | Counter (labeled) | Asynchronous NATS client errors observed by the registered ErrorHandler. `kind` is one of `slow_consumer`, `timeout`, `connection_state`, `consumer_invalidated`, `other`. `slow_consumer` indicates the nats.go per-subscription buffer overflowed and messages were silently dropped. `consumer_invalidated` covers three nats.go signals that all mean the JetStream push consumer is unusable: `nats.ErrConsumerNotActive` (primary case: server stopped sending IdleHeartbeats and nats.go's activityCheck timeout fired, typically because the server reaped the ephemeral via InactiveThreshold during a network blip or a leafnode route failover dropped the inbox), `nats.ErrConsumerDeleted` (consumer administratively deleted), and `*nats.ErrConsumerSequenceMismatch` (heartbeats arrived but the delivered sequence drifted). Batch B of M9 will use this signal to disconnect the affected SSE client so it reconnects with `Last-Event-ID` against a fresh consumer. |
-| `nuts_consumer_invalidated_total{reason}` | Counter (labeled) | JetStream push consumers invalidated mid-stream, triggering SSE disconnect with `disconnect_reason=consumer_invalidated`. `reason` is one of `heartbeat_missed` (from `nuts_nats_async_errors_total{kind="consumer_invalidated"}`) or `slow_consumer` (from `nuts_nats_async_errors_total{kind="slow_consumer"}` — distinct from `nuts_slow_client_disconnects_total`, which fires when the SSE writer falls behind NUTS' own bounded `msgChan`). Declared and visible in `/metrics` from Batch A of milestone M9; populated by Batch B's `serveStream` termination arm. |
+| `nuts_dispatch_timeout_total` | Counter | Deprecated, always 0: `dispatch_timeout` has no effect. |
+| `nuts_nats_async_errors_total{kind}` | Counter (labeled) | Asynchronous NATS client errors observed by the registered ErrorHandler. `kind` is one of `slow_consumer`, `timeout`, `connection_state`, `consumer_invalidated`, `other`. Consumer health is now handled by the ordered consumer itself and counted in `nuts_consumer_invalidated_total`. |
+| `nuts_consumer_invalidated_total{reason}` | Counter (labeled) | JetStream consumer failures under live streams. `reason` is `recreated` (the consumer recovered after a gap, a NATS reconnect or missed heartbeats; the client noticed nothing) or `unrecoverable` (recreation kept failing and the stream closed with `disconnect_reason=consumer_unrecoverable`). |
 | `nuts_write_disconnects_total{site}` | Counter (labeled) | SSE streams terminated by a response-writer write error (typically the `write_timeout` deadline firing). `site` is one of `connected`, `message`, `heartbeat`. |
 | `nuts_readiness_failures_total{cause}` | Counter (labeled) | `/readyz` probe responses that returned 503 because a dependency was degraded. `cause` is one of `nats_disconnected`, `jetstream_missing`, `stream_info_error`. |
 | `nuts_nats_connection_events_total{event}` | Counter (labeled) | NATS connection-state transitions reported by the registered Disconnect/Reconnect/Closed handlers. `event` is one of `disconnect`, `reconnect`, `closed`. Use the `reconnect` series to alert on broker flapping (see [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml)). |
@@ -907,19 +924,22 @@ events.onerror = (e) => {
 
 ### Slow Clients And Replay
 
-NUTS does not silently drop queued messages merely because an active SSE client is slow.
+Each stream pulls from JetStream only as fast as its client reads. A client
+that falls behind during a burst or a long replay keeps its connection; the
+backlog waits in JetStream until the client catches up.
 
-If a client cannot read fast enough and its per-connection queue fills, NUTS closes that SSE connection instead of discarding queued messages. A reconnecting client can then resume from the last delivered SSE `id` using either:
+A client that stops reading altogether is disconnected once a write misses
+`write_timeout` (30 s by default). It can then resume from the last delivered
+SSE `id` using either:
 
 - The browser-managed `Last-Event-ID` header
 - The explicit `?last-id=` query parameter for custom clients
 
 This means the delivery policy is effectively:
 
-- No silent per-client message loss in the live stream path due to slow consumers
-- Slow clients must reconnect to continue
-- `dispatch_timeout` and `write_timeout` can bound callback waits and blocked
-  SSE writes when the downstream connection or proxy stalls
+- No per-client message loss in the live stream path, including across NATS
+  reconnects and consumer loss on the server
+- Clients that stop reading are disconnected and resume from their last ID
 - Replay depends on the requested sequence still being retained in JetStream
 - Oversized raw payloads or formatted SSE events are rejected according to `max_event_size`
 
@@ -939,9 +959,11 @@ const events = new EventSource(`/events?topic=updates&last-id=${lastId}`);
 - Messages with sequence numbers greater than `last-id` will be delivered
 - If the requested sequence no longer exists (expired/deleted), NUTS falls back to retained replay
 - **Replay storm caveat**: old cursors can trigger a large retained backlog. Design your stream retention policy (max age, max messages) accordingly, and cap replay with `replay_max_messages` or `replay_window` for public or multi-tenant routes.
-- Without `last-id`, only new messages are delivered
+- Without `last-id`, only new messages are delivered. The `connected` event
+  still carries an `id` (the stream position the subscription starts after),
+  so a client that disconnects before its first message resumes without a gap
 - Standard `EventSource` reconnects can use the `Last-Event-ID` header automatically
-- When a slow client is disconnected, reconnecting with the last delivered event ID resumes from that point instead of losing messages silently
+- When a client is disconnected, reconnecting with the last delivered event ID resumes from that point instead of losing messages silently
 
 **Source precedence and malformed-cursor handling:**
 
@@ -986,6 +1008,20 @@ data: {"topic":"my-topic","payload":{"your":"data"},"time":"2024-01-01T12:00:00Z
 ```
 
 The `id` field contains the JetStream sequence number, which can be used with `last-id` or `Last-Event-ID` for replay.
+
+The first frame of every stream is the handshake event:
+
+```
+id: 12344
+event: connected
+data: {"topics":["my-topic"]}
+```
+
+Its `id` is the stream position the subscription starts after: the stream's
+last sequence for a request without a cursor, or the requested cursor for a
+replay. Treat it like any other event ID. It is omitted when the stream
+starts in a fallback replay mode, in which case the client keeps its previous
+cursor.
 
 ## Example Scenarios
 

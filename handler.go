@@ -140,8 +140,11 @@ type Handler struct {
 	// major release.
 	DispatchTimeout int `json:"dispatch_timeout,omitempty"`
 
-	// WriteTimeout caps each SSE frame write/flush. Value is in seconds; 0
-	// leaves write deadlines to the surrounding HTTP server configuration.
+	// WriteTimeout caps each SSE frame write and flush, in seconds. A write
+	// that misses it means the client stopped reading, and the stream closes
+	// with disconnect_reason=slow_client. 0 (or unset) uses the default of
+	// 30; -1 disables the deadline and leaves stalled writes to the
+	// surrounding HTTP server configuration.
 	WriteTimeout int `json:"write_timeout,omitempty"`
 
 	// ReplayMaxMessages caps replay delivery per reconnect. 0 disables the cap.
