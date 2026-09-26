@@ -56,3 +56,15 @@ Feature: Multi-client SSE streaming with disconnect and reconnect
     # First client should have everything
     And client "first" should have received an event containing '"count":1'
     And client "first" should have received an event containing '"count":10'
+
+  Scenario: A client that reconnects before its first message loses nothing
+    # The connected event carries the stream position, so a client whose
+    # stream ends before any message arrives (a proxy or Caddy reload) still
+    # resumes without a gap.
+    Given client "early" is connected to SSE endpoint "/events?topic=earlyreconnect"
+    When client "early" disconnects
+    And I publish message '{"gap":1}' to subject "events.earlyreconnect"
+    And I publish message '{"gap":2}' to subject "events.earlyreconnect"
+    And client "early" reconnects to SSE endpoint "/events?topic=earlyreconnect" with its last event ID
+    Then client "early" should have received an event containing '"gap":1'
+    And client "early" should have received an event containing '"gap":2'

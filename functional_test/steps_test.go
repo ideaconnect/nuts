@@ -348,6 +348,12 @@ func iAmConnectedToSSEEndpoint(endpoint string) error {
 }
 
 func iConnectToSSEEndpoint(endpoint string) error {
+	return connectToSSEEndpoint(endpoint, "")
+}
+
+// connectToSSEEndpoint opens the scenario's SSE stream, sending lastEventID as
+// the Last-Event-ID header when it is not empty.
+func connectToSSEEndpoint(endpoint, lastEventID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	tc.cancelFunc = cancel
 
@@ -356,6 +362,9 @@ func iConnectToSSEEndpoint(endpoint string) error {
 		return err
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	if lastEventID != "" {
+		req.Header.Set("Last-Event-ID", lastEventID)
+	}
 
 	client := &http.Client{
 		Timeout: 0, // No timeout for SSE
@@ -382,6 +391,14 @@ func iConnectToSSEEndpointWithLastIdFromMessage(endpoint string, messageIndex in
 
 	fullEndpoint := fmt.Sprintf("%s&last-id=%d", endpoint, seq)
 	return iConnectToSSEEndpoint(fullEndpoint)
+}
+
+func iConnectToSSEEndpointWithLastEventIDFromMessage(endpoint string, messageIndex int) error {
+	seq, ok := tc.publishedSeqs[messageIndex]
+	if !ok {
+		return fmt.Errorf("no message published at index %d", messageIndex)
+	}
+	return connectToSSEEndpoint(endpoint, strconv.FormatUint(seq, 10))
 }
 
 func readSSEEvents(body io.Reader, done chan<- struct{}) {
@@ -1035,6 +1052,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	// When steps
 	ctx.Step(`^I connect to SSE endpoint "([^"]*)"$`, iConnectToSSEEndpoint)
 	ctx.Step(`^I connect to SSE endpoint "([^"]*)" with last-id from message (\d+)$`, iConnectToSSEEndpointWithLastIdFromMessage)
+	ctx.Step(`^I connect to SSE endpoint "([^"]*)" with Last-Event-ID from message (\d+)$`, iConnectToSSEEndpointWithLastEventIDFromMessage)
 	ctx.Step(`^I publish message '([^']*)' to subject "([^"]*)"$`, iPublishMessageToSubject)
 	ctx.Step(`^I request SSE endpoint "([^"]*)"$`, iRequestSSEEndpoint)
 	ctx.Step(`^I send OPTIONS request to "([^"]*)" with origin "([^"]*)"$`, iSendOPTIONSRequestToWithOrigin)

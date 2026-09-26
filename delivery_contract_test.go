@@ -3,8 +3,10 @@ package nuts
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,6 +14,8 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"go.uber.org/zap"
 )
 
 // Delivery-contract tests: end-to-end properties of the SSE stream that the
@@ -117,6 +121,7 @@ func newContractServer(t *testing.T, natsURL string, configure func(*Handler)) (
 	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
+	h.logger = zap.NewNop()
 	t.Cleanup(func() { _ = h.Cleanup() })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = h.ServeHTTP(w, r, nil) }))
 	t.Cleanup(srv.Close)
@@ -152,20 +157,7 @@ func TestDeliveryContract_NATSLinkLossLeavesNoHole(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	proxy.cut()
 	proxy.discard.Store(false)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		rt := h.currentStreamRuntime()
-		h.mu.RLock()
-		conn := h.conn
-		h.mu.RUnlock()
-		if rt.js != nil && conn != nil && conn.IsConnected() && conn.Stats().Reconnects > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("NUTS did not reconnect through the proxy")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	waitForNATSReconnect(t, h)
 	publishRange(t, js, "events.alpha", 7, 9)
 
 	assertContiguousIDs(t, stream.collectIDs(6, 15*time.Second), 4, 9)
@@ -173,6 +165,61 @@ func TestDeliveryContract_NATSLinkLossLeavesNoHole(t *testing.T) {
 	case <-stream.closed:
 		t.Fatal("stream closed; the client would have had to reconnect")
 	default:
+	}
+}
+
+// TestDeliveryContract_LinkLossBeforeFirstMessageNeitherReplaysNorSkips: an
+// ordered consumer that resets before delivering anything re-applies its
+// original deliver policy. With DeliverNew that skipped everything published
+// during the outage, and the legacy nats.go ordered consumer restarted from
+// sequence 1 and replayed the whole stream. Requests without a cursor start
+// at an explicit LastSeq+1, which survives the reset.
+func TestDeliveryContract_LinkLossBeforeFirstMessageNeitherReplaysNorSkips(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	js, _ := nc.JetStream()
+	publishRange(t, js, "events.alpha", 1, 3) // history the stream must not replay
+	proxy := newBlackholeProxy(t, ns.Addr().String())
+	h, srv := newContractServer(t, proxy.url(), nil)
+
+	stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
+	if connected := stream.collectIDs(1, 3*time.Second); len(connected) != 1 || connected[0] != 3 {
+		t.Fatalf("connected id = %v, want [3]", connected)
+	}
+	proxy.discard.Store(true)
+	publishRange(t, js, "events.alpha", 4, 6) // published while NUTS is cut off
+	time.Sleep(300 * time.Millisecond)
+	proxy.cut()
+	proxy.discard.Store(false)
+	waitForNATSReconnect(t, h)
+	publishRange(t, js, "events.alpha", 7, 8)
+
+	assertContiguousIDs(t, stream.collectIDs(5, 15*time.Second), 4, 8)
+}
+
+// waitForNATSReconnect waits until the handler's NATS connection has
+// reconnected at least once and its JetStream context is usable again.
+func waitForNATSReconnect(t *testing.T, h *Handler) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		rt := h.currentStreamRuntime()
+		h.mu.RLock()
+		conn := h.conn
+		h.mu.RUnlock()
+		if rt.js != nil && conn != nil && conn.IsConnected() && conn.Stats().Reconnects > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("NUTS did not reconnect through the proxy")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -235,4 +282,140 @@ func TestDeliveryContract_LiveBurstKeepsFastClientsConnected(t *testing.T) {
 	if got := counterVal(t, metricsSlowClientDisconnects); got != slowBefore {
 		t.Fatalf("slow_client_disconnects_total moved %v -> %v during a burst", slowBefore, got)
 	}
+}
+
+// TestDeliveryContract_CursorFromARecreatedStreamStillDelivers covers #103: a
+// cursor from before the stream was recreated used to park the consumer until
+// the new stream reached it, silently skipping everything before.
+func TestDeliveryContract_CursorFromARecreatedStreamStillDelivers(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, _ := nats.Connect(ns.ClientURL())
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	js, _ := nc.JetStream()
+	_, srv := newContractServer(t, ns.ClientURL(), nil)
+	publishRange(t, js, "events.alpha", 1, 50)
+
+	if err := js.DeleteStream("EVENTS"); err != nil {
+		t.Fatalf("DeleteStream: %v", err)
+	}
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	publishRange(t, js, "events.alpha", 1, 5)
+
+	stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "50")
+	// The fallback's connected event carries no id, so the first id is
+	// the recreated stream's first message.
+	assertContiguousIDs(t, stream.collectIDs(5, 5*time.Second), 1, 5)
+}
+
+// TestDeliveryContract_DeletedResumeMessageDoesNotReplayHistory covers #115:
+// with replay_window set, a deleted resume message used to force a
+// time-window fallback that re-sent messages the client already had.
+func TestDeliveryContract_DeletedResumeMessageDoesNotReplayHistory(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, _ := nats.Connect(ns.ClientURL())
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	js, _ := nc.JetStream()
+	_, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) { h.ReplayWindow = 3600 })
+	publishRange(t, js, "events.alpha", 1, 5)
+	if err := js.DeleteMsg("EVENTS", 3); err != nil {
+		t.Fatalf("DeleteMsg: %v", err)
+	}
+
+	stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "2")
+	ids := stream.collectIDs(3, 3*time.Second)
+	if want := []uint64{2, 4, 5}; !reflect.DeepEqual(ids, want) {
+		t.Fatalf("ids = %v, want %v (connected cursor 2, then 4 and 5; nothing before the cursor)", ids, want)
+	}
+	if extra := stream.collectIDs(1, 300*time.Millisecond); len(extra) != 0 {
+		t.Fatalf("unexpected extra ids %v", extra)
+	}
+}
+
+// TestDeliveryContract_EventSourceReconnectWithURLCursorMakesProgress covers
+// #102: the documented EventSource pattern puts ?last-id= in the URL, which
+// the browser resends on every auto-reconnect. With replay_max_messages the
+// URL cursor used to win, replaying the same first N messages forever.
+func TestDeliveryContract_EventSourceReconnectWithURLCursorMakesProgress(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, _ := nats.Connect(ns.ClientURL())
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	js, _ := nc.JetStream()
+	_, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) { h.ReplayMaxMessages = 5 })
+	publishRange(t, js, "events.alpha", 1, 20)
+
+	lastEventID := ""
+	var received []uint64
+	for reconnect := 0; reconnect < 4; reconnect++ {
+		stream := openSSEStream(t, srv.URL+"/events?topic=alpha&last-id=0", lastEventID)
+		ids := stream.collectIDs(6, 3*time.Second) // connected cursor + 5 replayed
+		if len(ids) != 6 {
+			t.Fatalf("reconnect %d: ids = %v, want the cursor and 5 messages", reconnect, ids)
+		}
+		received = append(received, ids[1:]...)
+		lastEventID = strconv.FormatUint(ids[len(ids)-1], 10)
+		<-stream.closed // replay_max_messages closes the stream
+	}
+	assertContiguousIDs(t, received, 1, 20)
+}
+
+// TestJetStream_StartSequenceOutsideTheStream pins the server behaviour that
+// replay planning relies on. A start below retention is clamped to FirstSeq
+// without an error, which is why NUTS no longer retries the subscribe (#97).
+// A start past the end is accepted and parks the consumer until the stream
+// reaches it, which is why planning falls back for such cursors (#103).
+func TestJetStream_StartSequenceOutsideTheStream(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	legacy, _ := nc.JetStream()
+	publishRange(t, legacy, "events.alpha", 1, 5)
+	if err := legacy.PurgeStream("EVENTS", &nats.StreamPurgeRequest{Sequence: 4}); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	js := mustJetStream(t, nc)
+
+	firstDelivered := func(t *testing.T, startSeq uint64) (uint64, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cons, err := js.OrderedConsumer(ctx, "EVENTS", jetstream.OrderedConsumerConfig{
+			FilterSubjects: []string{"events.alpha"},
+			DeliverPolicy:  jetstream.DeliverByStartSequencePolicy,
+			OptStartSeq:    startSeq,
+		})
+		if err != nil {
+			t.Fatalf("OrderedConsumer(OptStartSeq=%d): %v", startSeq, err)
+		}
+		msg, err := cons.Next(jetstream.FetchMaxWait(time.Second))
+		if err != nil {
+			return 0, err
+		}
+		meta, err := msg.Metadata()
+		if err != nil {
+			t.Fatalf("metadata: %v", err)
+		}
+		return meta.Sequence.Stream, nil
+	}
+
+	t.Run("below retention starts at FirstSeq", func(t *testing.T) {
+		if got, err := firstDelivered(t, 1); err != nil || got != 4 {
+			t.Fatalf("first delivered = %d (err %v), want 4", got, err)
+		}
+	})
+	t.Run("past the end delivers nothing yet", func(t *testing.T) {
+		if got, err := firstDelivered(t, 50); !errors.Is(err, nats.ErrTimeout) {
+			t.Fatalf("first delivered = %d (err %v), want a timeout", got, err)
+		}
+	})
 }

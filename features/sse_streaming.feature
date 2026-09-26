@@ -30,6 +30,29 @@ Feature: SSE Streaming with JetStream
     And I should receive an SSE event containing '"seq":3'
     But I should not receive an SSE event containing '"seq":1'
 
+  Scenario: Last-Event-ID header wins over the last-id parameter
+    # EventSource resends its original URL, ?last-id= included, on every
+    # reconnect; the fresher header must decide where the replay starts.
+    Given I publish message '{"seq": 1}' to subject "events.precedence"
+    And I publish message '{"seq": 2}' to subject "events.precedence"
+    And I publish message '{"seq": 3}' to subject "events.precedence"
+    When I connect to SSE endpoint "/events?topic=precedence&last-id=0" with Last-Event-ID from message 2
+    Then I should receive an SSE event containing '"seq":3'
+    But I should not receive an SSE event containing '"seq":2'
+    And I should not receive an SSE event containing '"seq":1'
+
+  Scenario Outline: Probe paths accept a trailing slash
+    When I request SSE endpoint "<path>"
+    Then I should receive HTTP status 200
+    And the response header "Content-Type" should be "application/json"
+    And the response should contain "<body>"
+
+    Examples:
+      | path             | body      |
+      | /events/livez/   | ok        |
+      | /events/readyz/  | available |
+      | /events/healthz/ | connected |
+
   Scenario: Path-based topic subscription
     Given I am connected to SSE endpoint "/mypath"
     When I publish message '{"path": "based"}' to subject "events.mypath"

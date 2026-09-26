@@ -45,6 +45,18 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   cursor it is the stream's last sequence when the consumer was created (`0`
   on an empty stream); for replay requests it is the requested cursor. Those
   requests start at an explicit sequence instead of `DeliverNew`.
+- **Breaking: a valid `Last-Event-ID` header wins over `?last-id=`** (#102).
+  `EventSource` resends the URL it was created with, `?last-id=` included, on
+  every auto-reconnect. Because the query used to win, a client that resumed
+  from a stored id replayed from that same id on every reconnect, and with
+  `replay_max_messages` it never got past the first N messages. A malformed
+  `?last-id=` is still rejected with `400`. A malformed header is logged and
+  ignored, and the query cursor is used instead.
+- **Breaking: probe paths ignore one trailing slash** (#83). `GET /livez/`,
+  `/readyz/` and `/healthz/` (also under a route prefix) now answer as probes.
+  Before, they were treated as a subscription to a topic named `livez`, so
+  kubelet probes with a trailing slash failed with `503`. Use
+  `?topic=livez` to subscribe to such a topic.
 - `nats_idle_heartbeat` now sets the heartbeat of every pull request. When
   heartbeats stop, the ordered consumer recreates itself. `-1` is still
   accepted but no longer disables anything: the library default (5s) applies,
@@ -79,6 +91,26 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
 - **A consumer reaped or deleted under a live stream left the stream open and
   silent** (#54). It is now recreated from the last delivered sequence without
   the client noticing (#53).
+- **A cursor ahead of the stream parked the client in the future** (#103).
+  After a stream was recreated or restored from a backup, a stored
+  `Last-Event-ID` could point past the new stream's last sequence. The
+  consumer then waited silently until the stream reached that sequence and
+  skipped everything before it. Such cursors now fall back to the retained
+  replay (`replay_window` when configured).
+- **`replay_window` and `replay_max_messages` failed open when the stream info
+  could not be read at request time** (#98). A stale cursor then replayed the
+  whole stream. The window now falls back to `now - replay_window`, and the
+  cap counts the backlog pending behind the first replayed message.
+- **The `replay_window` filter also dropped live messages** (#106), for example
+  from a mirror catching up or with clock skew between servers. It now applies
+  to replayed history only, and each drop is counted in
+  `nuts_messages_dropped_total{reason="replay_window"}`.
+- **A deleted message at the resume point re-sent history** under
+  `replay_window` (#115). Its publish time could not be read, so the request
+  fell back to the time window and replayed messages the client already had.
+  NUTS now dates the resume point by the next retained message.
+- `replay_max_messages` no longer counts live messages published during a
+  replay, including after a reconnect to an empty stream (#98).
 - A slow-client overflow race could write a message after an earlier one was
   dropped (#104). The NATS callback could also stay parked for good behind a
   stalled writer, with messages accumulating up to nats.go's 64 MiB pending

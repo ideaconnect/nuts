@@ -3,6 +3,7 @@ package nuts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestHandler_ParseStreamRequestBuildsStreamPlan(t *testing.T) {
@@ -69,7 +71,7 @@ func TestHandler_PlanSubscriptionSelectsReplayModes(t *testing.T) {
 
 	t.Run("start sequence inside retention", func(t *testing.T) {
 		h := &Handler{}
-		plan := h.planSubscription(basePlan, streamInfoSnapshot{FirstSeq: 5})
+		plan := h.planSubscription(basePlan, streamInfoSnapshot{HasSnapshot: true, FirstSeq: 5, LastSeq: 20})
 		if plan.Replay.Mode != replayModeStartSequence {
 			t.Fatalf("Replay mode = %s, want start_sequence", plan.Replay.Mode)
 		}
@@ -80,7 +82,7 @@ func TestHandler_PlanSubscriptionSelectsReplayModes(t *testing.T) {
 
 	t.Run("below retention falls back to deliver all", func(t *testing.T) {
 		h := &Handler{}
-		plan := h.planSubscription(basePlan, streamInfoSnapshot{FirstSeq: 20})
+		plan := h.planSubscription(basePlan, streamInfoSnapshot{HasSnapshot: true, FirstSeq: 20, LastSeq: 30})
 		if plan.Replay.Mode != replayModeFallbackDeliverAll {
 			t.Fatalf("Replay mode = %s, want fallback_deliver_all", plan.Replay.Mode)
 		}
@@ -91,7 +93,7 @@ func TestHandler_PlanSubscriptionSelectsReplayModes(t *testing.T) {
 
 	t.Run("below retention uses replay window", func(t *testing.T) {
 		h := &Handler{ReplayWindow: 30}
-		plan := h.planSubscription(basePlan, streamInfoSnapshot{FirstSeq: 20})
+		plan := h.planSubscription(basePlan, streamInfoSnapshot{HasSnapshot: true, FirstSeq: 20, LastSeq: 30})
 		if plan.Replay.Mode != replayModeFallbackStartTime {
 			t.Fatalf("Replay mode = %s, want fallback_start_time", plan.Replay.Mode)
 		}
@@ -103,6 +105,7 @@ func TestHandler_PlanSubscriptionSelectsReplayModes(t *testing.T) {
 	t.Run("valid retained sequence outside replay window falls back", func(t *testing.T) {
 		h := &Handler{ReplayWindow: 30}
 		plan := h.planSubscription(basePlan, streamInfoSnapshot{
+			HasSnapshot:          true,
 			FirstSeq:             5,
 			LastSeq:              20,
 			StartSequenceTime:    time.Now().Add(-time.Minute),
@@ -119,6 +122,7 @@ func TestHandler_PlanSubscriptionSelectsReplayModes(t *testing.T) {
 	t.Run("valid retained sequence inside replay window keeps sequence", func(t *testing.T) {
 		h := &Handler{ReplayWindow: 30}
 		plan := h.planSubscription(basePlan, streamInfoSnapshot{
+			HasSnapshot:          true,
 			FirstSeq:             5,
 			LastSeq:              20,
 			StartSequenceTime:    time.Now(),
@@ -307,38 +311,51 @@ func TestHandler_LogSubscriptionCountsOnlyFallbacks(t *testing.T) {
 	}
 }
 
-func TestHandler_CountsTowardReplayCapWithoutSequenceMetadata(t *testing.T) {
-	h := &Handler{ReplayMaxMessages: 2}
-	// Snapshot was observed; message has no stream-sequence metadata.
-	// We conservatively count (the cap bounds total delivery rather
-	// than only historical replay — see countsTowardReplayCap comment).
-	plan := streamPlan{Replay: replayPlan{HasLastID: true, HasSnapshot: true, CapSequence: 20}}
-
-	if !h.countsTowardReplayCap(plan, formattedMessageEvent{}) {
-		t.Fatal("message without stream sequence should conservatively count toward replay cap when a snapshot was observed")
+func TestReplayHistory(t *testing.T) {
+	seq := func(n uint64) formattedMessageEvent {
+		return formattedMessageEvent{HasStreamSequence: true, StreamSequence: n}
 	}
-}
 
-// TestHandler_CountsTowardReplayCap_NoSnapshotSkipsCap covers pass-7's
-// HasSnapshot fix: when readStreamSnapshot's StreamInfo call failed
-// (HasSnapshot=false) the replay cap MUST NOT enforce, because the
-// CapSequence we have is 0-by-default and the conservative "count it"
-// branch would silently retarget the cap at live traffic — closing a
-// long-lived SSE session with disconnect_reason=replay_cap_reached
-// after N live messages of any age.
-func TestHandler_CountsTowardReplayCap_NoSnapshotSkipsCap(t *testing.T) {
-	h := &Handler{ReplayMaxMessages: 2}
-	plan := streamPlan{Replay: replayPlan{HasLastID: true, HasSnapshot: false, CapSequence: 0}}
+	t.Run("requests without a cursor have no history", func(t *testing.T) {
+		r := newReplayHistory(streamPlan{Replay: replayPlan{HasSnapshot: true, CapSequence: 20}})
+		if r.isHistory(seq(1)) {
+			t.Fatal("message counted as history for a request without a cursor")
+		}
+	})
 
-	// Even though the cap is configured and the request asked for replay,
-	// no snapshot means we cannot tell live from historical — skip the
-	// cap entirely.
-	if h.countsTowardReplayCap(plan, formattedMessageEvent{HasStreamSequence: true, StreamSequence: 100}) {
-		t.Fatal("live message must not count toward replay cap when HasSnapshot=false")
-	}
-	if h.countsTowardReplayCap(plan, formattedMessageEvent{}) {
-		t.Fatal("metadata-less message must not count toward replay cap when HasSnapshot=false")
-	}
+	t.Run("snapshot boundary is the planned LastSeq", func(t *testing.T) {
+		r := newReplayHistory(streamPlan{Replay: replayPlan{HasLastID: true, HasSnapshot: true, CapSequence: 20}})
+		if !r.isHistory(seq(20)) {
+			t.Fatal("sequence at the boundary is history")
+		}
+		if r.isHistory(seq(21)) {
+			t.Fatal("sequence past the boundary is live")
+		}
+	})
+
+	t.Run("empty stream at plan time means every message is live", func(t *testing.T) {
+		r := newReplayHistory(streamPlan{Replay: replayPlan{HasLastID: true, HasSnapshot: true, CapSequence: 0}})
+		if r.isHistory(seq(1)) {
+			t.Fatal("message on a stream that was empty at plan time counted as history")
+		}
+	})
+
+	t.Run("message without metadata counts", func(t *testing.T) {
+		r := newReplayHistory(streamPlan{Replay: replayPlan{HasLastID: true, HasSnapshot: true, CapSequence: 20}})
+		if !r.isHistory(formattedMessageEvent{}) {
+			t.Fatal("metadata-less message must count toward the replay budget")
+		}
+	})
+
+	t.Run("without a snapshot the first pending count sizes the backlog", func(t *testing.T) {
+		r := newReplayHistory(streamPlan{Replay: replayPlan{HasLastID: true}})
+		first := seq(5)
+		first.NumPending = 2
+		got := []bool{r.isHistory(first), r.isHistory(seq(6)), r.isHistory(seq(7)), r.isHistory(seq(8))}
+		if want := []bool{true, true, true, false}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("history = %v, want %v", got, want)
+		}
+	})
 }
 
 func TestHandler_RecordDroppedMessageLogsFormattedEvent(t *testing.T) {
@@ -877,6 +894,248 @@ func TestHandler_ParseStreamRequest_LastIDBoundary(t *testing.T) {
 			}
 			if c.wantHasID && plan.Replay.StartSequence != c.wantStartAt+1 {
 				t.Fatalf("StartSequence = %d, want %d", plan.Replay.StartSequence, c.wantStartAt+1)
+			}
+		})
+	}
+}
+
+func TestHandler_PlanSubscriptionReplayFallbacks(t *testing.T) {
+	base := streamPlan{Topics: []string{"alpha"}, FullSubjects: []string{"events.alpha"}}
+	cursor := func(startSeq uint64) streamPlan {
+		p := base
+		p.Replay = replayPlan{HasLastID: true, Mode: replayModeStartSequence, StartSequence: startSeq}
+		return p
+	}
+	cases := []struct {
+		name       string
+		window     int
+		plan       streamPlan
+		snapshot   streamInfoSnapshot
+		wantMode   replayMode
+		wantReason string
+	}{
+		{name: "caught-up cursor resumes normally", plan: cursor(11), snapshot: streamInfoSnapshot{HasSnapshot: true, FirstSeq: 1, LastSeq: 10}, wantMode: replayModeStartSequence},
+		{name: "cursor ahead of the stream falls back", plan: cursor(12), snapshot: streamInfoSnapshot{HasSnapshot: true, FirstSeq: 1, LastSeq: 10}, wantMode: replayModeFallbackDeliverAll, wantReason: "cursor ahead of stream"},
+		{name: "cursor ahead of an empty recreated stream falls back", plan: cursor(51), snapshot: streamInfoSnapshot{HasSnapshot: true}, wantMode: replayModeFallbackDeliverAll, wantReason: "cursor ahead of stream"},
+		{name: "cursor ahead with a window uses the window", window: 60, plan: cursor(12), snapshot: streamInfoSnapshot{HasSnapshot: true, FirstSeq: 1, LastSeq: 10}, wantMode: replayModeFallbackStartTime, wantReason: "cursor ahead of stream"},
+		{name: "no snapshot with a window fails closed", window: 60, plan: cursor(5), snapshot: streamInfoSnapshot{}, wantMode: replayModeFallbackStartTime, wantReason: "stream info unavailable"},
+		{name: "no snapshot without a window keeps the cursor", plan: cursor(5), snapshot: streamInfoSnapshot{}, wantMode: replayModeStartSequence},
+		{name: "below retention falls back", plan: cursor(2), snapshot: streamInfoSnapshot{HasSnapshot: true, FirstSeq: 5, LastSeq: 10}, wantMode: replayModeFallbackDeliverAll, wantReason: "sequence below retention"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := &Handler{ReplayWindow: c.window}
+			got := h.planSubscription(c.plan, c.snapshot)
+			if got.Replay.Mode != c.wantMode || got.Replay.FallbackReason != c.wantReason {
+				t.Fatalf("plan = %s (%q), want %s (%q)", got.Replay.Mode, got.Replay.FallbackReason, c.wantMode, c.wantReason)
+			}
+			if got.Replay.StartSequence != c.plan.Replay.StartSequence {
+				t.Fatalf("StartSequence = %d, want the requested %d kept for logs", got.Replay.StartSequence, c.plan.Replay.StartSequence)
+			}
+		})
+	}
+}
+
+// countingStream serves GetMsg from a script, recording each call.
+type countingStream struct {
+	fakeStream
+	getMsg []func() (*jetstream.RawStreamMsg, error)
+	calls  int
+}
+
+func (c *countingStream) GetMsg(_ context.Context, _ uint64, _ ...jetstream.GetMsgOpt) (*jetstream.RawStreamMsg, error) {
+	call := c.getMsg[c.calls]
+	c.calls++
+	return call()
+}
+
+func TestHandler_ReadStreamSnapshot_DeletedResumeMessageUsesTheNextMessage(t *testing.T) {
+	h := &Handler{StreamName: "EVENTS", ReplayWindow: 3600, logger: zap.NewNop()}
+	next := time.Date(2026, 9, 26, 11, 0, 0, 0, time.UTC)
+	stream := &countingStream{
+		fakeStream: fakeStream{info: &jetstream.StreamInfo{State: jetstream.StreamState{FirstSeq: 1, LastSeq: 5}}},
+		getMsg: []func() (*jetstream.RawStreamMsg, error){
+			func() (*jetstream.RawStreamMsg, error) { return nil, jetstream.ErrMsgNotFound },
+			func() (*jetstream.RawStreamMsg, error) { return &jetstream.RawStreamMsg{Sequence: 4, Time: next}, nil },
+		},
+	}
+	plan := streamPlan{Replay: replayPlan{HasLastID: true, StartSequence: 3}}
+
+	snapshot := h.readStreamSnapshot(context.Background(), fakeStreamLookup{stream: stream}, plan)
+	if stream.calls != 2 {
+		t.Fatalf("GetMsg calls = %d, want 2 (exact, then next)", stream.calls)
+	}
+	if !snapshot.HasStartSequenceTime || !snapshot.StartSequenceTime.Equal(next) {
+		t.Fatalf("StartSequenceTime = %v (has=%v), want the next message's time %v", snapshot.StartSequenceTime, snapshot.HasStartSequenceTime, next)
+	}
+
+	other := &countingStream{
+		fakeStream: fakeStream{info: &jetstream.StreamInfo{State: jetstream.StreamState{FirstSeq: 1, LastSeq: 5}}},
+		getMsg: []func() (*jetstream.RawStreamMsg, error){
+			func() (*jetstream.RawStreamMsg, error) { return nil, errors.New("timeout") },
+		},
+	}
+	if s := h.readStreamSnapshot(context.Background(), fakeStreamLookup{stream: other}, plan); s.HasStartSequenceTime || other.calls != 1 {
+		t.Fatalf("a non-not-found error must not retry: calls=%d has=%v", other.calls, s.HasStartSequenceTime)
+	}
+}
+
+// runServeStreamWithFrames drives serveStream with scripted frames and
+// returns the body once the frames are consumed or the stream ends.
+func runServeStreamWithFrames(t *testing.T, h *Handler, plan streamPlan, frames []formattedMessageEvent) (string, bool) {
+	t.Helper()
+	ch := make(chan formattedMessageEvent)
+	feed := &streamFeed{frames: ch, errs: make(chan error), stop: func() {}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rr := newSafeRecorder()
+	done := make(chan struct{})
+	go func() {
+		_ = h.serveStream(rr, httptest.NewRequest(http.MethodGet, "/events", nil).WithContext(ctx), plan, feed, nil)
+		close(done)
+	}()
+	for _, f := range frames {
+		select {
+		case ch <- f:
+		case <-done:
+			return rr.Body(), true
+		}
+	}
+	cancel()
+	<-done
+	return rr.Body(), false
+}
+
+func frameAt(seq uint64, ts time.Time) formattedMessageEvent {
+	return formattedMessageEvent{
+		Frame:             fmt.Sprintf("id: %d\nevent: message\ndata: {}\n\n", seq),
+		HasStreamSequence: true,
+		StreamSequence:    seq,
+		HasMessageTime:    true,
+		MessageTime:       ts,
+	}
+}
+
+// TestServeStream_ReplayWindowFilterSparesLiveMessages covers #106: a live
+// message whose timestamp predates the window (mirror catching up, clock
+// skew) is delivered; only replayed history is filtered.
+func TestServeStream_ReplayWindowFilterSparesLiveMessages(t *testing.T) {
+	h := &Handler{HeartbeatInterval: 60, logger: zap.NewNop()}
+	windowStart := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	old := windowStart.Add(-time.Hour)
+	plan := streamPlan{Replay: replayPlan{HasLastID: true, HasSnapshot: true, CapSequence: 10, Mode: replayModeFallbackStartTime, StartTime: windowStart}}
+	before := counterValue(metricsMessagesDropped, dropReasonReplayWindow)
+
+	body, _ := runServeStreamWithFrames(t, h, plan, []formattedMessageEvent{frameAt(9, old), frameAt(10, windowStart), frameAt(11, old)})
+
+	if strings.Contains(body, "id: 9\n") {
+		t.Fatal("replayed message older than the window was delivered")
+	}
+	if !strings.Contains(body, "id: 10\n") || !strings.Contains(body, "id: 11\n") {
+		t.Fatalf("in-window history or the live message is missing; body=%q", body)
+	}
+	if got := counterValue(metricsMessagesDropped, dropReasonReplayWindow); got != before+1 {
+		t.Fatalf("messages_dropped_total{replay_window} = %v, want %v", got, before+1)
+	}
+}
+
+// TestServeStream_ReplayCapHoldsWithoutSnapshot covers #98: when StreamInfo
+// failed at plan time the first message's pending count bounds the replay,
+// instead of the cap switching off.
+func TestServeStream_ReplayCapHoldsWithoutSnapshot(t *testing.T) {
+	h := &Handler{HeartbeatInterval: 60, ReplayMaxMessages: 2, logger: zap.NewNop()}
+	plan := streamPlan{Replay: replayPlan{HasLastID: true, Mode: replayModeStartSequence, StartSequence: 1}}
+	first := frameAt(1, time.Now())
+	first.NumPending = 9
+	before := counterVal(t, metricsReplayCapReached)
+
+	body, ended := runServeStreamWithFrames(t, h, plan, []formattedMessageEvent{first, frameAt(2, time.Now()), frameAt(3, time.Now())})
+
+	if !ended {
+		t.Fatal("stream kept running past replay_max_messages without a snapshot")
+	}
+	if strings.Contains(body, "id: 3\n") {
+		t.Fatalf("message past the cap was delivered; body=%q", body)
+	}
+	if got := counterVal(t, metricsReplayCapReached); got != before+1 {
+		t.Fatalf("replay_cap_reached_total = %v, want %v", got, before+1)
+	}
+}
+
+func TestParseReplayCursor(t *testing.T) {
+	cases := []struct {
+		value   string
+		want    uint64
+		problem cursorProblem
+	}{
+		{value: "", problem: cursorAbsent},
+		{value: "0", want: 0, problem: cursorValid},
+		{value: "41", want: 41, problem: cursorValid},
+		{value: strconv.FormatUint(maxReplayCursor-2, 10), want: maxReplayCursor - 2, problem: cursorValid},
+		{value: strconv.FormatUint(maxReplayCursor-1, 10), problem: cursorInvalid},
+		{value: strconv.FormatUint(maxReplayCursor, 10), problem: cursorInvalid},
+		{value: "abc", problem: cursorInvalid},
+		{value: "-1", problem: cursorInvalid},
+		{value: strings.Repeat("9", 20), problem: cursorInvalid},
+		{value: strings.Repeat("1", 21), problem: cursorTooLong},
+	}
+	for _, c := range cases {
+		t.Run(c.value, func(t *testing.T) {
+			got, problem, _ := parseReplayCursor(c.value)
+			if got != c.want || problem != c.problem {
+				t.Fatalf("parseReplayCursor(%q) = %d, %v; want %d, %v", c.value, got, problem, c.want, c.problem)
+			}
+		})
+	}
+}
+
+// TestHandler_ParseStreamRequest_CursorPrecedence covers #102: EventSource
+// resends its original URL, ?last-id= included, on every auto-reconnect,
+// together with a fresher Last-Event-ID. The header must win.
+func TestHandler_ParseStreamRequest_CursorPrecedence(t *testing.T) {
+	cases := []struct {
+		name       string
+		query      string
+		header     string
+		wantStatus int
+		wantStart  uint64
+		wantWarn   string
+	}{
+		{name: "header wins over the URL cursor", query: "2", header: "7", wantStart: 8},
+		{name: "URL cursor alone", query: "5", wantStart: 6},
+		{name: "header alone", header: "7", wantStart: 8},
+		{name: "malformed header falls back to the URL cursor", query: "2", header: "abc", wantStart: 3, wantWarn: "ignoring unparseable Last-Event-ID header"},
+		{name: "oversized header falls back to the URL cursor", query: "2", header: strings.Repeat("1", 21), wantStart: 3, wantWarn: "ignoring oversized Last-Event-ID header"},
+		{name: "malformed URL cursor is rejected even with a valid header", query: "abc", header: "7", wantStatus: http.StatusBadRequest},
+		{name: "no cursor", wantStart: 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			core, obs := observer.New(zap.WarnLevel)
+			h := &Handler{TopicPrefix: "events.", logger: zap.New(core)}
+			target := "/events?topic=x"
+			if c.query != "" {
+				target += "&last-id=" + c.query
+			}
+			req := httptest.NewRequest(http.MethodGet, target, nil)
+			if c.header != "" {
+				req.Header.Set("Last-Event-ID", c.header)
+			}
+			plan, reqErr := h.parseStreamRequest(req)
+			if c.wantStatus != 0 {
+				if reqErr == nil || reqErr.status != c.wantStatus {
+					t.Fatalf("err = %+v, want status %d", reqErr, c.wantStatus)
+				}
+				return
+			}
+			if reqErr != nil {
+				t.Fatalf("unexpected error %+v", reqErr)
+			}
+			if plan.Replay.StartSequence != c.wantStart || plan.Replay.HasLastID != (c.wantStart != 0) {
+				t.Fatalf("Replay = %+v, want start %d", plan.Replay, c.wantStart)
+			}
+			if c.wantWarn != "" && obs.FilterMessage(c.wantWarn).Len() != 1 {
+				t.Fatalf("expected warning %q, got %v", c.wantWarn, obs.All())
 			}
 		})
 	}

@@ -272,7 +272,7 @@ NUTS registers the following metrics; expose them via Caddy's `metrics` handler:
 |--------|------|-------------|
 | `nuts_active_connections` | Gauge | Currently connected SSE clients |
 | `nuts_messages_delivered_total` | Counter | SSE message events successfully written to clients |
-| `nuts_messages_dropped_total{reason}` | Counter | Messages dropped during SSE formatting (`reason`: `raw_payload`, `formatted_sse_message` — exceeded `max_event_size`) |
+| `nuts_messages_dropped_total{reason}` | Counter | Messages dropped before delivery (`reason`: `raw_payload`, `formatted_sse_message` — exceeded `max_event_size`; `replay_window` — a replayed message older than `replay_window`) |
 | `nuts_wildcard_filter_drops_total` | Counter | Messages filtered client-side by the multi-topic wildcard fallback (NATS < 2.10 delivering unrequested subjects) |
 | `nuts_slow_client_disconnects_total` | Counter | Clients disconnected due to slow consumption (full per-connection buffer) |
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
@@ -375,8 +375,11 @@ Clients can resume from where they left off using `last-id` or the standard
 `Last-Event-ID` header:
 
 ```javascript
-const lastId = localStorage.getItem('lastEventId') || '';
-const events = new EventSource(`/events?topic=notifications&last-id=${lastId}`);
+const lastId = localStorage.getItem('lastEventId');
+const url = lastId
+    ? `/events?topic=notifications&last-id=${encodeURIComponent(lastId)}`
+    : '/events?topic=notifications';
+const events = new EventSource(url);
 ```
 
 **Replay behavior:**
@@ -386,6 +389,10 @@ const events = new EventSource(`/events?topic=notifications&last-id=${lastId}`);
   messages are replayed
 - Without `last-id`, only new messages are delivered
 - Standard `EventSource` reconnects send `Last-Event-ID` automatically
+- When both are present, a valid `Last-Event-ID` header wins over
+  `?last-id=`: `EventSource` resends its original URL on every reconnect,
+  and the header carries the fresher position. A malformed `?last-id=` is
+  rejected with `400`; a malformed header is logged and ignored
 
 > **Replay storm caveat:** when the fallback fires, all retained messages are
 > replayed. Cap with `replay_max_messages` and/or `replay_window` for public

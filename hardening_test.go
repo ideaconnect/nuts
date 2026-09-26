@@ -1594,6 +1594,55 @@ func TestHandler_LiveAndReadyPaths_AreDistinctProbes(t *testing.T) {
 	assertProbe("/readyz", http.StatusServiceUnavailable, `"nats":"disconnected"`)
 }
 
+// TestHandler_ProbesAcceptATrailingSlash covers #83: "/livez/" used to fall
+// through to topic parsing and answer 503 "Failed to subscribe" for topic
+// "livez", so a kubelet probe with a trailing slash restarted the pod.
+func TestHandler_ProbesAcceptATrailingSlash(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	h := &Handler{
+		NatsURL:     ns.ClientURL(),
+		StreamName:  "EVENTS",
+		TopicPrefix: "events.",
+		logger:      zap.NewNop(),
+	}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer h.Cleanup()
+
+	for _, c := range []struct{ path, wantBody string }{
+		{"/livez/", `"status":"ok"`},
+		{"/readyz/", `"stream":"available"`},
+		{"/healthz/", `"nats":"connected"`},
+		{"/events/readyz/", `"stream":"available"`},
+	} {
+		t.Run(c.path, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			if err := h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, c.path, nil), nil); err != nil {
+				t.Fatalf("ServeHTTP: %v", err)
+			}
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+			}
+			if got := rr.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("Content-Type = %q, want application/json", got)
+			}
+			if !strings.Contains(rr.Body.String(), c.wantBody) {
+				t.Fatalf("body = %q, want to contain %q", rr.Body.String(), c.wantBody)
+			}
+		})
+	}
+}
+
 // ── health_path segment-boundary match ──────────────────────────────────
 
 func TestHandler_MatchesHealthPath_SegmentBoundary(t *testing.T) {
@@ -1611,6 +1660,14 @@ func TestHandler_MatchesHealthPath_SegmentBoundary(t *testing.T) {
 		{"glued suffix custom", "/status", "/apistatus", false},
 		{"unrelated path", "", "/events/orders.new", false},
 		{"partial segment in middle", "/status", "/statusful/thing", false},
+		{"trailing slash default", "", "/healthz/", true},
+		{"trailing slash under a route prefix", "", "/events/healthz/", true},
+		{"configured with a trailing slash", "/status/", "/status", true},
+		{"configured with a trailing slash under a prefix", "/status/", "/api/v1/status", true},
+		{"glued suffix with a trailing slash", "", "/eventshealthz/", false},
+		{"only one trailing slash is ignored", "", "/healthz//", false},
+		{"root request", "", "/", false},
+		{"root configured path matches root", "/", "/", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

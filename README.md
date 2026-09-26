@@ -496,17 +496,20 @@ this can be tens of thousands of events.
   configured number of historical replay events have been delivered. The
   client reconnects with a fresher `Last-Event-ID` and continues normally.
   The `nuts_replay_cap_reached_total` counter is incremented each time the cap
-  fires. Edge case: when a client reconnects with `last-id` but the stream
-  is empty at that moment (`LastSeq=0`), or a delivered message lacks
-  JetStream metadata, NUTS conservatively counts subsequent deliveries
-  against the cap. This is intentional — it protects the operator's
-  protection budget when the snapshot cannot tell historical replay apart
-  from live traffic — but it does mean the cap can fire after N live
-  messages following such a reconnect rather than after N historical ones.
+  fires. Only history counts: NUTS reads the stream's last sequence when the
+  request arrives, and messages published after that are live traffic that
+  never trips the cap. When the stream info cannot be read, the backlog
+  pending behind the first replayed message is counted instead. A message
+  without JetStream metadata counts against the cap during a replay.
 - `replay_window <seconds>` time-bounds replay to recent retained messages.
   If the requested cursor is older than the window, NUTS starts replay at
   `now - window`; if the cursor is still inside the window, NUTS preserves
-  exact `last-id + 1` cursor semantics.
+  exact `last-id + 1` cursor semantics. When the stream info cannot be read,
+  or the cursor is ahead of the stream (a recreated or restored stream), the
+  replay also starts at `now - window`. Replayed messages older than the
+  window are dropped and counted as
+  `nuts_messages_dropped_total{reason="replay_window"}`; live messages are
+  never filtered.
 
 Both default to `0` (unlimited / all retained) to preserve the original
 behaviour. They can be combined: `replay_window` bounds the time range,
@@ -775,7 +778,7 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 |--------|------|-------------|
 | `nuts_active_connections` | Gauge | Currently connected SSE clients |
 | `nuts_messages_delivered_total` | Counter | SSE message events successfully written |
-| `nuts_messages_dropped_total{reason}` | Counter (labeled) | Messages dropped during SSE formatting. `reason` is one of `raw_payload` (inbound NATS payload exceeded `max_event_size`) or `formatted_sse_message` (SSE envelope after JSON wrap exceeded `max_event_size`). |
+| `nuts_messages_dropped_total{reason}` | Counter (labeled) | Messages dropped during SSE formatting. `reason` is one of `raw_payload` (inbound NATS payload exceeded `max_event_size`), `formatted_sse_message` (SSE envelope after JSON wrap exceeded `max_event_size`) or `replay_window` (a replayed message older than `replay_window`). |
 | `nuts_wildcard_filter_drops_total` | Counter | Deprecated, always 0: the pre-NATS-2.10 wildcard fallback was removed. |
 | `nuts_slow_client_disconnects_total` | Counter | Clients disconnected because a write missed `write_timeout` (the client stopped reading) |
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
@@ -893,9 +896,14 @@ const events = new EventSource('/events?topic=notifications&topic=updates');
 // Using path-based topic
 const events = new EventSource('/events/my-topic');
 
-// Replay messages from a specific ID (e.g., after reconnection)
-const lastId = localStorage.getItem('lastEventId') || '';
-const events = new EventSource(`/events?topic=notifications&last-id=${lastId}`);
+// Resume from a stored ID after a page reload. EventSource resends this URL,
+// ?last-id= included, on every auto-reconnect, but its own Last-Event-ID
+// header is fresher and takes precedence, so reconnects keep moving forward.
+const lastId = localStorage.getItem('lastEventId');
+const url = lastId
+    ? `/events?topic=notifications&last-id=${encodeURIComponent(lastId)}`
+    : '/events?topic=notifications';
+const events = new EventSource(url);
 
 // Handle connection
 events.addEventListener('connected', (e) => {
@@ -967,21 +975,25 @@ const events = new EventSource(`/events?topic=updates&last-id=${lastId}`);
 
 **Source precedence and malformed-cursor handling:**
 
-When both `?last-id=` and the `Last-Event-ID` header are present on the
-same request, the **query parameter wins** — clients explicitly setting
-`?last-id=` override whatever the browser auto-attaches on EventSource
-reconnect.
+When both `?last-id=` and a valid `Last-Event-ID` header are present on
+the same request, the **header wins**. An `EventSource` keeps the URL it was
+created with, so every auto-reconnect resends the original `?last-id=` next
+to the browser's fresher `Last-Event-ID`; letting the query win would replay
+from the same old cursor on every reconnect, and with `replay_max_messages`
+set the client would never get past the first N messages.
 
 Malformed values are handled asymmetrically on purpose:
 
-- `?last-id=` malformed or above the cursor cap → **400 Bad Request**.
-  An explicit query value is a client choice; failing fast surfaces the
-  bug.
+- `?last-id=` malformed or above the cursor cap → **400 Bad Request**,
+  even when a valid header is also present. An explicit query value is a
+  client choice; failing fast surfaces the bug.
 - `Last-Event-ID:` malformed or above the cursor cap → **logged at
-  Warn, stream resumes with `DeliverNew`**. A browser auto-resumes on
-  reconnect with whatever it last received; returning 400 would make
-  it loop forever on a single bad value. The Warn log carries the
-  offending value so an operator can diagnose the producer.
+  Warn and ignored**. The stream resumes from a valid `?last-id=` when one
+  is present, otherwise it starts at the live position like a request
+  without a cursor. A browser auto-resumes on reconnect with whatever it
+  last received; returning 400 would make it loop forever on a single bad
+  value. The Warn log carries the offending value so an operator can
+  diagnose the producer.
 
 The **cursor cap** is `2^64 − 2` (the highest accepted value). NUTS
 adds `1` to the parsed cursor to compute the JetStream `StartSequence`,

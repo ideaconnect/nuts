@@ -94,6 +94,9 @@ const (
 	// the JSON-wrapped SSE frame (id/event/data envelope plus encoded payload)
 	// exceeded MaxEventSize.
 	dropReasonFormattedSSEMessage string = "formatted_sse_message"
+	// dropReasonReplayWindow tags a replayed message that JetStream delivered
+	// from a time-bounded fallback but that predates the replay window.
+	dropReasonReplayWindow string = "replay_window"
 )
 
 // isFallback reports whether the mode was selected by the fallback path
@@ -260,6 +263,9 @@ type formattedMessageEvent struct {
 	// ConsumerName is the server-side consumer that delivered the message. A
 	// change between messages means the ordered consumer recreated itself.
 	ConsumerName string
+	// NumPending is how many matching messages were still waiting in the
+	// stream when this one was delivered.
+	NumPending uint64
 	// Dropped is set when the formatter chose not to emit (oversize).
 	Dropped bool
 	// DropReason names the drop bucket for metrics/logging.
@@ -455,55 +461,80 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 		return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Too many topics requested"}
 	}
 
-	// Query parameter takes precedence over the header so a client can
-	// override what the browser auto-attaches on EventSource reconnect.
-	lastIDStr := r.URL.Query().Get("last-id")
-	queryProvided := lastIDStr != ""
-	if lastIDStr == "" {
-		lastIDStr = r.Header.Get("Last-Event-ID")
+	// Both cursor sources are parsed. A malformed ?last-id= is the client's
+	// explicit mistake (400); a malformed Last-Event-ID came from a browser
+	// auto-resume, so it is logged and ignored rather than breaking
+	// reconnect. When both are valid the header wins: EventSource keeps its
+	// URL for its whole lifetime, so every auto-reconnect resends the
+	// original ?last-id= next to the fresher Last-Event-ID.
+	cursor, queryProblem, _ := parseReplayCursor(r.URL.Query().Get("last-id"))
+	switch queryProblem {
+	case cursorTooLong:
+		return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Invalid last-id value: too long"}
+	case cursorInvalid:
+		return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Invalid last-id value: must be an unsigned integer below the maximum cursor value"}
 	}
-	if lastIDStr != "" {
-		// Cap the input length before strconv.ParseUint so a multi-MB numeric
-		// string can't cause large allocations. uint64 max is 20 digits.
-		if len(lastIDStr) > 20 {
-			if queryProvided {
-				return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Invalid last-id value: too long"}
-			}
-			h.log().Warn("ignoring oversized Last-Event-ID header; resuming with DeliverNew",
-				zap.Int("length", len(lastIDStr)))
-			return plan, nil
-		}
-		parsedID, err := strconv.ParseUint(lastIDStr, 10, 64)
-		// `parsedID + 1` is the JetStream StartSequence we will dial. When
-		// parsedID == maxReplayCursor-1, that addition lands on
-		// maxReplayCursor itself — the reserved "invalid" sentinel — and
-		// JetStream silently parks the consumer at a sequence that will
-		// never arrive. Reject the off-by-one alongside the documented
-		// == maxReplayCursor case.
-		if err != nil || parsedID >= maxReplayCursor-1 {
-			// Explicit ?last-id= is a client error (bad request); a header
-			// value usually came from a browser auto-resume and we'd rather
-			// downgrade to DeliverNew than break reconnect entirely.
-			if queryProvided {
-				return streamPlan{}, &streamRequestError{status: http.StatusBadRequest, message: "Invalid last-id value: must be an unsigned integer below the maximum cursor value"}
-			}
-			fields := []zap.Field{zap.String("value", lastIDStr)}
-			if err != nil {
-				fields = append(fields, zap.Error(err))
-			} else {
-				fields = append(fields, zap.String("reason", "cursor would overflow"))
-			}
-			h.log().Warn("ignoring unparseable Last-Event-ID header; resuming with DeliverNew", fields...)
+	hasCursor := queryProblem == cursorValid
+
+	headerValue := r.Header.Get("Last-Event-ID")
+	headerCursor, headerProblem, headerErr := parseReplayCursor(headerValue)
+	switch headerProblem {
+	case cursorValid:
+		cursor, hasCursor = headerCursor, true
+	case cursorTooLong:
+		h.log().Warn("ignoring oversized Last-Event-ID header", zap.Int("length", len(headerValue)))
+	case cursorInvalid:
+		fields := []zap.Field{zap.String("value", headerValue)}
+		if headerErr != nil {
+			fields = append(fields, zap.Error(headerErr))
 		} else {
-			plan.Replay = replayPlan{
-				HasLastID:     true,
-				Mode:          replayModeStartSequence,
-				StartSequence: parsedID + 1,
-			}
-			metricsReplayRequests.Inc()
+			fields = append(fields, zap.String("reason", "cursor would overflow"))
 		}
+		h.log().Warn("ignoring unparseable Last-Event-ID header", fields...)
+	}
+
+	if hasCursor {
+		plan.Replay = replayPlan{
+			HasLastID:     true,
+			Mode:          replayModeStartSequence,
+			StartSequence: cursor + 1,
+		}
+		metricsReplayRequests.Inc()
 	}
 	return plan, nil
+}
+
+// cursorProblem classifies a replay cursor value.
+type cursorProblem int
+
+const (
+	cursorAbsent cursorProblem = iota
+	cursorValid
+	cursorTooLong
+	cursorInvalid
+)
+
+// parseReplayCursor parses a last-id / Last-Event-ID value. The returned
+// error, if any, is strconv's reason for an invalid value.
+func parseReplayCursor(value string) (uint64, cursorProblem, error) {
+	if value == "" {
+		return 0, cursorAbsent, nil
+	}
+	// Cap the input length before strconv.ParseUint so a multi-MB numeric
+	// string can't cause large allocations. uint64 max is 20 digits.
+	if len(value) > 20 {
+		return 0, cursorTooLong, nil
+	}
+	id, err := strconv.ParseUint(value, 10, 64)
+	// id+1 is the JetStream start sequence. When id == maxReplayCursor-1
+	// that addition lands on maxReplayCursor itself, the reserved "invalid"
+	// sentinel, and JetStream would park the consumer at a sequence that
+	// never arrives, so the off-by-one is rejected along with the
+	// == maxReplayCursor case.
+	if err != nil || id >= maxReplayCursor-1 {
+		return 0, cursorInvalid, err
+	}
+	return id, cursorValid, nil
 }
 
 // currentStreamRuntime takes a single locked snapshot of the handler's
@@ -548,7 +579,15 @@ func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan 
 		Subjects:    info.Config.Subjects,
 	}
 	if plan.Replay.HasLastID && h.ReplayWindow > 0 && plan.Replay.StartSequence >= info.State.FirstSeq {
-		if msg, err := stream.GetMsg(readCtx, plan.Replay.StartSequence); err == nil {
+		msg, err := stream.GetMsg(readCtx, plan.Replay.StartSequence)
+		if errors.Is(err, jetstream.ErrMsgNotFound) {
+			// The resume message itself was deleted (TTL, rollup,
+			// MaxMsgsPerSubject); the next retained message dates the
+			// resume point instead of forcing a window fallback that would
+			// replay messages the client already has.
+			msg, err = stream.GetMsg(readCtx, plan.Replay.StartSequence, jetstream.WithGetMsgSubject(">"))
+		}
+		if err == nil {
 			snapshot.StartSequenceTime = msg.Time
 			snapshot.HasStartSequenceTime = true
 		} else {
@@ -589,9 +628,25 @@ func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot)
 	}
 	plan.Replay.CapSequence = snapshot.LastSeq
 	plan.Replay.HasSnapshot = snapshot.HasSnapshot
-	if snapshot.FirstSeq > 0 && plan.Replay.StartSequence < snapshot.FirstSeq {
+	switch {
+	case !snapshot.HasSnapshot:
+		// The resume point cannot be dated, so replay_window falls back to
+		// the window itself instead of replaying history the operator
+		// restricted. The replay cap still applies: see replayHistory.
+		if h.ReplayWindow > 0 {
+			plan.Replay = h.fallbackReplayPlan(plan.Replay, "stream info unavailable")
+		}
+	case plan.Replay.StartSequence > snapshot.LastSeq+1:
+		// A cursor from a recreated or restored stream: the server would
+		// park the consumer until the stream reached it, silently skipping
+		// everything before.
+		plan.Replay = h.fallbackReplayPlan(plan.Replay, "cursor ahead of stream")
+	case snapshot.FirstSeq > 0 && plan.Replay.StartSequence < snapshot.FirstSeq:
+		// The server itself clamps a start below retention to FirstSeq and
+		// returns no error, so this branch exists to apply replay_window and
+		// to log and count the fallback, not to avoid a failed subscribe.
 		plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence below retention")
-	} else if h.shouldUseReplayWindow(plan.Replay, snapshot) {
+	case h.shouldUseReplayWindow(plan.Replay, snapshot):
 		plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence outside replay window")
 	}
 	return plan
@@ -692,6 +747,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 	defer heartbeat.Stop()
 
 	replayDelivered := 0
+	history := newReplayHistory(plan)
 	consumerName := ""
 
 	ctx := r.Context()
@@ -736,7 +792,12 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 				}
 				consumerName = formatted.ConsumerName
 			}
-			if shouldSkipReplayWindowMessage(plan, formatted) {
+			historical := history.isHistory(formatted)
+			if historical && shouldSkipReplayWindowMessage(plan, formatted) {
+				metricsMessagesDropped.WithLabelValues(dropReasonReplayWindow).Inc()
+				h.log().Debug("skipping replayed message older than replay_window",
+					appendStreamLogFields(plan, zap.Uint64("stream_sequence", formatted.StreamSequence))...,
+				)
 				continue
 			}
 
@@ -746,7 +807,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 			}
 			metricsMessagesDelivered.Inc()
 
-			if h.countsTowardReplayCap(plan, formatted) {
+			if historical && h.ReplayMaxMessages > 0 {
 				replayDelivered++
 				if replayDelivered >= h.ReplayMaxMessages {
 					metricsReplayCapReached.Inc()
@@ -796,11 +857,12 @@ func (h *Handler) recordWriteDisconnect(plan streamPlan, site string, err error,
 	)
 }
 
-// shouldSkipReplayWindowMessage filters out messages that JetStream
-// delivered but predate the configured replay window. Necessary because
-// nats.StartTime() resolution is server-side and can include messages
-// published an instant before the requested cutoff; this is the
-// belt-and-braces client-side check.
+// shouldSkipReplayWindowMessage filters out replayed messages that JetStream
+// delivered but that predate the configured replay window. Necessary because
+// the start-time resolution is server-side and can include messages published
+// an instant before the requested cutoff. Callers apply it to the replayed
+// backlog only: live messages can carry older timestamps (a mirror catching
+// up, clock skew) and must never be filtered.
 func shouldSkipReplayWindowMessage(plan streamPlan, formatted formattedMessageEvent) bool {
 	return plan.Replay.Mode == replayModeFallbackStartTime &&
 		!plan.Replay.StartTime.IsZero() &&
@@ -808,35 +870,51 @@ func shouldSkipReplayWindowMessage(plan streamPlan, formatted formattedMessageEv
 		formatted.MessageTime.Before(plan.Replay.StartTime)
 }
 
-// countsTowardReplayCap reports whether a delivered message should count
-// against ReplayMaxMessages. Only true when (a) the cap is configured,
-// (b) the request asked for replay, (c) the request had an observed
-// stream snapshot at plan time, and (d) the message's sequence is at or
-// below the cap recorded when the subscription opened (i.e. it is
-// historical replay, not new live traffic produced after we connected).
-//
-// When StreamInfo failed at plan time CapSequence is 0 because we never
-// observed LastSeq. Treating that as "count everything" would let a
-// transient broker blip silently retarget the cap at live traffic and
-// disconnect a long-lived SSE session with disconnect_reason=
-// replay_cap_reached after the configured number of LIVE messages. The
-// HasSnapshot guard distinguishes "snapshot unavailable" from
-// "snapshot says LastSeq=0" so that case skips replay accounting
-// entirely. Without sequence metadata on the message itself we still
-// conservatively count it (the cap then bounds total delivery rather
-// than only historical replay, which is the right side to err on for
-// the operator's protection budget).
-func (h *Handler) countsTowardReplayCap(plan streamPlan, formatted formattedMessageEvent) bool {
-	if h.ReplayMaxMessages <= 0 || !plan.Replay.HasLastID {
+// replayHistory tells replayed backlog apart from live traffic on one stream,
+// so replay_max_messages and the replay_window filter apply to the backlog
+// only. With a snapshot the boundary is the stream's LastSeq when the request
+// was planned. Without one (StreamInfo failed) the first delivered message's
+// pending count gives the size of the backlog instead, so both protections
+// still hold rather than switching off.
+type replayHistory struct {
+	replay     bool
+	bySequence bool
+	lastSeq    uint64
+	counting   bool
+	remaining  uint64
+}
+
+func newReplayHistory(plan streamPlan) *replayHistory {
+	return &replayHistory{
+		replay:     plan.Replay.HasLastID,
+		bySequence: plan.Replay.HasSnapshot,
+		lastSeq:    plan.Replay.CapSequence,
+	}
+}
+
+// isHistory reports whether a delivered message belongs to the replayed
+// backlog. Call it once per message, in delivery order.
+func (r *replayHistory) isHistory(formatted formattedMessageEvent) bool {
+	if !r.replay {
 		return false
 	}
-	if !plan.Replay.HasSnapshot {
-		return false
-	}
-	if plan.Replay.CapSequence == 0 || !formatted.HasStreamSequence {
+	if !formatted.HasStreamSequence {
+		// Nothing to place the message by: count it, erring on the side of
+		// the operator's replay budget.
 		return true
 	}
-	return formatted.StreamSequence <= plan.Replay.CapSequence
+	if r.bySequence {
+		return formatted.StreamSequence <= r.lastSeq
+	}
+	if !r.counting {
+		r.counting = true
+		r.remaining = formatted.NumPending + 1
+	}
+	if r.remaining == 0 {
+		return false
+	}
+	r.remaining--
+	return true
 }
 
 // formatConnectedEvent renders the SSE handshake event sent immediately
@@ -893,6 +971,7 @@ func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formatted
 		formatted.MessageTime = msg.Timestamp
 		formatted.HasMessageTime = true
 		formatted.ConsumerName = msg.ConsumerName
+		formatted.NumPending = msg.NumPending
 	}
 	if h.MaxEventSize > 0 && len(msg.Data) > h.MaxEventSize {
 		formatted.Dropped = true
@@ -1031,7 +1110,10 @@ func (h *Handler) matchesReadyPath(reqPath string) bool {
 // configured probe path. Falls back to defaultPath when configuredPath is
 // empty, normalises a leading slash, and accepts either an exact match or
 // a HasSuffix match — the leading slash is what makes the suffix check
-// safe (e.g. "/eventslivez" cannot accidentally match "/livez").
+// safe (e.g. "/eventslivez" cannot accidentally match "/livez"). One
+// trailing slash is ignored on both sides: kubelet manifests, load
+// balancers and browser address bars add one, and "/livez/" must not fall
+// through to topic parsing as topic "livez".
 func matchesConfiguredPath(reqPath, configuredPath, defaultPath string) bool {
 	path := configuredPath
 	if path == "" {
@@ -1040,10 +1122,20 @@ func matchesConfiguredPath(reqPath, configuredPath, defaultPath string) bool {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
+	path = trimTrailingSlash(path)
+	reqPath = trimTrailingSlash(reqPath)
 	if reqPath == path {
 		return true
 	}
 	return strings.HasSuffix(reqPath, path)
+}
+
+// trimTrailingSlash drops one trailing slash, keeping the root path "/".
+func trimTrailingSlash(p string) string {
+	if len(p) > 1 && strings.HasSuffix(p, "/") {
+		return p[:len(p)-1]
+	}
+	return p
 }
 
 // reserveConnSlot atomically tries to reserve a connection slot, returning

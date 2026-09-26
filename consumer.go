@@ -244,6 +244,7 @@ type streamMessage struct {
 	Header         nats.Header
 	StreamSequence uint64
 	ConsumerName   string
+	NumPending     uint64
 	Timestamp      time.Time
 	HasMetadata    bool
 	MetadataErr    error
@@ -259,6 +260,7 @@ func newStreamMessage(msg jetstream.Msg) streamMessage {
 	sm.HasMetadata = true
 	sm.StreamSequence = meta.Sequence.Stream
 	sm.ConsumerName = meta.Consumer
+	sm.NumPending = meta.NumPending
 	sm.Timestamp = meta.Timestamp
 	return sm
 }
