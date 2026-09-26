@@ -11,7 +11,7 @@ Feature: Shared subscriptions
     Given client "first" is connected to SSE endpoint "/shared?topic=sharedlive"
     And client "second" is connected to SSE endpoint "/shared?topic=sharedlive"
     And client "third" is connected to SSE endpoint "/shared?topic=sharedlive"
-    Then the stream "EVENTS" should have 1 consumer
+    Then the stream "EVENTS" should have 1 consumer for subject "events.sharedlive"
     When I publish message '{"n":1}' to subject "events.sharedlive"
     And I publish message '{"n":2}' to subject "events.sharedlive"
     And I publish message '{"n":3}' to subject "events.sharedlive"
@@ -30,7 +30,7 @@ Feature: Shared subscriptions
     And client "returning" reconnects to SSE endpoint "/shared?topic=sharedreplay" with its last event ID
     Then client "returning" should have received 3 messages in total
     And client "returning" should have received an event containing '"n":3'
-    And the stream "EVENTS" should have 1 consumer
+    And the stream "EVENTS" should have 1 consumer for subject "events.sharedreplay"
     When I publish message '{"n":4}' to subject "events.sharedreplay"
     Then client "returning" should have received 4 messages in total
     And client "live" should have received 4 messages

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1035,6 +1036,11 @@ func cleanupScenarioState() error {
 
 	if tc.js != nil {
 		for streamName := range tc.streamNames {
+			// NUTS deletes a stream's consumers after its client goes away.
+			// Wait for that before deleting the stream: a consumer still
+			// being recreated would otherwise reappear on the next
+			// scenario's fresh stream.
+			waitForNoConsumers(streamName, functionalDisconnectLimit)
 			if err := deleteStreamIfExists(streamName); err != nil {
 				cleanupErrs = append(cleanupErrs, err.Error())
 			}
@@ -1125,7 +1131,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^I note the value of metric '([^']*)'$`, iNoteTheValueOfMetric)
 	ctx.Step(`^the metric '([^']*)' should have increased$`, theMetricShouldHaveIncreased)
 	ctx.Step(`^I publish (\d+) messages to subject "([^"]*)"$`, iPublishNMessagesToSubject)
-	ctx.Step(`^the stream "([^"]*)" should have (\d+) consumers?$`, theStreamShouldHaveConsumers)
+	ctx.Step(`^the stream "([^"]*)" should have (\d+) consumers? for subject "([^"]*)"$`, theStreamShouldHaveConsumersForSubject)
 	ctx.Step(`^the received message event ids should be contiguous$`, theReceivedMessageEventIDsShouldBeContiguous)
 
 	// Multi-client steps
@@ -1139,19 +1145,35 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^client "([^"]*)" should not have received an event containing '([^']*)'$`, clientShouldNotHaveReceivedEventContaining)
 }
 
-// theStreamShouldHaveConsumers waits until the stream has exactly want
-// consumers; consumer deletes happen in the background.
-func theStreamShouldHaveConsumers(streamName string, want int) error {
+// theStreamShouldHaveConsumersForSubject waits until exactly want of the
+// stream's consumers filter on subject; consumer deletes happen in the
+// background.
+func theStreamShouldHaveConsumersForSubject(streamName string, want int, subject string) error {
 	return waitUntil("consumer count", functionalWaitTimeout, func() (bool, string) {
-		info, err := tc.js.StreamInfo(streamName)
-		if err != nil {
-			return false, err.Error()
+		got := 0
+		for info := range tc.js.ConsumersInfo(streamName) {
+			if info.Config.FilterSubject == subject || slices.Contains(info.Config.FilterSubjects, subject) {
+				got++
+			}
 		}
-		if info.State.Consumers == want {
+		if got == want {
 			return true, ""
 		}
-		return false, fmt.Sprintf("stream %s has %d consumers, want %d", streamName, info.State.Consumers, want)
+		return false, fmt.Sprintf("stream %s has %d consumers for %s, want %d", streamName, got, subject, want)
 	})
+}
+
+// waitForNoConsumers waits, at most timeout, until the stream has no
+// consumers left.
+func waitForNoConsumers(streamName string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		info, err := tc.js.StreamInfo(streamName)
+		if err != nil || info.State.Consumers == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // theSSEResponseHeaderShouldBe checks a header of the scenario's open SSE
