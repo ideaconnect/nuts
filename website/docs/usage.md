@@ -376,12 +376,14 @@ events.onerror = (e) => {
 ### Message Format
 
 ```
-id: 12345
 event: message
 data: {"topic":"my-topic","payload":{"your":"data"},"time":"2024-01-01T12:00:00Z"}
+id: 12345
 ```
 
-The `id` field is the JetStream sequence number, used for replay.
+The `id` field is the JetStream sequence number, used for replay. It comes
+last in each event, so clients that record an id as soon as they parse it
+cannot skip a message whose frame was cut off.
 
 ### Message Replay
 

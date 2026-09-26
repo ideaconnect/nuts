@@ -1151,19 +1151,19 @@ logged as `"ignoring oversized Last-Event-ID header"` for the header.
 Messages are sent as SSE events with the following format:
 
 ```
-id: 12345
 event: message
 data: {"topic":"my-topic","payload":{"your":"data"},"time":"2024-01-01T12:00:00Z"}
+id: 12345
 ```
 
-The `id` field contains the JetStream sequence number, which can be used with `last-id` or `Last-Event-ID` for replay.
+The `id` field contains the JetStream sequence number, which can be used with `last-id` or `Last-Event-ID` for replay. It is the last line of each event: SSE allows the fields in any order, and some clients (for example `@microsoft/fetch-event-source`) record an id as soon as they read it, so with the id last a frame cut off mid-write cannot make them resume after a message they never received.
 
 The first frame of every stream is the handshake event:
 
 ```
-id: 12344
 event: connected
 data: {"topics":["my-topic"]}
+id: 12344
 ```
 
 Its `id` is the stream position the subscription starts after: the stream's

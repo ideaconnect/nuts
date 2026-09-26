@@ -74,6 +74,13 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   the Caddyfile is parsed, with the directive's location (#80).
 - A failed consumer delete is logged with the stream's topics and the
   consumer name (#84).
+- **Breaking: the `id:` line is the last line of each event** (#107), in
+  message and `connected` events alike. SSE allows the fields in any order
+  and EventSource is unaffected, but clients such as
+  `@microsoft/fetch-event-source` store an id as soon as they parse it: with
+  the id first, a frame cut off by a write timeout made them resume after a
+  message they never received. Custom parsers that expect `id:` first need
+  updating.
 - **Breaking: server control messages are no longer forwarded** (#112).
   Subject delete markers (`Nats-Marker-Reason`) and message schedule
   definitions (`Nats-Schedule`) used to reach clients as ordinary, often

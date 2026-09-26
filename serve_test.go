@@ -481,7 +481,7 @@ func TestConnectedEventID(t *testing.T) {
 
 func TestFormatConnectedEvent(t *testing.T) {
 	withID := formatConnectedEvent(streamPlan{Topics: []string{"a", "b"}, Replay: replayPlan{Mode: replayModeDeliverNew, StartSequence: 43}})
-	if withID != "id: 42\nevent: connected\ndata: {\"topics\":[\"a\",\"b\"]}\n\n" {
+	if withID != "event: connected\ndata: {\"topics\":[\"a\",\"b\"]}\nid: 42\n\n" {
 		t.Fatalf("connected event with id = %q", withID)
 	}
 	withoutID := formatConnectedEvent(streamPlan{Topics: []string{"a"}, Replay: replayPlan{Mode: replayModeDeliverNew}})

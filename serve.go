@@ -1116,14 +1116,15 @@ func (r *replayHistory) isHistory(formatted formattedMessageEvent) bool {
 // first message resumes from there instead of from "now".
 func formatConnectedEvent(plan streamPlan) string {
 	var event strings.Builder
+	event.WriteString("event: connected\ndata: {\"topics\":")
+	event.WriteString(toJSON(plan.Topics))
+	event.WriteString("}\n")
 	if id, ok := connectedEventID(plan); ok {
 		event.WriteString("id: ")
 		event.WriteString(strconv.FormatUint(id, 10))
 		event.WriteString("\n")
 	}
-	event.WriteString("event: connected\ndata: {\"topics\":")
-	event.WriteString(toJSON(plan.Topics))
-	event.WriteString("}\n\n")
+	event.WriteString("\n")
 	return event.String()
 }
 
@@ -1180,15 +1181,10 @@ func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formatted
 	// messageEventPayload, written by hand: the payload is validated once
 	// and copied once, compacted and HTML-escaped exactly as json.Marshal
 	// embeds a json.RawMessage (#122). Pre-size for the payload plus the
-	// envelope (id/event/data lines and the JSON wrapper).
+	// envelope (event/data/id lines and the JSON wrapper).
 	var event strings.Builder
 	event.Grow(len(msg.Data) + 128)
 	var scratch [64]byte
-	if msg.HasMetadata {
-		event.WriteString("id: ")
-		event.Write(strconv.AppendUint(scratch[:0], msg.StreamSequence, 10))
-		event.WriteByte('\n')
-	}
 	event.WriteString("event: message\ndata: {\"topic\":")
 	writeJSONString(&event, strings.TrimPrefix(msg.Subject, h.TopicPrefix))
 	event.WriteString(`,"payload":`)
@@ -1199,7 +1195,17 @@ func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formatted
 		timestamp = msg.Timestamp
 	}
 	event.Write(timestamp.UTC().AppendFormat(scratch[:0], time.RFC3339))
-	event.WriteString("\"}\n\n")
+	event.WriteString("\"}\n")
+	// The id goes last (#107). EventSource applies it only when the event
+	// is dispatched, but clients such as fetch-event-source store it as soon
+	// as they parse the line: with the id first, a frame cut off by a write
+	// timeout would make them resume after a message they never received.
+	if msg.HasMetadata {
+		event.WriteString("id: ")
+		event.Write(strconv.AppendUint(scratch[:0], msg.StreamSequence, 10))
+		event.WriteByte('\n')
+	}
+	event.WriteByte('\n')
 
 	if h.MaxEventSize > 0 && event.Len() > h.MaxEventSize {
 		formatted.Dropped = true

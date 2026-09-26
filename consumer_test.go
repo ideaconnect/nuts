@@ -3,6 +3,7 @@ package nuts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -44,7 +45,7 @@ func TestStreamFeed_DeliversFormattedFramesInOrder(t *testing.T) {
 		if frame.StreamSequence != seq || frame.ConsumerName != "nuts_x_1" {
 			t.Fatalf("frame %d: seq=%d consumer=%q", seq, frame.StreamSequence, frame.ConsumerName)
 		}
-		if !strings.HasPrefix(frame.Frame, "id: ") || !strings.Contains(frame.Frame, `"topic":"alpha"`) {
+		if !strings.HasSuffix(frame.Frame, fmt.Sprintf("\nid: %d\n\n", seq)) || !strings.Contains(frame.Frame, `"topic":"alpha"`) {
 			t.Fatalf("frame %d not rendered: %q", seq, frame.Frame)
 		}
 	}

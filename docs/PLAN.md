@@ -372,11 +372,14 @@ the pull prefetch bound.
 - [x] **[#121] Batch already-queued frames.** *minor · M*
   - [x] One write, one flush, and one deadline set/clear per batch. Keep the
     clear on HTTP/2.
-- [ ] **[#107] Delivery visibility.** *nit · S–M*
-  - [ ] Write `id:` last in the frame.
+- [x] **[#107] Delivery visibility.** *nit · S–M*
+  - [x] Write `id:` last in the frame.
   - [x] Log the stream sequence for oversize drops.
-  - [ ] Optional gap signal (D4e).
-  - [ ] Attribute slow-consumer errors to the stream and topics.
+  - [ ] Optional gap signal (D4e). Deferred to the backlog: opt-in by
+    decision, and no client has asked for it.
+  - [x] ~~Attribute slow-consumer errors to the stream and topics.~~ Not
+    applicable: bounded pull requests keep nats.go's subscription buffers
+    from overflowing, and ordered consumers recover what they miss.
 - [ ] **Godog scenarios.**
   - [ ] A NATS restart mid-stream still produces contiguous ids.
   - [ ] A backlog replays on one connection.

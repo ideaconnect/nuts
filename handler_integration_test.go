@@ -1372,7 +1372,7 @@ func TestHandler_NoCursorRequestStartsAfterLastSeq(t *testing.T) {
 
 	rr, cancel, done := startSSE(t, h, "/events?topic=alpha", "")
 	defer stopSSE(t, cancel, done)
-	if !strings.HasPrefix(rr.Body(), "id: 3\nevent: connected\n") {
+	if !strings.HasPrefix(rr.Body(), "event: connected\ndata: {\"topics\":[\"alpha\"]}\nid: 3\n\n") {
 		t.Fatalf("connected event = %q, want it to carry id 3", rr.Body())
 	}
 	if _, err := js.Publish("events.alpha", []byte(`{"new":4}`)); err != nil {

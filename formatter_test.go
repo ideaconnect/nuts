@@ -13,7 +13,7 @@ import (
 // did before it was rewritten as a single pass (#122): compact the payload,
 // wrap it in messageEventPayload and json.Marshal the envelope. The rewrite
 // must stay byte-identical to it, since clients may depend on the exact
-// escaping.
+// escaping. (The id line moved last separately, #107.)
 func referenceMessageFrame(h *Handler, msg streamMessage, now time.Time) string {
 	payload := messageEventPayload{
 		Topic:   strings.TrimPrefix(msg.Subject, h.TopicPrefix),
@@ -25,15 +25,16 @@ func referenceMessageFrame(h *Handler, msg streamMessage, now time.Time) string 
 		payload.Time = now.UTC().Format(time.RFC3339)
 	}
 	var event strings.Builder
+	event.WriteString("event: message\n")
+	event.WriteString("data: ")
+	event.WriteString(toJSON(payload))
+	event.WriteString("\n")
 	if msg.HasMetadata {
 		event.WriteString("id: ")
 		event.WriteString(strconv.FormatUint(msg.StreamSequence, 10))
 		event.WriteString("\n")
 	}
-	event.WriteString("event: message\n")
-	event.WriteString("data: ")
-	event.WriteString(toJSON(payload))
-	event.WriteString("\n\n")
+	event.WriteString("\n")
 	return event.String()
 }
 
