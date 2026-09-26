@@ -636,9 +636,17 @@ func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
 	if rr2.Code != http.StatusTooManyRequests {
 		t.Errorf("expected 429 (RFC 6585) for max_connections, got %d", rr2.Code)
 	}
-	if got := rr2.Header().Get("Retry-After"); got != "5" {
-		t.Errorf("Retry-After: expected 5, got %q", got)
+	assertRetryAfter(t, rr2.Header())
+
+	// A native EventSource would give up for good on the 429, so it is told
+	// to retry instead (#105).
+	req3 := httptest.NewRequest(http.MethodGet, "/events?topic=b", nil)
+	req3.Header.Set("Accept", "text/event-stream")
+	rr3 := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr3, req3, nil); err != nil {
+		t.Fatalf("third ServeHTTP returned err: %v", err)
 	}
+	assertRetryStream(t, rr3, "Too many concurrent connections")
 
 	if got := counterValue(metricsConnectionsRejected, "max_connections"); got <= before {
 		t.Errorf("nuts_connections_rejected_total{reason=max_connections} did not increment: %v -> %v", before, got)
@@ -2333,5 +2341,42 @@ func TestHandler_Validate_WarnsAboutIneffectiveSettings(t *testing.T) {
 				t.Fatalf("warnings %v do not mention %q", messages, c.wantWarn)
 			}
 		})
+	}
+}
+
+func TestServerVersionBefore(t *testing.T) {
+	cases := []struct {
+		version string
+		want    bool
+	}{
+		{"2.10.29", true},
+		{"2.12.15", true},
+		{"2.14.6", true},
+		{"2.14.7", false},
+		{"2.14.8", false},
+		{"2.15.0", false},
+		{"2.15.0-beta.1", false},
+		{"2.14.6-RC.2", true},
+		{"3.0.0", false},
+		{"1.99.99", true},
+		{"", false},
+		{"2.14", false},
+		{"2.x.7", false},
+	}
+	for _, c := range cases {
+		if got := serverVersionBefore(c.version, multiFilterPurgeFixed); got != c.want {
+			t.Errorf("serverVersionBefore(%q) = %v, want %v", c.version, got, c.want)
+		}
+	}
+}
+
+func TestHandler_WarnAboutServerVersion(t *testing.T) {
+	for version, wantWarn := range map[string]bool{"2.12.15": true, "2.14.7": false, "garbage": false} {
+		core, obs := observer.New(zap.WarnLevel)
+		h := &Handler{logger: zap.New(core)}
+		h.warnAboutServerVersion(version)
+		if got := hasLogField(obs, "server_version", version); got != wantWarn {
+			t.Errorf("server %q: warned=%v, want %v (%v)", version, got, wantWarn, obs.All())
+		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,11 @@ const defaultLivePath = "/livez"
 
 // defaultReadyPath is used when no ready_path directive is configured.
 const defaultReadyPath = "/readyz"
+
+// cleanupStreamsTimeout bounds how long Cleanup waits for in-flight streams to
+// delete their consumers before it closes the NATS connection. Each delete is
+// itself bounded by defaultMetadataReadTimeout.
+const cleanupStreamsTimeout = 3 * time.Second
 
 // defaultConsumerInactiveThreshold is how long JetStream waits after the
 // last delivery / activity before reaping an ephemeral NUTS consumer.
@@ -197,6 +203,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// connectNATS fails the deferred Cleanup() still has a channel to close.
 	h.mu.Lock()
 	h.shutdown = make(chan struct{})
+	h.closing = false
 	h.mu.Unlock()
 
 	// Register the failure-cleanup deferred call BEFORE the first step that
@@ -225,7 +232,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		return provisionErr
 	}
 	js, err := jetstream.New(conn, jetstream.WithDefaultTimeout(defaultMetadataReadTimeout))
+	serverVersion := conn.ConnectedServerVersion()
 	h.mu.RUnlock()
+	h.warnAboutServerVersion(serverVersion)
 	if err != nil {
 		provisionErr = fmt.Errorf("failed to create JetStream context: %w", err)
 		return provisionErr
@@ -238,12 +247,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// Step 4: Verify that the configured stream actually exists. Bounded so a
 	// degraded JetStream API cannot stall a Caddy reload.
 	streamCtx, cancelStream := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
-	_, err = js.Stream(streamCtx, h.StreamName)
+	stream, err := js.Stream(streamCtx, h.StreamName)
 	cancelStream()
 	if err != nil {
 		provisionErr = fmt.Errorf("JetStream stream '%s' not found. Please create the stream first. See README for instructions. Error: %w", h.StreamName, err)
 		return provisionErr
 	}
+	h.logStreamLimits(stream.CachedInfo())
 
 	h.log().Info("nuts handler provisioned",
 		zap.String("nats_url", redactURL(h.NatsURL)),
@@ -255,6 +265,63 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	)
 
 	return nil
+}
+
+// multiFilterPurgeFixed is the first nats-server release whose multi-filter
+// consumers keep their pending messages when one of their subjects is purged
+// or rolled up (nats-server#8572). Older servers skip them silently, and the
+// client's cursor moves past the hole.
+var multiFilterPurgeFixed = [3]int{2, 14, 7}
+
+// warnAboutServerVersion flags a nats-server that silently loses messages on
+// multi-topic subscriptions (#111). It only warns: behaviour does not depend
+// on the version, and single-topic subscriptions are not affected.
+func (h *Handler) warnAboutServerVersion(version string) {
+	if serverVersionBefore(version, multiFilterPurgeFixed) {
+		h.log().Warn("this nats-server can skip messages on multi-topic subscriptions when one of their subjects is purged or rolled up; upgrade to 2.14.7 or later, or subscribe to one topic per connection",
+			zap.String("server_version", version),
+		)
+	}
+}
+
+// serverVersionBefore reports whether a server version such as "2.12.15" or
+// "2.15.0-beta.1" is older than want. Unparseable versions report false.
+func serverVersionBefore(version string, want [3]int) bool {
+	core, _, _ := strings.Cut(version, "-")
+	parts := strings.Split(core, ".")
+	if len(parts) != len(want) {
+		return false
+	}
+	for i, part := range parts {
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return false
+		}
+		if n != want[i] {
+			return n < want[i]
+		}
+	}
+	return false
+}
+
+// logStreamLimits points out stream settings that limit what NUTS can do, so
+// operators see them at startup rather than as failed requests.
+func (h *Handler) logStreamLimits(info *jetstream.StreamInfo) {
+	if info == nil {
+		return
+	}
+	if limit := info.Config.ConsumerLimits.InactiveThreshold; limit > 0 && limit < defaultConsumerInactiveThreshold {
+		h.log().Info("consumer inactive threshold lowered to the stream's consumer limit",
+			zap.Duration("inactive_threshold", limit),
+			zap.Duration("default_inactive_threshold", defaultConsumerInactiveThreshold),
+		)
+	}
+	if maxConsumers := info.Config.MaxConsumers; maxConsumers > 0 && h.MaxConnections > maxConsumers {
+		h.log().Warn("the stream's max_consumers is below max_connections; every SSE connection needs its own consumer, so connections beyond it will be rejected",
+			zap.Int("max_consumers", maxConsumers),
+			zap.Int("max_connections", h.MaxConnections),
+		)
+	}
 }
 
 // connectNATS opens a long-lived TCP connection to the NATS server.
@@ -289,6 +356,18 @@ func (h *Handler) connectNATS() error {
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			metricsNATSConnectionEvents.WithLabelValues("closed").Inc()
 			h.log().Info("NATS connection closed")
+		}),
+		// Cleanup closes the connection itself; without this option the
+		// final callbacks run after Close returns, logging through a handler
+		// Caddy has already unloaded while its replacement is serving.
+		nats.NoCallbacksAfterClientClose(),
+		// A server in lame duck mode is about to shut down; clients move to
+		// another server of the cluster and the ordered consumers follow.
+		nats.LameDuckModeHandler(func(nc *nats.Conn) {
+			metricsNATSConnectionEvents.WithLabelValues("lame_duck").Inc()
+			h.log().Warn("NATS server entered lame duck mode; the connection will move to another server",
+				zap.String("url", redactURL(nc.ConnectedUrl())),
+			)
 		}),
 		// ErrorHandler captures async failures the nats.go client would
 		// otherwise log to stderr via its default printer — most importantly
@@ -375,22 +454,47 @@ func (h *Handler) buildTLSConfig() (*tls.Config, error) {
 // Cleanup is called by Caddy when the config is unloaded or Caddy shuts down.
 func (h *Handler) Cleanup() error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	// Signal in-flight SSE handlers first so they return promptly instead of
 	// discovering the teardown via a heartbeat-write error or a NATS-side
 	// subscription close. Idempotent: nil-ing after close prevents a panic
 	// if Cleanup is called more than once.
+	h.closing = true
 	if h.shutdown != nil {
 		close(h.shutdown)
 		h.shutdown = nil
 	}
-	if h.conn != nil {
-		h.conn.Close()
-		h.conn = nil
-	}
+	conn := h.conn
+	h.conn = nil
 	h.js = nil
+	h.mu.Unlock()
+
+	// The streams end as soon as shutdown closes. Let their consumer deletes
+	// reach the server before the connection goes, so a reload does not
+	// leave every stream's consumer behind until InactiveThreshold (#75).
+	h.waitForStreams(cleanupStreamsTimeout)
+	if conn != nil {
+		conn.Close()
+	}
 	return nil
+}
+
+// waitForStreams waits, at most timeout, until every tracked stream has
+// deleted its consumer.
+func (h *Handler) waitForStreams(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		h.streams.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		h.log().Warn("closing the NATS connection before every SSE stream deleted its consumer",
+			zap.Duration("waited", timeout),
+		)
+	}
 }
 
 // validateRequiredFields checks the presence of fields that are required

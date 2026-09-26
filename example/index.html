@@ -203,19 +203,30 @@
 
         function subscribe(url, name, handler) {
             var es;
+            var lastEventId = '';
             function connect() {
-                es = new EventSource(url);
-                es.addEventListener('connected', function() { setDot(name, 'ok'); });
+                // A new EventSource starts without a Last-Event-ID, so the
+                // cursor of the one that closed travels in the URL instead.
+                var target = lastEventId ? url + '&last-id=' + encodeURIComponent(lastEventId) : url;
+                es = new EventSource(target);
+                es.addEventListener('connected', function(e) {
+                    if (e.lastEventId) { lastEventId = e.lastEventId; }
+                    setDot(name, 'ok');
+                });
                 es.addEventListener('message', function(e) {
-                    var data = JSON.parse(e.data);
-                    handler(data);
+                    if (e.lastEventId) { lastEventId = e.lastEventId; }
+                    handler(JSON.parse(e.data));
                 });
                 es.onerror = function() {
                     if (es.readyState === EventSource.CLOSED) {
                         setDot(name, 'err');
-                        // Server returned a non-200 (e.g. 503 during restart).
-                        // EventSource won't retry, so reconnect manually.
-                        setTimeout(connect, 3000);
+                        // NUTS answers transient failures (NATS outage,
+                        // connection caps) with a retry delay that
+                        // EventSource follows by itself. It only closes on
+                        // errors that will not clear up on their own, or when
+                        // a proxy in front of NUTS fails, so retry slowly and
+                        // resume after the last event received.
+                        setTimeout(connect, 10000);
                     } else {
                         setDot(name, 'wait');
                     }

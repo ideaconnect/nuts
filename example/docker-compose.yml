@@ -1,6 +1,6 @@
 services:
   nats:
-    image: nats:2.12-alpine
+    image: nats:2.15-alpine
     container_name: nuts-example-nats
     command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
     volumes:
@@ -23,6 +23,7 @@ services:
       - |
         nats -s nats://nats:4222 stream add EVENTS \
           --subjects "events.>" \
+          --max-consumers 10000 \
           --storage memory \
           --retention limits \
           --max-msgs 10000 \

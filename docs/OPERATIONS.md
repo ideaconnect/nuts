@@ -49,7 +49,7 @@ Streaming logs consistently include these fields when a request plan exists:
 | `replay_mode` | `deliver_new`, `start_sequence`, `fallback_deliver_all`, or `fallback_start_time` |
 | `replay_start_sequence` | JetStream sequence requested by `last-id` / `Last-Event-ID`, when present |
 | `replay_fallback_reason` | Why NUTS fell back from a requested sequence, when present |
-| `disconnect_reason` | Why an SSE stream closed, such as `slow_client`, `replay_cap_reached`, `handler_shutdown`, or `write_error` |
+| `disconnect_reason` | Why an SSE stream closed or was refused: `client_context_done`, `slow_client`, `write_error`, `heartbeat_write_error`, `replay_cap_reached`, `consumer_unrecoverable`, `handler_shutdown`, `jetstream_unavailable`, `max_connections`, `stream_consumer_limit` or `subscription_failed` |
 
 Use `subject_label`, `replay_mode`, and `disconnect_reason` as the first
 filters when correlating logs with alerts.
@@ -265,6 +265,34 @@ filters when correlating logs with alerts.
    (`ConsumerFilterSubjects`) and removes the fallback entirely.
 3. Until you can upgrade, narrow the wildcard by ensuring all topics in
    a single subscription share a deeper common prefix.
+
+## Incident: Stream consumer limit reached
+
+**Signals**
+
+- `nuts_connections_rejected_total{reason="stream_consumer_limit"}` increases.
+- Logs at Warn level with `disconnect_reason="stream_consumer_limit"`.
+- Clients get `503 Stream consumer limit reached` (browsers: a `retry:`
+  stream, so they keep reconnecting).
+- At startup, a Warn that the stream's `max_consumers` is below
+  `max_connections`.
+
+**Cause**
+
+Every SSE connection holds one JetStream consumer, and the stream refuses new
+consumers beyond `max_consumers`. From nats-server 2.15 that limit is 1000 per
+stream unless the stream or account sets a positive value; `-1` does not
+lift it. All NUTS instances and other applications on the stream share it.
+
+**Steps**
+
+1. Check the stream: `nats stream info EVENTS` (`Maximum Consumers`) and the
+   current count (`Consumers`).
+2. Raise it for peak concurrent connections across every NUTS instance:
+   `nats stream edit EVENTS --max-consumers 10000`, or set
+   `default_max_consumers: -1` in the server's JetStream limits.
+3. Keep `max_connections` × instances at or below the limit, so clients get
+   the cheaper `max_connections` rejection first.
 
 ## Incident: CORS Misconfiguration
 

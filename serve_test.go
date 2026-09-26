@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -1139,4 +1140,263 @@ func TestHandler_ParseStreamRequest_CursorPrecedence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRetryDelay_StaysWithinTheJitterRange(t *testing.T) {
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 1000; i++ {
+		d := retryDelay()
+		if d < transientRetryBase/2 || d >= transientRetryBase*3/2 {
+			t.Fatalf("retryDelay() = %v, want [%v, %v)", d, transientRetryBase/2, transientRetryBase*3/2)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 100 {
+		t.Fatalf("retryDelay() produced %d distinct values in 1000 calls; want jitter", len(seen))
+	}
+}
+
+func TestAcceptsEventStream(t *testing.T) {
+	cases := []struct {
+		accept []string
+		want   bool
+	}{
+		{accept: nil, want: false},
+		{accept: []string{"text/event-stream"}, want: true},
+		{accept: []string{"Text/Event-Stream"}, want: true},
+		{accept: []string{"application/json, text/event-stream;q=0.9"}, want: true},
+		{accept: []string{"application/json", "text/event-stream"}, want: true},
+		{accept: []string{"*/*"}, want: false},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=a", nil)
+		for _, v := range c.accept {
+			req.Header.Add("Accept", v)
+		}
+		if got := acceptsEventStream(req); got != c.want {
+			t.Errorf("acceptsEventStream(%q) = %v, want %v", c.accept, got, c.want)
+		}
+	}
+}
+
+// TestHandler_ServeHTTP_JetStreamUnavailableIsRetryable covers #105 for the
+// NATS-outage path: plain clients keep the 503 with a Retry-After, while an
+// EventSource gets a retry stream so it does not stop reconnecting for good.
+func TestHandler_ServeHTTP_JetStreamUnavailableIsRetryable(t *testing.T) {
+	h := &Handler{StreamName: "EVENTS", TopicPrefix: "events.", logger: zap.NewNop()}
+
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/events?topic=a", nil), nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), "JetStream not available") {
+		t.Fatalf("plain client got %d %q, want 503 JetStream not available", rr.Code, rr.Body.String())
+	}
+	assertRetryAfter(t, rr.Header())
+
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=a", nil)
+	req.Header.Set("Accept", "text/event-stream")
+	rr = httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	assertRetryStream(t, rr, "JetStream not available")
+}
+
+func TestHandler_RejectConsumerFailure(t *testing.T) {
+	apiErr := &jetstream.APIError{ErrorCode: 10153, Code: 400, Description: "consumer inactive threshold exceeds system limit of 10s"}
+	cases := []struct {
+		name         string
+		err          error
+		wantBody     string
+		wantReason   string
+		wantRejected float64
+		wantErrors   float64
+		wantCode     int64
+	}{
+		{name: "consumer limit", err: jetstream.ErrMaximumConsumersLimit, wantBody: "Stream consumer limit reached", wantReason: "stream_consumer_limit", wantRejected: 1},
+		{name: "handler closing", err: errHandlerClosing, wantBody: "JetStream not available", wantReason: "handler_shutdown"},
+		{name: "server refusal", err: apiErr, wantBody: "Failed to subscribe to requested topics: alpha", wantReason: "subscription_failed", wantErrors: 1, wantCode: 10153},
+		{name: "other failure", err: errors.New("timeout"), wantBody: "Failed to subscribe to requested topics: alpha", wantReason: "subscription_failed", wantErrors: 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			core, obs := observer.New(zap.DebugLevel)
+			h := &Handler{logger: zap.New(core)}
+			rejectedBefore := counterValue(metricsConnectionsRejected, "stream_consumer_limit")
+			errorsBefore := counterVal(t, metricsSubscriptionErrors)
+
+			rr := httptest.NewRecorder()
+			h.rejectConsumerFailure(rr, httptest.NewRequest(http.MethodGet, "/events?topic=alpha", nil), testFeedPlan, c.err)
+			if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), c.wantBody) {
+				t.Fatalf("response = %d %q, want 503 %q", rr.Code, rr.Body.String(), c.wantBody)
+			}
+			assertRetryAfter(t, rr.Header())
+			if !hasLogField(obs, "disconnect_reason", c.wantReason) {
+				t.Fatalf("missing disconnect_reason=%s: %v", c.wantReason, obs.All())
+			}
+			if got := counterValue(metricsConnectionsRejected, "stream_consumer_limit") - rejectedBefore; got != c.wantRejected {
+				t.Fatalf("connections_rejected_total{stream_consumer_limit} moved by %v, want %v", got, c.wantRejected)
+			}
+			if got := counterVal(t, metricsSubscriptionErrors) - errorsBefore; got != c.wantErrors {
+				t.Fatalf("subscription_errors_total moved by %v, want %v", got, c.wantErrors)
+			}
+			if c.wantCode != 0 && !hasIntLogField(obs, "jetstream_error_code", c.wantCode) {
+				t.Fatalf("missing jetstream_error_code=%d: %v", c.wantCode, obs.All())
+			}
+		})
+	}
+}
+
+// hasIntLogField reports whether any observed entry carries an integer field
+// with the given key and value.
+func hasIntLogField(obs *observer.ObservedLogs, key string, value int64) bool {
+	for _, entry := range obs.All() {
+		for _, f := range entry.Context {
+			if f.Key == key && f.Integer == value {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestJetStreamErrorFields(t *testing.T) {
+	wrapped := fmt.Errorf("create consumer: %w", &jetstream.APIError{ErrorCode: 10153})
+	fields := jetStreamErrorFields(wrapped)
+	if len(fields) != 1 || fields[0].Key != "jetstream_error_code" || fields[0].Integer != 10153 {
+		t.Fatalf("fields = %+v, want jetstream_error_code=10153", fields)
+	}
+	if fields := jetStreamErrorFields(errors.New("plain")); fields != nil {
+		t.Fatalf("fields for a non-API error = %+v, want none", fields)
+	}
+}
+
+func TestConsumerInactiveThreshold(t *testing.T) {
+	cases := []struct {
+		limit, want time.Duration
+	}{
+		{limit: 0, want: defaultConsumerInactiveThreshold},
+		{limit: 10 * time.Second, want: 10 * time.Second},
+		{limit: defaultConsumerInactiveThreshold, want: defaultConsumerInactiveThreshold},
+		{limit: defaultConsumerInactiveThreshold - time.Nanosecond, want: defaultConsumerInactiveThreshold - time.Nanosecond},
+		{limit: time.Hour, want: defaultConsumerInactiveThreshold},
+	}
+	for _, c := range cases {
+		if got := consumerInactiveThreshold(c.limit); got != c.want {
+			t.Errorf("consumerInactiveThreshold(%v) = %v, want %v", c.limit, got, c.want)
+		}
+	}
+	h := &Handler{StreamName: "EVENTS"}
+	plan := testFeedPlan
+	plan.ConsumerInactiveLimit = 10 * time.Second
+	if got := h.orderedConsumerConfig(plan).InactiveThreshold; got != 10*time.Second {
+		t.Fatalf("orderedConsumerConfig InactiveThreshold = %v, want the stream's 10s limit", got)
+	}
+}
+
+func TestHandler_PlanSubscriptionCarriesTheConsumerInactiveLimit(t *testing.T) {
+	h := &Handler{}
+	snapshot := streamInfoSnapshot{HasSnapshot: true, LastSeq: 5, ConsumerInactiveLimit: 10 * time.Second}
+	for _, replay := range []replayPlan{{Mode: replayModeDeliverNew}, {Mode: replayModeStartSequence, HasLastID: true, StartSequence: 3}} {
+		plan := testFeedPlan
+		plan.Replay = replay
+		if got := h.planSubscription(plan, snapshot).ConsumerInactiveLimit; got != 10*time.Second {
+			t.Fatalf("ConsumerInactiveLimit = %v, want 10s for %+v", got, replay)
+		}
+	}
+}
+
+func TestHandler_ReadStreamSnapshot_ReadsTheConsumerInactiveLimit(t *testing.T) {
+	h := &Handler{StreamName: "EVENTS", logger: zap.NewNop()}
+	info := &jetstream.StreamInfo{Config: jetstream.StreamConfig{
+		Subjects:       []string{"events.>"},
+		ConsumerLimits: jetstream.StreamConsumerLimits{InactiveThreshold: 10 * time.Second},
+	}}
+	snapshot := h.readStreamSnapshot(context.Background(), fakeStreamLookup{stream: fakeStream{info: info}}, testFeedPlan)
+	if snapshot.ConsumerInactiveLimit != 10*time.Second {
+		t.Fatalf("ConsumerInactiveLimit = %v, want 10s", snapshot.ConsumerInactiveLimit)
+	}
+}
+
+func TestIsControlMessage(t *testing.T) {
+	cases := []struct {
+		name   string
+		header nats.Header
+		want   bool
+	}{
+		{name: "no headers", header: nil, want: false},
+		{name: "application headers", header: nats.Header{"Trace-Id": {"1"}}, want: false},
+		{name: "subject delete marker", header: nats.Header{"Nats-Marker-Reason": {"MaxAge"}, "Nats-Rollup": {"sub"}}, want: true},
+		{name: "schedule definition", header: nats.Header{"Nats-Schedule": {"@every 1m"}, "Nats-Schedule-Target": {"events.a"}}, want: true},
+		{name: "message produced by a schedule", header: nats.Header{"Nats-Scheduler": {"events.sched"}, "Nats-Schedule-Next": {"purge"}}, want: false},
+		{name: "per-message TTL only", header: nats.Header{"Nats-TTL": {"1s"}}, want: false},
+	}
+	for _, c := range cases {
+		if got := isControlMessage(c.header); got != c.want {
+			t.Errorf("%s: isControlMessage = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestHandler_FormatMessageEvent_DropsControlMessages(t *testing.T) {
+	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
+	marker := streamMessage{Subject: "events.a", Header: nats.Header{"Nats-Marker-Reason": {"MaxAge"}}, HasMetadata: true, StreamSequence: 7}
+	got := h.formatMessageEvent(marker, time.Now())
+	if !got.Dropped || got.DropReason != dropReasonControlMessage || got.Frame != "" {
+		t.Fatalf("marker formatted as %+v, want a control_message drop", got)
+	}
+	if got.StreamSequence != 7 {
+		t.Fatalf("dropped marker lost its stream sequence: %+v", got)
+	}
+	fired := streamMessage{Subject: "events.a", Data: []byte(`{"fired":true}`), Header: nats.Header{"Nats-Scheduler": {"events.sched"}}, HasMetadata: true, StreamSequence: 8}
+	if got := h.formatMessageEvent(fired, time.Now()); got.Dropped || !strings.Contains(got.Frame, `"fired":true`) {
+		t.Fatalf("scheduled message formatted as %+v, want it delivered", got)
+	}
+}
+
+func TestHandler_LogStreamLimits(t *testing.T) {
+	cases := []struct {
+		name           string
+		maxConnections int
+		cfg            jetstream.StreamConfig
+		wantInfo       bool
+		wantWarn       bool
+	}{
+		{name: "no limits", maxConnections: 100},
+		{name: "consumer inactive limit below the default", cfg: jetstream.StreamConfig{ConsumerLimits: jetstream.StreamConsumerLimits{InactiveThreshold: 10 * time.Second}}, wantInfo: true},
+		{name: "consumer inactive limit above the default", cfg: jetstream.StreamConfig{ConsumerLimits: jetstream.StreamConsumerLimits{InactiveThreshold: time.Hour}}},
+		{name: "max_consumers below max_connections", maxConnections: 100, cfg: jetstream.StreamConfig{MaxConsumers: 50}, wantWarn: true},
+		{name: "max_consumers equal to max_connections", maxConnections: 50, cfg: jetstream.StreamConfig{MaxConsumers: 50}},
+		{name: "unlimited max_consumers", maxConnections: 100, cfg: jetstream.StreamConfig{MaxConsumers: -1}},
+		{name: "unlimited max_connections", cfg: jetstream.StreamConfig{MaxConsumers: 50}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			core, obs := observer.New(zap.InfoLevel)
+			h := &Handler{MaxConnections: c.maxConnections, logger: zap.New(core)}
+			h.logStreamLimits(&jetstream.StreamInfo{Config: c.cfg})
+			gotInfo := obs.FilterMessage("consumer inactive threshold lowered to the stream's consumer limit").Len() == 1
+			gotWarn := obs.FilterLevelExact(zap.WarnLevel).Len() == 1
+			if gotInfo != c.wantInfo || gotWarn != c.wantWarn || obs.Len() != btoi(c.wantInfo)+btoi(c.wantWarn) {
+				t.Fatalf("logs = %v, want info=%v warn=%v", obs.All(), c.wantInfo, c.wantWarn)
+			}
+		})
+	}
+	(&Handler{logger: zap.NewNop()}).logStreamLimits(nil) // must not panic
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func TestHandler_OpenConsumerStream_RefusedOnceCleanupStarted(t *testing.T) {
+	h := &Handler{closing: true}
+	if _, err := h.openConsumerStream(context.Background(), nil, testFeedPlan); !errors.Is(err, errHandlerClosing) {
+		t.Fatalf("openConsumerStream after Cleanup = %v, want errHandlerClosing", err)
+	}
+	h.waitForStreams(time.Second) // nothing was tracked, so this returns at once
 }

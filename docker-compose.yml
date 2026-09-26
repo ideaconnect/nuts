@@ -1,6 +1,6 @@
 services:
   nats:
-    image: ${NATS_IMAGE:-nats:2.12-alpine}
+    image: ${NATS_IMAGE:-nats:2.15-alpine}
     container_name: nuts-nats
     ports:
       - "4222:4222"   # Client connections
@@ -26,6 +26,7 @@ services:
       - |
         nats -s nats://nats:4222 stream add EVENTS \
           --subjects "events.>" \
+          --max-consumers 10000 \
           --storage memory \
           --retention limits \
           --max-msgs 10000 \

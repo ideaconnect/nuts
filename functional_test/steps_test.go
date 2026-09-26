@@ -323,15 +323,26 @@ func aNATSJetStreamServerIsRunning() error {
 }
 
 func theStreamExistsWithSubjects(streamName, subjects string) error {
+	return createStream(streamName, subjects, 0)
+}
+
+func theStreamExistsWithSubjectsAndAtMostConsumers(streamName, subjects string, maxConsumers int) error {
+	return createStream(streamName, subjects, maxConsumers)
+}
+
+// createStream recreates the stream from scratch. maxConsumers 0 leaves the
+// server's default consumer limit in place.
+func createStream(streamName, subjects string, maxConsumers int) error {
 	if err := deleteStreamIfExists(streamName); err != nil {
 		return err
 	}
 
 	_, err := tc.js.AddStream(&nats.StreamConfig{
-		Name:     streamName,
-		Subjects: []string{subjects},
-		Storage:  nats.MemoryStorage,
-		MaxMsgs:  10000,
+		Name:         streamName,
+		Subjects:     []string{subjects},
+		Storage:      nats.MemoryStorage,
+		MaxMsgs:      10000,
+		MaxConsumers: maxConsumers,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
@@ -623,12 +634,26 @@ func theConnectedEventShouldListTopic(topic string) error {
 }
 
 func iRequestSSEEndpoint(endpoint string) error {
+	return requestEndpoint(endpoint, "")
+}
+
+func iRequestSSEEndpointAsAnEventSource(endpoint string) error {
+	return requestEndpoint(endpoint, "text/event-stream")
+}
+
+// requestEndpoint sends a GET and reads the whole response, which must end
+// within 5 seconds. accept, when set, is sent as the Accept header, the way
+// a browser EventSource does.
+func requestEndpoint(endpoint, accept string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", tc.baseURL+endpoint, nil)
 	if err != nil {
 		return err
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
 	}
 
 	client := &http.Client{}
@@ -1044,6 +1069,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	// Background steps
 	ctx.Step(`^a NATS JetStream server is running$`, aNATSJetStreamServerIsRunning)
 	ctx.Step(`^the stream "([^"]*)" exists with subjects "([^"]*)"$`, theStreamExistsWithSubjects)
+	ctx.Step(`^the stream "([^"]*)" exists with subjects "([^"]*)" and at most (\d+) consumers?$`, theStreamExistsWithSubjectsAndAtMostConsumers)
 
 	// Given steps
 	ctx.Step(`^I am connected to SSE endpoint "([^"]*)"$`, iAmConnectedToSSEEndpoint)
@@ -1055,6 +1081,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^I connect to SSE endpoint "([^"]*)" with Last-Event-ID from message (\d+)$`, iConnectToSSEEndpointWithLastEventIDFromMessage)
 	ctx.Step(`^I publish message '([^']*)' to subject "([^"]*)"$`, iPublishMessageToSubject)
 	ctx.Step(`^I request SSE endpoint "([^"]*)"$`, iRequestSSEEndpoint)
+	ctx.Step(`^I request SSE endpoint "([^"]*)" as an EventSource$`, iRequestSSEEndpointAsAnEventSource)
 	ctx.Step(`^I send OPTIONS request to "([^"]*)" with origin "([^"]*)"$`, iSendOPTIONSRequestToWithOrigin)
 
 	// Then steps

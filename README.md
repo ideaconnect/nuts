@@ -30,7 +30,7 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 - **[NATS Authentication](#with-nats-authentication)**: Credentials file, token, or user/password auth for the NUTS-to-NATS connection
 - **NATS TLS / mTLS**: Optional `nats_tls_ca`, `nats_tls_cert`, `nats_tls_key` directives for an encrypted and mutually authenticated NATS connection
 - **[Subscriber JWT Authorization](#subscriber-authentication-and-topic-authorization)**: Optional HMAC-signed JWT auth with per-topic `subscribe` claims, accepted from `Authorization: Bearer` or a configurable cookie
-- **[Connection Caps](#max_connections)**: `max_connections` bounds concurrent SSE streams; rejected clients receive `429 Too Many Requests` with `Retry-After`
+- **[Connection Caps](#max_connections)**: `max_connections` bounds concurrent SSE streams; rejected clients receive `429 Too Many Requests` with `Retry-After`, and browser `EventSource` clients are told to [retry](#transient-failures-and-eventsource)
 - **[Per-frame Write Bounds](#write_timeout)**: `write_timeout` (default 30 s) bounds every SSE write, so a client that stopped reading cannot tie up a handler indefinitely
 - **Topic Prefixing**: Optional prefix for all NATS subscriptions
 - **[Prometheus Metrics](#prometheus-metrics)**: Built-in `nuts_*` counters and gauges (active connections, messages delivered, slow-client disconnects, replay stats)
@@ -109,7 +109,7 @@ directory:
 | --- | --- | --- |
 | Go (build) | 1.26.8 (`go.mod`) | Matches the toolchain `Dockerfile` uses. |
 | Caddy | 2.11.x | Embedded via `xcaddy`. Patch bumps tracked in `CHANGELOG.md`. |
-| NATS server | 2.10 (required) | Each stream uses an ordered pull consumer with server-side `FilterSubjects`, which needs nats-server 2.10 or newer. **Multi-topic subscriptions need 2.14.7 or newer (2.15 recommended):** older servers, including every 2.12.x release, can skip messages on one requested subject when another is purged or rolled up (nats-server#8572). On 2.15 and newer, raise the stream's `max_consumers`; see [Consumer limits on nats-server 2.15](#consumer-limits-on-nats-server-215). Functional matrix: see [`Makefile`](Makefile) `test-functional-matrix`. |
+| NATS server | 2.10 (required) | Each stream uses an ordered pull consumer with server-side `FilterSubjects`, which needs nats-server 2.10 or newer. **Multi-topic subscriptions need 2.14.7 or newer (2.15 recommended):** older servers, including every 2.10.x and 2.12.x release, can skip messages on one requested subject when another is purged or rolled up (nats-server#8572), and NUTS logs a warning at startup on such servers. On 2.15 and newer, raise the stream's `max_consumers`; see [Consumer limits on nats-server 2.15](#consumer-limits-on-nats-server-215). Functional matrix: see [`Makefile`](Makefile) `test-functional-matrix`. |
 
 ## Versioning policy
 
@@ -187,7 +187,7 @@ A typical production-like stack with NATS and NUTS:
 ```yaml
 services:
   nats:
-    image: nats:2.12-alpine
+    image: nats:2.15-alpine
     # -m 8222 enables the HTTP monitoring endpoint that the healthcheck
     # below probes. Without it the healthcheck never passes and any
     # depends_on: { condition: service_healthy } gates block forever.
@@ -210,6 +210,7 @@ services:
       - |
         nats -s nats://nats:4222 stream add EVENTS \
           --subjects "events.>" \
+          --max-consumers 10000 \
           --storage file \
           --retention limits \
           --max-msgs 10000 \
@@ -282,7 +283,7 @@ itself does not read environment variables directly.
 
 1. **Start NATS server with JetStream enabled**:
    ```bash
-   docker run -p 4222:4222 nats:2.12-alpine -js
+   docker run -p 4222:4222 nats:2.15-alpine -js
    ```
 
 2. **Create a JetStream stream** (using NATS CLI):
@@ -290,6 +291,7 @@ itself does not read environment variables directly.
    # Install NATS CLI: https://github.com/nats-io/natscli
    nats stream add EVENTS \
      --subjects "events.>" \
+     --max-consumers 10000 \
      --storage file \
      --retention limits \
      --max-msgs 10000 \
@@ -416,13 +418,15 @@ For example, setting `max_event_size 1000` means that if a NATS message produces
 #### `max_connections`
 
 Caps the number of concurrent SSE streams per NUTS instance. When the cap
-is reached, new clients receive `429 Too Many Requests` (RFC 6585) with
-`Retry-After: 5` and the `nuts_connections_rejected_total{reason="max_connections"}`
-counter is incremented. Default `0` disables the cap. The `429` status
-distinguishes a client-side concurrency cap from genuine `503` paths
-(NATS unavailable / subscription failed / readiness probe degraded), so
-client-side circuit breakers can keep retrying rather than opening the
-circuit on a healthy backend.
+is reached, new clients receive `429 Too Many Requests` (RFC 6585) with a
+jittered `Retry-After` of 3–8 seconds, and the
+`nuts_connections_rejected_total{reason="max_connections"}` counter is
+incremented. Browser `EventSource` clients get a `retry:` stream instead; see
+[Transient failures and EventSource](#transient-failures-and-eventsource).
+Default `0` disables the cap. The `429` status distinguishes a client-side
+concurrency cap from genuine `503` paths (NATS unavailable / subscription
+failed / readiness probe degraded), so client-side circuit breakers can keep
+retrying rather than opening the circuit on a healthy backend.
 
 **Sizing memory.** Each connection holds at most `client_buffer_size`
 messages prefetched from JetStream, plus the frame being written. Prefetched
@@ -466,7 +470,11 @@ Every SSE request gets its own ordered pull consumer, named
 `nuts_<random id>_<n>`. NUTS deletes it when the stream ends, and a
 reconnecting client always gets a new one. The consumer also has an
 **`InactiveThreshold` of 30 seconds**, so the server reaps it on its own if
-NUTS loses its NATS connection before it can delete it.
+NUTS loses its NATS connection before it can delete it. When the stream sets a
+shorter `consumer_limits.inactive_threshold`, NUTS uses that instead, because
+the server refuses consumers that ask for more. When the NUTS handler shuts
+down or reloads, it waits up to 3 seconds for its streams to delete their
+consumers before closing the NATS connection.
 
 The consumer recreates itself from the last delivered sequence after a
 delivery gap, a NATS reconnect, or missed heartbeats (`nats_idle_heartbeat`),
@@ -484,6 +492,12 @@ peak concurrent connections across all NUTS replicas (for example
 `nats stream edit EVENTS --max-consumers 10000`), or set
 `default_max_consumers: -1` in the server's JetStream limits. A stream or
 account value of `-1` does not lift the default.
+
+When the limit is reached, NUTS rejects the request as retryable (`503` with
+`Retry-After`, or a `retry:` stream for `EventSource` clients), logs
+`disconnect_reason=stream_consumer_limit` and counts
+`nuts_connections_rejected_total{reason="stream_consumer_limit"}`. At startup,
+NUTS warns when the stream's `max_consumers` is below `max_connections`.
 
 #### `replay_max_messages` and `replay_window`
 
@@ -778,20 +792,20 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 |--------|------|-------------|
 | `nuts_active_connections` | Gauge | Currently connected SSE clients |
 | `nuts_messages_delivered_total` | Counter | SSE message events successfully written |
-| `nuts_messages_dropped_total{reason}` | Counter (labeled) | Messages dropped during SSE formatting. `reason` is one of `raw_payload` (inbound NATS payload exceeded `max_event_size`), `formatted_sse_message` (SSE envelope after JSON wrap exceeded `max_event_size`) or `replay_window` (a replayed message older than `replay_window`). |
+| `nuts_messages_dropped_total{reason}` | Counter (labeled) | Messages not delivered to a client. `reason` is one of `raw_payload` (inbound NATS payload exceeded `max_event_size`), `formatted_sse_message` (SSE envelope after JSON wrap exceeded `max_event_size`), `replay_window` (a replayed message older than `replay_window`) or `control_message` (a subject delete marker or schedule definition; see [Server control messages](#server-control-messages)). |
 | `nuts_wildcard_filter_drops_total` | Counter | Deprecated, always 0: the pre-NATS-2.10 wildcard fallback was removed. |
 | `nuts_slow_client_disconnects_total` | Counter | Clients disconnected because a write missed `write_timeout` (the client stopped reading) |
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
 | `nuts_replay_fallbacks_total` | Counter | Replay streams that started in a fallback mode (requested sequence was purged or older than `replay_window`), counted once the consumer exists |
 | `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
-| `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` is one of `max_connections`, `auth_missing_token`, `auth_invalid_token`, `auth_topic_forbidden`. |
+| `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` is one of `max_connections`, `stream_consumer_limit`, `auth_missing_token`, `auth_invalid_token`, `auth_topic_forbidden`. |
 | `nuts_replay_cap_reached_total` | Counter | Replaying SSE connections closed after `replay_max_messages` was reached |
 | `nuts_dispatch_timeout_total` | Counter | Deprecated, always 0: `dispatch_timeout` has no effect. |
 | `nuts_nats_async_errors_total{kind}` | Counter (labeled) | Asynchronous NATS client errors observed by the registered ErrorHandler. `kind` is one of `slow_consumer`, `timeout`, `connection_state`, `consumer_invalidated`, `other`. Consumer health is now handled by the ordered consumer itself and counted in `nuts_consumer_invalidated_total`. |
 | `nuts_consumer_invalidated_total{reason}` | Counter (labeled) | JetStream consumer failures under live streams. `reason` is `recreated` (the consumer recovered after a gap, a NATS reconnect or missed heartbeats; the client noticed nothing) or `unrecoverable` (recreation kept failing and the stream closed with `disconnect_reason=consumer_unrecoverable`). |
 | `nuts_write_disconnects_total{site}` | Counter (labeled) | SSE streams terminated by a response-writer write error (typically the `write_timeout` deadline firing). `site` is one of `connected`, `message`, `heartbeat`. |
 | `nuts_readiness_failures_total{cause}` | Counter (labeled) | `/readyz` probe responses that returned 503 because a dependency was degraded. `cause` is one of `nats_disconnected`, `jetstream_missing`, `stream_info_error`. |
-| `nuts_nats_connection_events_total{event}` | Counter (labeled) | NATS connection-state transitions reported by the registered Disconnect/Reconnect/Closed handlers. `event` is one of `disconnect`, `reconnect`, `closed`. Use the `reconnect` series to alert on broker flapping (see [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml)). |
+| `nuts_nats_connection_events_total{event}` | Counter (labeled) | NATS connection-state transitions reported by the registered Disconnect/Reconnect/Closed/LameDuckMode handlers. `event` is one of `disconnect`, `reconnect`, `closed`, `lame_duck` (the server announced it is shutting down). `closed` is not counted when NUTS closes the connection itself on shutdown or reload. Use the `reconnect` series to alert on broker flapping (see [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml)). |
 
 Example alert rules and a Grafana dashboard are available in
 [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml) and
@@ -841,6 +855,7 @@ Using the NATS CLI:
 # Basic stream for events
 nats stream add EVENTS \
   --subjects "events.>" \
+  --max-consumers 10000 \
   --storage file \
   --retention limits \
   --max-msgs 10000 \
@@ -861,6 +876,7 @@ nats stream add
 | `--max-msgs` | `10000` | Maximum messages to keep |
 | `--max-age` | `24h` | Maximum age of messages |
 | `--discard` | `old` | Discard oldest messages when limit reached |
+| `--max-consumers` | Peak concurrent SSE connections across all NUTS instances | Each SSE connection holds one consumer. nats-server 2.15 allows 1000 per stream unless this is set |
 
 ### Example Streams
 
@@ -868,6 +884,7 @@ nats stream add
 ```bash
 nats stream add CHAT \
   --subjects "chat.>" \
+  --max-consumers 10000 \
   --storage file \
   --max-msgs-per-subject 1000 \
   --max-age 7d
@@ -877,6 +894,7 @@ nats stream add CHAT \
 ```bash
 nats stream add METRICS \
   --subjects "metrics.>" \
+  --max-consumers 10000 \
   --storage memory \
   --max-msgs 5000 \
   --max-age 1h
@@ -925,10 +943,43 @@ events.addEventListener('message', (e) => {
 // Handle errors and reconnect with replay
 events.onerror = (e) => {
     console.error('SSE error:', e);
-    // EventSource will auto-reconnect and send Last-Event-ID automatically.
+    // EventSource reconnects on its own and sends Last-Event-ID, including
+    // after NUTS answers a transient failure with a retry delay.
     // Custom clients should reconnect with the most recent event ID.
 };
 ```
+
+### Transient failures and EventSource
+
+A browser `EventSource` gives up for good when a connection or reconnection is
+answered with anything other than a `200` event stream: it closes and never
+retries. NUTS therefore answers transient failures differently for clients
+that send `Accept: text/event-stream`, as every `EventSource` does:
+
+| Failure | `EventSource` clients | Other clients |
+| --- | --- | --- |
+| JetStream not available (NATS outage, handler shutting down) | `200` retry stream | `503` + `Retry-After` |
+| `max_connections` reached | `200` retry stream | `429` + `Retry-After` |
+| Stream consumer limit reached | `200` retry stream | `503` + `Retry-After` |
+| Consumer could not be created | `200` retry stream | `503` + `Retry-After` |
+
+The retry stream holds a comment naming the reason and a `retry:` delay of
+2.5–7.5 seconds (jittered so rejected clients do not return together), then
+closes:
+
+```
+: JetStream not available
+retry: 4213
+
+```
+
+The browser waits that long, reconnects and sends its `Last-Event-ID`, so
+nothing is lost. `Retry-After` carries the same delay in whole seconds. While
+the NATS connection is down, NUTS answers at once rather than waiting for
+JetStream calls to time out.
+Client errors (`400`, `401`, `403`) and topics outside the stream
+(`503 Failed to subscribe to requested topics`) are not retryable: they will
+not succeed on their own.
 
 ### Slow Clients And Replay
 
@@ -1035,6 +1086,20 @@ replay. Treat it like any other event ID. It is omitted when the stream
 starts in a fallback replay mode, in which case the client keeps its previous
 cursor.
 
+#### Server control messages
+
+Some messages in a stream are written by the server for its own bookkeeping
+rather than published by an application. NUTS does not forward them:
+
+- subject delete markers, stored when a subject's last message is removed on
+  a stream with `subject_delete_marker_ttl` (header `Nats-Marker-Reason`);
+- message schedule definitions (header `Nats-Schedule`). The messages a
+  schedule produces are delivered as usual.
+
+They are counted as `nuts_messages_dropped_total{reason="control_message"}`.
+Their sequence numbers never appear as event IDs, so IDs can skip them.
+Apart from these two headers, NUTS does not look at message headers.
+
 ## Example Scenarios
 
 ### Chat Application
@@ -1054,7 +1119,7 @@ cursor.
 
 ```bash
 # Create the stream first
-nats stream add CHAT --subjects "chat.>" --storage file --max-age 7d
+nats stream add CHAT --subjects "chat.>" --max-consumers 10000 --storage file --max-age 7d
 ```
 
 ```javascript
@@ -1080,7 +1145,7 @@ const events = new EventSource(`/chat/messages?topic=${room}`);
 
 ```bash
 # Create the stream first
-nats stream add METRICS --subjects "metrics.>" --storage memory --max-age 1h
+nats stream add METRICS --subjects "metrics.>" --max-consumers 10000 --storage memory --max-age 1h
 ```
 
 ### With NATS Authentication

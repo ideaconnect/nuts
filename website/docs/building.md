@@ -61,6 +61,7 @@ nats-server -js -p 4222
 ```bash
 nats stream add EVENTS \
   --subjects "events.>" \
+  --max-consumers 10000 \
   --storage file \
   --retention limits \
   --max-msgs 10000 \
@@ -117,7 +118,7 @@ If NATS runs in the same Docker network, point `NATS_URL` at its service name
 Quickly spin up just NATS while keeping a local Caddy binary:
 
 ```bash
-docker run --rm -p 4222:4222 nats:2.12-alpine -js
+docker run --rm -p 4222:4222 nats:2.15-alpine -js
 ```
 
 ### Option C — Full stack with Docker Compose
@@ -139,7 +140,7 @@ A production-style Compose file using the prebuilt image looks like:
 ```yaml
 services:
   nats:
-    image: nats:2.12-alpine
+    image: nats:2.15-alpine
     command: ["--jetstream", "--store_dir=/data"]
     volumes:
       - nats-data:/data
@@ -159,6 +160,7 @@ services:
       - |
         nats -s nats://nats:4222 stream add EVENTS \
           --subjects "events.>" --storage file --retention limits \
+          --max-consumers 10000 \
           --max-msgs 10000 --max-age 24h --discard old --defaults
     restart: "no"
 

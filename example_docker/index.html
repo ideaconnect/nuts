@@ -202,20 +202,37 @@
         }
 
         function subscribe(url, name, handler) {
-            const es = new EventSource(url);
-            es.addEventListener('connected', function() { setDot(name, 'ok'); });
-            es.addEventListener('message', function(e) {
-                const data = JSON.parse(e.data);
-                handler(data);
-            });
-            es.onerror = function() {
-                if (es.readyState === EventSource.CLOSED) {
-                    setDot(name, 'err');
-                } else {
-                    setDot(name, 'wait');
-                }
-            };
-            return es;
+            var es;
+            var lastEventId = '';
+            function connect() {
+                // A new EventSource starts without a Last-Event-ID, so the
+                // cursor of the one that closed travels in the URL instead.
+                var target = lastEventId ? url + '&last-id=' + encodeURIComponent(lastEventId) : url;
+                es = new EventSource(target);
+                es.addEventListener('connected', function(e) {
+                    if (e.lastEventId) { lastEventId = e.lastEventId; }
+                    setDot(name, 'ok');
+                });
+                es.addEventListener('message', function(e) {
+                    if (e.lastEventId) { lastEventId = e.lastEventId; }
+                    handler(JSON.parse(e.data));
+                });
+                es.onerror = function() {
+                    if (es.readyState === EventSource.CLOSED) {
+                        setDot(name, 'err');
+                        // NUTS answers transient failures (NATS outage,
+                        // connection caps) with a retry delay that
+                        // EventSource follows by itself. It only closes on
+                        // errors that will not clear up on their own, or when
+                        // a proxy in front of NUTS fails, so retry slowly and
+                        // resume after the last event received.
+                        setTimeout(connect, 10000);
+                    } else {
+                        setDot(name, 'wait');
+                    }
+                };
+            }
+            connect();
         }
 
         // Column 1: numbers only

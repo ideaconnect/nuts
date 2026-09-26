@@ -18,6 +18,7 @@ if ! command -v nats &> /dev/null; then
     echo "   nats stream add EVENTS \\"
     echo "     --server=nats://localhost:4222 \\"
     echo "     --subjects \"events.>\" \\"
+    echo "     --max-consumers 10000 \\"
     echo "     --storage memory \\"
     echo "     --retention limits \\"
     echo "     --max-msgs 10000 \\"
@@ -30,6 +31,7 @@ echo "📦 Creating JetStream stream 'EVENTS'..."
 nats stream add EVENTS \
     --server=nats://localhost:4222 \
     --subjects "events.>" \
+    --max-consumers 10000 \
     --storage memory \
     --retention limits \
     --max-msgs 10000 \

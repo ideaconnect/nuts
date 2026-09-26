@@ -59,7 +59,7 @@ jobs:
       # coverage and that walks the godog suite under functional_test/.
       - name: Bring up NATS stack
         env:
-          NATS_IMAGE: nats:2.12-alpine
+          NATS_IMAGE: nats:2.15-alpine
         run: docker compose up -d --build --wait
 
       - name: Run mutation testing

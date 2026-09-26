@@ -28,6 +28,9 @@ type streamLookup interface {
 	Stream(ctx context.Context, name string) (jetstream.Stream, error)
 }
 
+// errHandlerClosing rejects new streams once Cleanup has started.
+var errHandlerClosing = errors.New("handler is shutting down")
+
 // consumerStream is the JetStream side of a single SSE request: its ordered
 // consumer and the feed that pulls from it.
 type consumerStream struct {
@@ -35,6 +38,8 @@ type consumerStream struct {
 	stream   string
 	consumer jetstream.Consumer
 	feed     *streamFeed
+	// release tells Cleanup that this stream's consumer is gone.
+	release func()
 }
 
 // openConsumerStream creates the request's ordered consumer and starts pulling.
@@ -42,27 +47,37 @@ type consumerStream struct {
 // refusals (stream missing, consumer limits) surface here as an error the
 // caller turns into an HTTP response.
 func (h *Handler) openConsumerStream(ctx context.Context, js jetstream.JetStream, plan streamPlan) (*consumerStream, error) {
+	if !h.trackStream() {
+		return nil, errHandlerClosing
+	}
 	createCtx, cancel := context.WithTimeout(ctx, defaultConsumerCreateTimeout)
 	defer cancel()
 	consumer, err := js.OrderedConsumer(createCtx, h.StreamName, h.orderedConsumerConfig(plan))
 	if err != nil {
-		metricsSubscriptionErrors.Inc()
+		h.streams.Done()
 		return nil, err
 	}
+	cs := &consumerStream{js: js, stream: h.StreamName, consumer: consumer, release: h.streams.Done}
 	iterator, err := consumer.Messages(h.pullOptions()...)
 	if err != nil {
-		metricsSubscriptionErrors.Inc()
-		cs := &consumerStream{js: js, stream: h.StreamName, consumer: consumer}
 		cs.deleteConsumer()
 		return nil, err
 	}
 	h.logSubscription(plan)
-	return &consumerStream{
-		js:       js,
-		stream:   h.StreamName,
-		consumer: consumer,
-		feed:     h.startStreamFeed(iterator, plan),
-	}, nil
+	cs.feed = h.startStreamFeed(iterator, plan)
+	return cs, nil
+}
+
+// trackStream registers a stream whose consumer Cleanup waits for. It fails
+// once Cleanup has started, so no stream is added while Cleanup waits.
+func (h *Handler) trackStream() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.closing {
+		return false
+	}
+	h.streams.Add(1)
+	return true
 }
 
 // close stops pulling and removes the consumer from the server.
@@ -78,10 +93,12 @@ func (cs *consumerStream) close() {
 func (cs *consumerStream) deleteConsumer() {
 	info := cs.consumer.CachedInfo()
 	if info == nil {
+		cs.release()
 		return
 	}
 	name := info.Name
 	go func() {
+		defer cs.release()
 		ctx, cancel := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
 		defer cancel()
 		_ = cs.js.DeleteConsumer(ctx, cs.stream, name)
@@ -136,7 +153,7 @@ func (h *Handler) replayStartTime(plan streamPlan) time.Time {
 func (h *Handler) orderedConsumerConfig(plan streamPlan) jetstream.OrderedConsumerConfig {
 	cfg := jetstream.OrderedConsumerConfig{
 		FilterSubjects:    plan.FullSubjects,
-		InactiveThreshold: defaultConsumerInactiveThreshold,
+		InactiveThreshold: consumerInactiveThreshold(plan.ConsumerInactiveLimit),
 		MaxResetAttempts:  defaultConsumerMaxResetAttempts,
 		NamePrefix:        consumerNamePrefix + nuid.Next(),
 	}
@@ -159,6 +176,17 @@ func (h *Handler) orderedConsumerConfig(plan streamPlan) jetstream.OrderedConsum
 		}
 	}
 	return cfg
+}
+
+// consumerInactiveThreshold is the InactiveThreshold a new consumer asks for:
+// the default, lowered to the stream's consumer limit when one is set (#113).
+// The server refuses a consumer that asks for more than the limit (error
+// 10153), which would fail every request on such a stream.
+func consumerInactiveThreshold(limit time.Duration) time.Duration {
+	if limit > 0 && limit < defaultConsumerInactiveThreshold {
+		return limit
+	}
+	return defaultConsumerInactiveThreshold
 }
 
 // pullOptions sizes the consumer's prefetch from client_buffer_size and maps

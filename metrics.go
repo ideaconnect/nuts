@@ -37,7 +37,7 @@ var (
 	metricsMessagesDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "messages_dropped_total",
-		Help:      "Total number of messages dropped during SSE formatting. Labelled by drop reason.",
+		Help:      "Total number of messages not delivered to a client, labelled by reason (raw_payload, formatted_sse_message, replay_window, control_message).",
 	}, []string{"reason"})
 
 	// nuts_wildcard_filter_drops_total is deprecated: it counted messages the
@@ -90,7 +90,7 @@ var (
 	metricsConnectionsRejected = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "connections_rejected_total",
-		Help:      "Total number of SSE connections rejected before streaming started, labelled by reason (max_connections, auth_missing_token, auth_invalid_token, auth_topic_forbidden).",
+		Help:      "Total number of SSE connections rejected before streaming started, labelled by reason (max_connections, stream_consumer_limit, auth_missing_token, auth_invalid_token, auth_topic_forbidden).",
 	}, []string{"reason"})
 
 	// nuts_replay_cap_reached_total counts replaying SSE connections closed
@@ -189,6 +189,6 @@ var (
 	metricsNATSConnectionEvents = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "nats_connection_events_total",
-		Help:      "Total NATS connection-state transitions, labelled by event (disconnect, reconnect, closed).",
+		Help:      "Total NATS connection-state transitions, labelled by event (disconnect, reconnect, closed, lame_duck).",
 	}, []string{"event"})
 )

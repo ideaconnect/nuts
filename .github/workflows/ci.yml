@@ -72,14 +72,14 @@ jobs:
         env:
           TEST_BASE_URL: http://localhost:8080
           TEST_NATS_URL: nats://localhost:4222
-          NATS_COMPAT_IMAGES: nats:2.9-alpine nats:2.12-alpine nats:2.14-alpine
+          NATS_COMPAT_IMAGES: nats:2.10-alpine nats:2.12-alpine nats:2.14-alpine nats:2.15-alpine
         run: make test-functional-matrix
 
       - name: Run functional test stress pass
         env:
           TEST_BASE_URL: http://localhost:8080
           TEST_NATS_URL: nats://localhost:4222
-          NATS_IMAGE: nats:2.12-alpine
+          NATS_IMAGE: nats:2.15-alpine
         run: make test-functional-stress FUNCTIONAL_TEST_STRESS_COUNT=3
 
       # One functional pass under the race detector against the newest
@@ -92,7 +92,7 @@ jobs:
         env:
           TEST_BASE_URL: http://localhost:8080
           TEST_NATS_URL: nats://localhost:4222
-          NATS_IMAGE: nats:2.12-alpine
+          NATS_IMAGE: nats:2.15-alpine
           FUNCTIONAL_TEST_RACE: '1'
         run: make test-functional
 

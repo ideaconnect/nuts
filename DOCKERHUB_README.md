@@ -35,6 +35,7 @@ Example stream setup with the NATS CLI:
 ```bash
 nats stream add EVENTS \
   --subjects "events.>" \
+  --max-consumers 10000 \
   --storage file \
   --retention limits \
   --max-msgs 10000 \
@@ -144,7 +145,7 @@ This example starts NATS, creates the `EVENTS` stream, then starts NUTS.
 ```yaml
 services:
   nats:
-    image: nats:2.12-alpine
+    image: nats:2.15-alpine
     command: ["--jetstream", "--store_dir=/data"]
     volumes:
       - nats-data:/data
@@ -164,6 +165,7 @@ services:
       - |
         nats -s nats://nats:4222 stream add EVENTS \
           --subjects "events.>" \
+          --max-consumers 10000 \
           --storage file \
           --retention limits \
           --max-msgs 10000 \

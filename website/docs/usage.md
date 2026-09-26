@@ -305,6 +305,7 @@ NUTS requires a pre-configured JetStream stream — create it before starting Ca
 ```bash
 nats stream add EVENTS \
   --subjects "events.>" \
+  --max-consumers 10000 \
   --storage file \
   --retention limits \
   --max-msgs 10000 \
@@ -424,7 +425,7 @@ no data is lost silently.
 ```
 
 ```bash
-nats stream add CHAT --subjects "chat.>" --storage file --max-age 7d
+nats stream add CHAT --subjects "chat.>" --max-consumers 10000 --storage file --max-age 7d
 ```
 
 ```javascript
@@ -448,7 +449,7 @@ const events = new EventSource(`/chat/messages?topic=${room}`);
 ```
 
 ```bash
-nats stream add METRICS --subjects "metrics.>" --storage memory --max-age 1h
+nats stream add METRICS --subjects "metrics.>" --max-consumers 10000 --storage memory --max-age 1h
 ```
 
 ### Authenticated NATS Connection

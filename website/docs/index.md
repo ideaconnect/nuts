@@ -32,6 +32,7 @@ Welcome to the NUTS documentation. Choose a topic to get started:
    ```bash
    nats stream add EVENTS \
      --subjects "events.>" \
+     --max-consumers 10000 \
      --storage file \
      --retention limits \
      --max-msgs 10000 \
@@ -84,7 +85,7 @@ Pick whichever fits your workflow:
 - **Just NATS in Docker, Caddy local:**
 
   ```bash
-  docker run --rm -p 4222:4222 nats:2.12-alpine -js
+  docker run --rm -p 4222:4222 nats:2.15-alpine -js
   ```
 
 - **Prebuilt NUTS Docker image** (`idcttech/nuts`):

@@ -12,7 +12,38 @@ ordered **pull** consumer instead of a push consumer. That removes a class of
 silent message loss, and clients that fall behind no longer get disconnected.
 Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
 
+### Added
+- A request refused because the stream reached its consumer limit is counted
+  as `nuts_connections_rejected_total{reason="stream_consumer_limit"}` and
+  logged with `disconnect_reason=stream_consumer_limit` (#110). NUTS also
+  warns at startup when the stream's `max_consumers` is below
+  `max_connections`.
+- NUTS warns at startup when connected to a nats-server older than 2.14.7,
+  which can silently skip messages on multi-topic subscriptions (#111).
+- A NATS server entering lame duck mode is logged and counted as
+  `nuts_nats_connection_events_total{event="lame_duck"}` (#73).
+- Consumer-creation failures log the JetStream error code as
+  `jetstream_error_code`.
+
 ### Changed
+- **Breaking: transient failures tell `EventSource` clients to retry** (#105).
+  A browser `EventSource` stops reconnecting for good after any answer other
+  than a `200` event stream, so a NATS outage or a connection cap used to
+  disconnect browsers permanently. Requests with
+  `Accept: text/event-stream` now get a `200` stream holding only a jittered
+  `retry:` delay (2.5–7.5 s) when JetStream is unavailable, `max_connections`
+  or the stream's consumer limit is reached, or the consumer cannot be
+  created. The browser then reconnects with its `Last-Event-ID`. Other
+  clients keep `503`/`429`, now always with a jittered `Retry-After`
+  (3–8 s; `max_connections` used a fixed 5). While the NATS connection is
+  down, these answers come at once instead of after the JetStream timeouts
+  (about 7 seconds).
+- **Breaking: server control messages are no longer forwarded** (#112).
+  Subject delete markers (`Nats-Marker-Reason`) and message schedule
+  definitions (`Nats-Schedule`) used to reach clients as ordinary, often
+  empty, message events. They are skipped and counted as
+  `nuts_messages_dropped_total{reason="control_message"}`. Messages produced
+  by a schedule are delivered as before.
 - **Breaking: the JetStream delivery pipeline is pull-based** (#116). Every SSE
   request creates an ordered pull consumer (nats.go `jetstream` package), named
   `nuts_<id>_<n>`. It is deleted when the stream ends, instead of lingering
@@ -57,6 +88,11 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   Before, they were treated as a subscription to a topic named `livez`, so
   kubelet probes with a trailing slash failed with `503`. Use
   `?topic=livez` to subscribe to such a topic.
+- The test matrix covers nats-server 2.10, 2.12, 2.14 and 2.15, and the
+  Docker Compose files, CI and examples default to `nats:2.15-alpine` (#109).
+  The `nats stream add` examples set `--max-consumers`.
+- `nuts_nats_connection_events_total{event="closed"}` no longer counts the
+  connection NUTS closes itself on shutdown or reload (#73).
 - `nats_idle_heartbeat` now sets the heartbeat of every pull request. When
   heartbeats stop, the ordered consumer recreates itself. `-1` is still
   accepted but no longer disables anything: the library default (5s) applies,
@@ -111,6 +147,15 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   NUTS now dates the resume point by the next retained message.
 - `replay_max_messages` no longer counts live messages published during a
   replay, including after a reconnect to an empty stream (#98).
+- **Every request failed on a stream whose `consumer_limits.inactive_threshold`
+  is below 30 seconds** (#113), with `503` while the readiness probe stayed
+  green: the server refused the consumer's fixed 30-second threshold (error
+  10153). NUTS now uses the stream's limit when it is shorter.
+- **A reload left every open stream's consumer on the server** until its
+  inactive threshold expired (#75). Cleanup now waits up to 3 seconds for the
+  streams it ends to delete their consumers before closing the connection.
+- The NATS closed callback no longer runs after Cleanup has returned, when
+  Caddy has already unloaded the handler (#73).
 - A slow-client overflow race could write a message after an earlier one was
   dropped (#104). The NATS callback could also stay parked for good behind a
   stalled writer, with messages accumulating up to nats.go's 64 MiB pending

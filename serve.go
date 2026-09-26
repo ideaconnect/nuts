@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strconv"
@@ -31,6 +32,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )
@@ -97,6 +99,10 @@ const (
 	// dropReasonReplayWindow tags a replayed message that JetStream delivered
 	// from a time-bounded fallback but that predates the replay window.
 	dropReasonReplayWindow string = "replay_window"
+	// dropReasonControlMessage tags a message the server stored for its own
+	// bookkeeping (a subject delete marker or a schedule definition), which
+	// is not an application event.
+	dropReasonControlMessage string = "control_message"
 )
 
 // isFallback reports whether the mode was selected by the fallback path
@@ -154,6 +160,9 @@ type streamPlan struct {
 	// (e.g. not allowed by the configured stream's subject filters). When
 	// non-empty, the request short-circuits with 503.
 	FailedTopics []string
+	// ConsumerInactiveLimit caps the consumer's InactiveThreshold; see
+	// streamInfoSnapshot.
+	ConsumerInactiveLimit time.Duration
 }
 
 // subjectLabel produces a single comma-joined subject string suitable for log
@@ -210,6 +219,9 @@ type streamInfoSnapshot struct {
 	// Subjects are the configured stream subject filters; a multi-topic
 	// request whose subjects are not allowed by these filters is rejected.
 	Subjects []string
+	// ConsumerInactiveLimit is the stream's consumer_limits.inactive_threshold
+	// (0 when unset). The server refuses consumers that ask for more.
+	ConsumerInactiveLimit time.Duration
 	// StartSequenceTime is the publish time of the requested replay start
 	// sequence, when the message is still retained. Used for replay_window
 	// comparisons.
@@ -224,6 +236,9 @@ type streamInfoSnapshot struct {
 type streamRuntime struct {
 	js       jetstream.JetStream
 	shutdown <-chan struct{}
+	// disconnected is true while the NATS connection is down and
+	// reconnecting, when every JetStream call could only time out.
+	disconnected bool
 }
 
 // streamRequestError is a structured error returned by the request-parsing
@@ -313,12 +328,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
+	// While NATS is reconnecting, answer at once instead of letting the
+	// stream-info read and the consumer create each run into their timeout.
 	runtime := h.currentStreamRuntime()
-	if runtime.js == nil {
+	if runtime.js == nil || runtime.disconnected {
 		h.log().Warn("JetStream not available for SSE stream",
 			appendStreamLogFields(plan, zap.String("disconnect_reason", "jetstream_unavailable"))...,
 		)
-		http.Error(w, "JetStream not available", http.StatusServiceUnavailable)
+		h.rejectTransient(w, r, http.StatusServiceUnavailable, "JetStream not available")
 		return nil
 	}
 
@@ -333,14 +350,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 					zap.Int("max_connections", h.MaxConnections),
 				)...,
 			)
-			w.Header().Set("Retry-After", "5")
 			// 429 (RFC 6585) is the precise status for a per-client/server
 			// concurrency cap: the server is healthy, the caller should back
 			// off. Using 503 here would collide with the genuine-503 paths
 			// (jetstream_unavailable / subscription_failed / readiness probe
 			// degraded) and trip circuit breakers into opening the circuit
 			// when the right reaction is to keep retrying with Retry-After.
-			http.Error(w, "Too many concurrent connections", http.StatusTooManyRequests)
+			h.rejectTransient(w, r, http.StatusTooManyRequests, "Too many concurrent connections")
 			return nil
 		}
 		defer h.releaseConnSlot()
@@ -362,18 +378,97 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	stream, err := h.openConsumerStream(r.Context(), runtime.js, plan)
 	if err != nil {
-		h.log().Error("failed to create JetStream consumer",
-			appendStreamLogFields(plan,
-				zap.String("disconnect_reason", "subscription_failed"),
-				zap.Error(err),
-			)...,
-		)
-		http.Error(w, fmt.Sprintf("Failed to subscribe to requested topics: %s", strings.Join(plan.Topics, ", ")), http.StatusServiceUnavailable)
+		h.rejectConsumerFailure(w, r, plan, err)
 		return nil
 	}
 	defer stream.close()
 
 	return h.serveStream(w, r, plan, stream.feed, runtime.shutdown)
+}
+
+// transientRetryBase is the average delay a client is asked to wait before
+// retrying a stream request that failed for a transient reason. The delay
+// actually sent is jittered by ±50%, so clients rejected together do not all
+// come back together.
+const transientRetryBase = 5 * time.Second
+
+// retryDelay returns a delay in [transientRetryBase/2, 3*transientRetryBase/2).
+func retryDelay() time.Duration {
+	return transientRetryBase/2 + rand.N(transientRetryBase)
+}
+
+// acceptsEventStream reports whether the client asked for an event stream.
+// Native EventSource always sends Accept: text/event-stream.
+func acceptsEventStream(r *http.Request) bool {
+	for _, accept := range r.Header.Values("Accept") {
+		if strings.Contains(strings.ToLower(accept), "text/event-stream") {
+			return true
+		}
+	}
+	return false
+}
+
+// rejectTransient answers a stream request that failed for a reason expected
+// to clear up on its own: JetStream unavailable, max_connections, the
+// stream's consumer limit, or a failed consumer create. A native EventSource
+// treats any answer other than a 200 event stream as fatal and stops
+// reconnecting for good (#105). A client that accepts text/event-stream
+// therefore gets an empty 200 stream that carries only a retry: delay; it
+// reconnects after that delay and keeps its Last-Event-ID. Other clients get
+// the status code with a Retry-After header.
+func (h *Handler) rejectTransient(w http.ResponseWriter, r *http.Request, status int, message string) {
+	delay := retryDelay()
+	if acceptsEventStream(r) {
+		h.setSSEHeaders(w)
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, ": %s\nretry: %d\n\n", message, delay.Milliseconds())
+		return
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(int((delay+time.Second-1)/time.Second)))
+	http.Error(w, message, status)
+}
+
+// rejectConsumerFailure answers a request whose JetStream consumer could not
+// be created. Every cause is treated as transient: the stream may be
+// recreated, and consumer limits free up as other clients leave.
+func (h *Handler) rejectConsumerFailure(w http.ResponseWriter, r *http.Request, plan streamPlan, err error) {
+	switch {
+	case errors.Is(err, errHandlerClosing):
+		h.log().Debug("rejecting SSE stream: handler shutting down",
+			appendStreamLogFields(plan, zap.String("disconnect_reason", "handler_shutdown"))...,
+		)
+		h.rejectTransient(w, r, http.StatusServiceUnavailable, "JetStream not available")
+	case errors.Is(err, jetstream.ErrMaximumConsumersLimit):
+		// nats-server 2.15 caps every stream at 1000 consumers unless
+		// max_consumers says otherwise, and NUTS needs one per connection.
+		metricsConnectionsRejected.WithLabelValues("stream_consumer_limit").Inc()
+		h.log().Warn("rejecting SSE stream: the stream's consumer limit is reached",
+			appendStreamLogFields(plan,
+				zap.String("disconnect_reason", "stream_consumer_limit"),
+				zap.Error(err),
+			)...,
+		)
+		h.rejectTransient(w, r, http.StatusServiceUnavailable, "Stream consumer limit reached")
+	default:
+		metricsSubscriptionErrors.Inc()
+		fields := []zap.Field{zap.String("disconnect_reason", "subscription_failed"), zap.Error(err)}
+		h.log().Error("failed to create JetStream consumer",
+			appendStreamLogFields(plan, append(fields, jetStreamErrorFields(err)...)...)...,
+		)
+		h.rejectTransient(w, r, http.StatusServiceUnavailable, "Failed to subscribe to requested topics: "+strings.Join(plan.Topics, ", "))
+	}
+}
+
+// jetStreamErrorFields names the JetStream API error code of a failed call,
+// so server-side refusals can be told apart in the logs: for example 10153,
+// an inactive threshold above the stream's consumer limit, or 10059, a
+// missing stream.
+func jetStreamErrorFields(err error) []zap.Field {
+	var apiErr *jetstream.APIError
+	if errors.As(err, &apiErr) {
+		return []zap.Field{zap.Int("jetstream_error_code", int(apiErr.ErrorCode))}
+	}
+	return nil
 }
 
 // handleControlRequest short-circuits requests that aren't SSE subscriptions:
@@ -543,7 +638,11 @@ func parseReplayCursor(value string) (uint64, cursorProblem, error) {
 // the lock for the duration of the connection.
 func (h *Handler) currentStreamRuntime() streamRuntime {
 	h.mu.RLock()
-	runtime := streamRuntime{js: h.js, shutdown: h.shutdown}
+	runtime := streamRuntime{
+		js:           h.js,
+		shutdown:     h.shutdown,
+		disconnected: h.conn != nil && !h.conn.IsConnected(),
+	}
 	h.mu.RUnlock()
 	return runtime
 }
@@ -573,10 +672,11 @@ func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan 
 	}
 	info := stream.CachedInfo()
 	snapshot := streamInfoSnapshot{
-		HasSnapshot: true,
-		FirstSeq:    info.State.FirstSeq,
-		LastSeq:     info.State.LastSeq,
-		Subjects:    info.Config.Subjects,
+		HasSnapshot:           true,
+		FirstSeq:              info.State.FirstSeq,
+		LastSeq:               info.State.LastSeq,
+		Subjects:              info.Config.Subjects,
+		ConsumerInactiveLimit: info.Config.ConsumerLimits.InactiveThreshold,
 	}
 	if plan.Replay.HasLastID && h.ReplayWindow > 0 && plan.Replay.StartSequence >= info.State.FirstSeq {
 		msg, err := stream.GetMsg(readCtx, plan.Replay.StartSequence)
@@ -607,6 +707,7 @@ func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan 
 // sequence is below retention or outside the configured replay_window.
 // Idempotent: calling it twice with the same snapshot yields the same result.
 func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot) streamPlan {
+	plan.ConsumerInactiveLimit = snapshot.ConsumerInactiveLimit
 	if len(snapshot.Subjects) > 0 {
 		for idx, fullSubject := range plan.FullSubjects {
 			if !subjectAllowedByStream(fullSubject, snapshot.Subjects) {
@@ -700,6 +801,20 @@ func (h *Handler) replayWindowStart() time.Time {
 	return time.Now().Add(-time.Duration(h.ReplayWindow) * time.Second)
 }
 
+// setSSEHeaders sets the headers of an event-stream response.
+func (h *Handler) setSSEHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	// X-Accel-Buffering: no tells nginx (and other proxies that respect it)
+	// not to buffer the response, which would otherwise hold events until
+	// flush thresholds are met and break SSE's near-real-time guarantee.
+	w.Header().Set("X-Accel-Buffering", "no")
+	if h.HubURL != "" {
+		w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"nuts\"", h.HubURL))
+	}
+}
+
 // serveStream is the SSE writer loop. It writes the response headers and the
 // initial "connected" event, then multiplexes between these sources until one
 // of them terminates the connection:
@@ -727,16 +842,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 
 	// CORS headers were already applied at the top of ServeHTTP — repeating
 	// the call here is harmless (idempotent) but unnecessary.
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	// X-Accel-Buffering: no tells nginx (and other proxies that respect it)
-	// not to buffer the response, which would otherwise hold events until
-	// flush thresholds are met and break SSE's near-real-time guarantee.
-	w.Header().Set("X-Accel-Buffering", "no")
-	if h.HubURL != "" {
-		w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"nuts\"", h.HubURL))
-	}
+	h.setSSEHeaders(w)
 
 	if err := writeSSEChunkWithTimeout(w, rc, formatConnectedEvent(plan), writeTimeout); err != nil {
 		h.recordWriteDisconnect(plan, "connected", err)
@@ -973,6 +1079,11 @@ func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formatted
 		formatted.ConsumerName = msg.ConsumerName
 		formatted.NumPending = msg.NumPending
 	}
+	if isControlMessage(msg.Header) {
+		formatted.Dropped = true
+		formatted.DropReason = dropReasonControlMessage
+		return formatted
+	}
 	if h.MaxEventSize > 0 && len(msg.Data) > h.MaxEventSize {
 		formatted.Dropped = true
 		formatted.DropReason = dropReasonRawPayload
@@ -1014,18 +1125,38 @@ func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formatted
 	return formatted
 }
 
+// isControlMessage reports whether a stored message was written by the server
+// or holds a schedule rather than being an application event: subject delete
+// markers (ADR-43) and message schedule definitions (ADR-51). The messages a
+// schedule produces carry Nats-Scheduler instead of Nats-Schedule and are
+// delivered as usual.
+func isControlMessage(header nats.Header) bool {
+	if _, ok := header[jetstream.MarkerReasonHeader]; ok {
+		return true
+	}
+	_, ok := header[jetstream.ScheduleHeader]
+	return ok
+}
+
 // recordDroppedMessage emits the metric and structured log line for a
 // message the formatter decided not to send. Operators rely on these logs
 // to size MaxEventSize correctly without grepping the message payloads.
 //
 // Callers must only invoke this with a formattedMessageEvent where Dropped
-// is true; formatMessageEvent always sets DropReason to one of the two
-// declared constants (dropReasonRawPayload / dropReasonFormattedSSEMessage)
-// at every Dropped=true assignment site, so the metric label set stays
-// bounded to the values documented in README "nuts_messages_dropped_total".
+// is true; formatMessageEvent always sets DropReason to one of the declared
+// constants (dropReasonControlMessage / dropReasonRawPayload /
+// dropReasonFormattedSSEMessage) at every Dropped=true assignment site, so
+// the metric label set stays bounded to the values documented in README
+// "nuts_messages_dropped_total".
 func (h *Handler) recordDroppedMessage(formatted formattedMessageEvent) {
 	metricsMessagesDropped.WithLabelValues(formatted.DropReason).Inc()
 	switch formatted.DropReason {
+	case dropReasonControlMessage:
+		// Routine with per-message TTLs and schedules, so not a warning.
+		h.log().Debug("skipping server control message",
+			zap.String("topic", formatted.Subject),
+			zap.Uint64("stream_sequence", formatted.StreamSequence),
+		)
 	case dropReasonRawPayload:
 		h.log().Warn("dropping oversized NATS payload",
 			zap.String("topic", formatted.Subject),

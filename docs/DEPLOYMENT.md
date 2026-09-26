@@ -4,6 +4,14 @@ These examples are intended as copy-paste starting points. Replace image tags,
 domains, secrets, storage classes, and NATS addresses before using them in a
 real environment.
 
+## Consumer limits
+
+Each SSE connection holds one JetStream consumer. From nats-server 2.15 a
+stream accepts at most 1000 consumers unless `max_consumers` is set, and every
+NUTS replica counts against the same limit. The stream definitions below set
+`--max-consumers 10000`; size it for peak concurrent connections across all
+replicas (at least `max_connections` × replicas).
+
 ## Production Compose
 
 `compose.yaml`:
@@ -11,7 +19,7 @@ real environment.
 ```yaml
 services:
   nats:
-    image: nats:2.12-alpine
+    image: nats:2.15-alpine
     command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
     ports:
       - "4222:4222"
@@ -34,6 +42,7 @@ services:
       - |
         nats -s nats://nats:4222 stream add EVENTS \
           --subjects "events.>" \
+          --max-consumers 10000 \
           --storage file \
           --retention limits \
           --max-msgs 100000 \

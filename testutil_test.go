@@ -1,18 +1,23 @@
 package nuts
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.uber.org/zap"
 )
 
 // fakeJSMsg is a jetstream.Msg with fixed subject, data and metadata. Methods
@@ -240,4 +245,76 @@ func (p *blackholeProxy) cut() {
 		_ = c.Close()
 	}
 	p.conns = nil
+}
+
+// assertRetryAfter checks the Retry-After header rejectTransient sends to
+// clients that do not accept an event stream: whole seconds covering the
+// jittered delay.
+func assertRetryAfter(t *testing.T, header http.Header) {
+	t.Helper()
+	got, err := strconv.Atoi(header.Get("Retry-After"))
+	if err != nil || got < 3 || got > 8 {
+		t.Fatalf("Retry-After = %q, want whole seconds in [3, 8]", header.Get("Retry-After"))
+	}
+}
+
+// assertRetryStream checks the answer rejectTransient gives EventSource
+// clients: a 200 event stream holding only a comment with the reason and a
+// jittered retry: delay, so the browser reconnects instead of giving up.
+func assertRetryStream(t *testing.T, rr *httptest.ResponseRecorder, reason string) {
+	t.Helper()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 so EventSource keeps reconnecting; body=%q", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	if got := rr.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After = %q on a retry stream, want none", got)
+	}
+	body := rr.Body.String()
+	prefix := ": " + reason + "\nretry: "
+	if !strings.HasPrefix(body, prefix) || !strings.HasSuffix(body, "\n\n") {
+		t.Fatalf("body = %q, want %q + delay + blank line", body, prefix)
+	}
+	ms, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(body, prefix), "\n\n"))
+	if err != nil || ms < 2500 || ms >= 7500 {
+		t.Fatalf("retry = %q ms, want [2500, 7500)", strings.TrimSuffix(strings.TrimPrefix(body, prefix), "\n\n"))
+	}
+}
+
+// provisionOnStream creates the stream described by cfg on a fresh embedded
+// server and provisions a handler for it, for tests that need stream
+// settings createTestStream does not offer. Everything is torn down when the
+// test ends.
+func provisionOnStream(t *testing.T, cfg jetstream.StreamConfig, configure func(*Handler)) (*Handler, *nats.Conn) {
+	t.Helper()
+	ns := startJetStreamServer(t)
+	t.Cleanup(ns.Shutdown)
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := mustJetStream(t, nc).CreateStream(ctx, cfg); err != nil {
+		t.Fatalf("CreateStream: %v", err)
+	}
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        cfg.Name,
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30,
+		MaxEventSize:      -1,
+	}
+	if configure != nil {
+		configure(h)
+	}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	h.logger = zap.NewNop()
+	t.Cleanup(func() { _ = h.Cleanup() })
+	return h, nc
 }

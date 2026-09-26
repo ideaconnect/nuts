@@ -78,9 +78,10 @@ Tests live alongside the source:
 | [performance_test.go](performance_test.go) | `TestPerformance_*` confidence tests and benchmarks. |
 | [serve_test.go](serve_test.go) | Request parsing, replay planning, formatting, and stream helper unit tests without live NATS. |
 | [consumer_test.go](consumer_test.go) | Feed unit tests (ordering, oversize drops, backpressure, failure and stop paths) with a fake iterator. |
-| [delivery_contract_test.go](delivery_contract_test.go) | End-to-end delivery contract over real HTTP: no hole after a NATS link loss, large backlogs on one connection, bursts without disconnects. |
+| [delivery_contract_test.go](delivery_contract_test.go) | End-to-end delivery contract over real HTTP: no hole after a NATS link loss, large backlogs on one connection, bursts without disconnects, cursor precedence and replay edge cases, plus the server start-sequence behaviour planning relies on. |
 | [caddy_integration_test.go](caddy_integration_test.go) | Caddy-in-the-loop tests via `caddy.Load` (access logs, HTTP metrics). |
-| [testutil_test.go](testutil_test.go) | Shared test doubles: fake JetStream messages and iterator, stalled writers, the black-hole TCP proxy. |
+| [server_compat_test.go](server_compat_test.go) | nats-server behaviour NUTS accommodates, on the embedded server: stream consumer limits, consumer inactive-threshold limits, delete markers and schedules, lame duck mode, the multi-topic purge fix, and teardown. |
+| [testutil_test.go](testutil_test.go) | Shared test doubles and helpers: fake JetStream messages and iterator, stalled writers, the black-hole TCP proxy, retry-response assertions, custom-stream provisioning. |
 | [functional_test/](functional_test/) | [Godog](https://github.com/cucumber/godog) BDD tests against a real Docker Compose stack. |
 | [features/](features/) | Gherkin `.feature` files driving the Godog suite. |
 
@@ -117,7 +118,7 @@ go build ./cmd/caddy       # equivalent
 | `make test-performance` | `TestPerformance_*` plus the named hot-path benchmarks. |
 | `make test-functional` | Godog BDD scenarios against the Docker Compose stack. |
 | `make test-functional-stress FUNCTIONAL_TEST_STRESS_COUNT=N` | Repeats the functional suite N times to catch flakes. |
-| `make test-functional-matrix` | Runs functional tests against `nats:2.9-alpine` (pre-multi-filter), `nats:2.12-alpine`, and `nats:2.14-alpine` (matches the embedded `nats-server/v2` major.minor pinned in `go.mod`). |
+| `make test-functional-matrix` | Runs functional tests against `nats:2.10-alpine` (the supported floor), `nats:2.12-alpine`, `nats:2.14-alpine` (2.14.7+, first release with the multi-filter purge fix) and `nats:2.15-alpine` (matches the embedded `nats-server/v2` major.minor pinned in `go.mod`). |
 | `make test` | `test-unit` + `test-functional`. |
 | `make lint` | golangci-lint via the pinned container image. |
 | `make release-check` | GoReleaser config validation in a container. |
@@ -254,8 +255,8 @@ PRs run, in this order:
 
 1. `gofmt`, `go mod tidy` diff check, golangci-lint, unit tests with coverage,
    focused race tests, `go vet`, `govulncheck`.
-2. Functional test matrix (`nats:2.9-alpine`, `nats:2.12-alpine`,
-   `nats:2.14-alpine`) and a 3× functional stress pass.
+2. Functional test matrix (`nats:2.10-alpine`, `nats:2.12-alpine`,
+   `nats:2.14-alpine`, `nats:2.15-alpine`) and a 3× functional stress pass.
 3. Coverage upload to Codecov.
 4. Production Docker image build + `caddy adapt` validation + Trivy scan +
    SBOM (SPDX JSON) artifact.

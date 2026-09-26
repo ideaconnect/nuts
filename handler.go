@@ -196,7 +196,7 @@ type Handler struct {
 	// logger is scoped to this handler instance.
 	logger *zap.Logger
 
-	// mu protects conn, js, and shutdown.
+	// mu protects conn, js, shutdown and closing.
 	mu sync.RWMutex
 
 	// connCount enforces MaxConnections.
@@ -204,6 +204,14 @@ type Handler struct {
 
 	// shutdown wakes in-flight SSE handlers during Cleanup.
 	shutdown chan struct{}
+
+	// closing is set by Cleanup. No stream is tracked in streams after it.
+	closing bool
+
+	// streams counts SSE streams whose JetStream consumer has not been
+	// deleted yet, so Cleanup can let those deletes reach the server before
+	// it closes the connection.
+	streams sync.WaitGroup
 }
 
 // messageEventPayload is the JSON structure sent inside the "data:" field of
