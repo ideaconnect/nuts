@@ -641,7 +641,7 @@ func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot)
 		// park the consumer until the stream reached it, silently skipping
 		// everything before.
 		plan.Replay = h.fallbackReplayPlan(plan.Replay, "cursor ahead of stream")
-	case snapshot.FirstSeq > 0 && plan.Replay.StartSequence < snapshot.FirstSeq:
+	case plan.Replay.StartSequence < snapshot.FirstSeq:
 		// The server itself clamps a start below retention to FirstSeq and
 		// returns no error, so this branch exists to apply replay_window and
 		// to log and count the fallback, not to avoid a failed subscribe.
