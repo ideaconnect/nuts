@@ -339,34 +339,23 @@ per connection, proven with the Phase 2 kit.
 [#85], [#53] and [#54] were closed by the migration, and [#120] is covered by
 the pull prefetch bound.
 
-- [ ] **[#99] Consumer-sequence continuity check.** *major · M*
-  - [ ] Check continuity in the callback, before the wildcard filter. On a
-    gap, stop enqueueing and end the stream with
-    `disconnect_reason=delivery_gap` before writing anything past the gap.
-  - [ ] Add a metric and a proxy test.
-- [ ] **[#100] Backpressure instead of disconnect.** *major · L* (D5)
-  - [ ] Block the callback while the writer is making progress. A client is
-    slow only after no progress for `dispatch_timeout` (non-zero default).
-  - [ ] Enable `nats.EnableFlowControl()`. On a slow signal, flush the frames
-    already queued before closing.
-  - [ ] Tests:
-    - a 3000-message backlog replays on one connection;
-    - a 1000-message live burst causes no disconnect;
-    - a stalled reader is still disconnected.
-- [ ] **[#120] Bounded memory per connection.** *major · M*
-  - [ ] Enforce `max_event_size` at enqueue.
-  - [ ] Call `sub.SetPendingLimits(...)` with values derived from
-    `client_buffer_size` and `max_event_size`.
-  - [ ] Drop immediately once a slow signal is pending.
-  - [ ] Memory test with a stalled client. Fix the formula in
-    `docs/PERFORMANCE.md` and README.
-- [ ] **[#85] No indefinite parking.** *minor · S*
-  - [ ] Verify with the new defaults, using the release-path tests from [#126].
-- [ ] **[#53] + [#54] M9 Batch B.** *major · L*
-  - [ ] Implement as specified in the issues.
-  - [ ] Act only when `nc.Status() == CONNECTED`.
-  - [ ] Send a jittered `retry:` on disconnect.
-  - [ ] Add alerts (see [#86]).
+Not taken, so the push-path items were not needed; where each concern ended
+up:
+
+- ~~[#99] Consumer-sequence continuity check.~~ Ordered consumers resume after
+  the last delivered message (`TestDeliveryContract_NATSLinkLossLeavesNoHole`,
+  `TestDeliveryContract_NATSRestartLeavesNoHole`).
+- ~~[#100] Backpressure instead of disconnect.~~ Pulling stops while the writer
+  is busy; the backlog, burst and stalled-reader tests pass.
+- ~~[#120] Bounded memory per connection.~~ The prefetch and the hand-off bound
+  it: at most `client_buffer_size` messages plus 18 frames, pinned by
+  `TestPerformance_StalledClientHoldsABoundedBacklog`; the formula in
+  `docs/PERFORMANCE.md` and README is corrected.
+- ~~[#85] No indefinite parking.~~ No callback left to park; `write_timeout`
+  defaults to 30 s.
+- ~~[#53] + [#54] M9 Batch B.~~ No subscription registry to route errors
+  through; a deleted consumer is recreated
+  (`TestHandler_ConsumerDeletedMidStream_RecreatesAndResumes`).
 
 **Both paths:**
 
@@ -381,10 +370,12 @@ the pull prefetch bound.
   - [x] ~~Attribute slow-consumer errors to the stream and topics.~~ Not
     applicable: bounded pull requests keep nats.go's subscription buffers
     from overflowing, and ordered consumers recover what they miss.
-- [ ] **Godog scenarios.**
-  - [ ] A NATS restart mid-stream still produces contiguous ids.
-  - [ ] A backlog replays on one connection.
-  - [ ] A burst causes no `slow_client`.
+- [x] **Godog scenarios.**
+  - [x] A NATS restart mid-stream still produces contiguous ids, with and
+    without `shared_subscriptions` (the step restarts the stack's NATS
+    container).
+  - [x] A backlog replays on one connection.
+  - [x] A burst causes no `slow_client`.
 
 ## Phase 5: NATS server compatibility (2.14.7 / 2.15)
 
@@ -493,9 +484,10 @@ documented budgets that hold.
 - [x] **[#124] Allocation-free subject matcher.** *minor · S*
   - [x] Walk the tokens without `strings.Split`.
   - [x] Fuzz-test equivalence against the old matcher (after [#61]).
-- [ ] **Re-measure performance.**
-  - [ ] Update the `docs/PERFORMANCE.md` budgets and the per-connection memory
-    formula, backed by a test.
+- [x] **Re-measure performance.**
+  - [x] Update the `docs/PERFORMANCE.md` budgets and the per-connection memory
+    formula, backed by a test (`TestPerformance_StalledClientHoldsABoundedBacklog`;
+    benchmarks re-run, figures unchanged).
 
 ## Phase 7: Control path and configuration hardening (parallelisable)
 

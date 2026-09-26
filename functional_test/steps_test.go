@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
@@ -332,9 +333,19 @@ func theStreamExistsWithSubjectsAndAtMostConsumers(streamName, subjects string, 
 	return createStream(streamName, subjects, maxConsumers)
 }
 
-// createStream recreates the stream from scratch. maxConsumers 0 leaves the
-// server's default consumer limit in place.
+// theStreamExistsOnDiskWithSubjects recreates the stream with file storage,
+// for scenarios whose messages must outlive a NATS restart.
+func theStreamExistsOnDiskWithSubjects(streamName, subjects string) error {
+	return createStoredStream(streamName, subjects, 0, nats.FileStorage)
+}
+
+// createStream recreates the stream from scratch, in memory. maxConsumers 0
+// leaves the server's default consumer limit in place.
 func createStream(streamName, subjects string, maxConsumers int) error {
+	return createStoredStream(streamName, subjects, maxConsumers, nats.MemoryStorage)
+}
+
+func createStoredStream(streamName, subjects string, maxConsumers int, storage nats.StorageType) error {
 	if err := deleteStreamIfExists(streamName); err != nil {
 		return err
 	}
@@ -342,7 +353,7 @@ func createStream(streamName, subjects string, maxConsumers int) error {
 	_, err := tc.js.AddStream(&nats.StreamConfig{
 		Name:         streamName,
 		Subjects:     []string{subjects},
-		Storage:      nats.MemoryStorage,
+		Storage:      storage,
 		MaxMsgs:      10000,
 		MaxConsumers: maxConsumers,
 	})
@@ -1094,6 +1105,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^a NATS JetStream server is running$`, aNATSJetStreamServerIsRunning)
 	ctx.Step(`^the stream "([^"]*)" exists with subjects "([^"]*)"$`, theStreamExistsWithSubjects)
 	ctx.Step(`^the stream "([^"]*)" exists with subjects "([^"]*)" and at most (\d+) consumers?$`, theStreamExistsWithSubjectsAndAtMostConsumers)
+	ctx.Step(`^the stream "([^"]*)" exists on disk with subjects "([^"]*)"$`, theStreamExistsOnDiskWithSubjects)
 
 	// Given steps
 	ctx.Step(`^I am connected to SSE endpoint "([^"]*)"$`, iAmConnectedToSSEEndpoint)
@@ -1130,7 +1142,10 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the SSE stream should still be open$`, theSSEStreamShouldStillBeOpen)
 	ctx.Step(`^I note the value of metric '([^']*)'$`, iNoteTheValueOfMetric)
 	ctx.Step(`^the metric '([^']*)' should have increased$`, theMetricShouldHaveIncreased)
+	ctx.Step(`^the metric '([^']*)' should not have changed$`, theMetricShouldNotHaveChanged)
 	ctx.Step(`^I publish (\d+) messages to subject "([^"]*)"$`, iPublishNMessagesToSubject)
+	ctx.Step(`^I publish (\d+) messages to subject "([^"]*)" at once$`, iPublishNMessagesToSubjectAtOnce)
+	ctx.Step(`^NATS restarts$`, natsRestarts)
 	ctx.Step(`^the stream "([^"]*)" should have (\d+) consumers? for subject "([^"]*)"$`, theStreamShouldHaveConsumersForSubject)
 	ctx.Step(`^the received message event ids should be contiguous$`, theReceivedMessageEventIDsShouldBeContiguous)
 
@@ -1233,6 +1248,64 @@ func theMetricShouldHaveIncreased(series string) error {
 		}
 		return value > before, fmt.Sprintf("%s = %v, noted %v", series, value, before)
 	})
+}
+
+// theMetricShouldNotHaveChanged compares a series with its noted value.
+func theMetricShouldNotHaveChanged(series string) error {
+	before, ok := tc.notedMetrics[series]
+	if !ok {
+		return fmt.Errorf("metric %s was not noted", series)
+	}
+	value, err := metricValue(series)
+	if err != nil {
+		return err
+	}
+	if value != before {
+		return fmt.Errorf("%s = %v, noted %v", series, value, before)
+	}
+	return nil
+}
+
+// natsRestarts restarts the stack's NATS container, then waits until
+// JetStream answers this suite again and NUTS reports ready. Both clients
+// reconnect by themselves.
+func natsRestarts() error {
+	container := getEnvOrDefault("TEST_NATS_CONTAINER", "nuts-nats")
+	if out, err := exec.Command("docker", "restart", container).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker restart %s: %v: %s", container, err, strings.TrimSpace(string(out)))
+	}
+	if err := waitUntil("JetStream after the NATS restart", 3*functionalWaitTimeout, func() (bool, string) {
+		if _, err := tc.js.AccountInfo(); err != nil {
+			return false, err.Error()
+		}
+		return true, ""
+	}); err != nil {
+		return err
+	}
+	return waitUntil("NUTS ready after the NATS restart", 3*functionalWaitTimeout, func() (bool, string) {
+		resp, err := http.Get(tc.baseURL + "/events/readyz")
+		if err != nil {
+			return false, err.Error()
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK, fmt.Sprintf("readyz answered %d", resp.StatusCode)
+	})
+}
+
+// iPublishNMessagesToSubjectAtOnce publishes without waiting for each ack,
+// so the messages reach the stream as one burst.
+func iPublishNMessagesToSubjectAtOnce(count int, subject string) error {
+	for i := 1; i <= count; i++ {
+		if _, err := tc.js.PublishAsync(subject, []byte(fmt.Sprintf(`{"n":%d}`, i))); err != nil {
+			return fmt.Errorf("publish %d: %w", i, err)
+		}
+	}
+	select {
+	case <-tc.js.PublishAsyncComplete():
+		return nil
+	case <-time.After(functionalWaitTimeout):
+		return fmt.Errorf("%d async publishes not acknowledged", tc.js.PublishAsyncPending())
+	}
 }
 
 func iPublishNMessagesToSubject(count int, subject string) error {

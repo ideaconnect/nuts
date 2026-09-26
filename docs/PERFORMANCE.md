@@ -37,6 +37,7 @@ make test-performance
 | Large payload memory | Repeated 64 KiB payload formatting retains less than 32 MiB of extra heap after GC, and the payload survives formatting | `TestPerformance_MemoryGrowthLargePayloadFormattingWithinBudget` |
 | Replay memory | Large retained replay scenarios grow heap by less than 32 MiB during the CI-sized run | `TestPerformance_ReplayLoadWithAndWithoutFallbackCaps` |
 | Shared fan-out | With `shared_subscriptions`, 300 connections receive a burst of 4 × 64 KiB messages within 2 seconds through one consumer, without a NATS reconnect | `TestPerformance_SharedFanOutBurst` |
+| Stalled client | A client that stops reading while 100 × 65 KiB messages are published holds at most `client_buffer_size` prefetched messages plus 18 frames, and its consumer stops pulling; with `shared_subscriptions` no consumer pulls for it until it reads again. Once it reads, all 100 arrive in order | `TestPerformance_StalledClientHoldsABoundedBacklog` |
 
 The delivery contract tests (`delivery_contract_test.go`) add correctness
 budgets under load: a 3000-message backlog replays on one connection at the
@@ -60,19 +61,31 @@ Use these as release gates before increasing traffic or connection limits:
   browser count. The CI budget is deliberately looser because it uses an
   embedded NATS server and shared test runner resources.
 - **Memory per connection:** each connection holds at most
-  `client_buffer_size` messages prefetched from JetStream, plus up to 17
-  formatted frames on their way to the client (the feed hands up to 16 ahead
-  to the writer, which batches them):
-  `client_buffer_size * M + 17 * F + 256 KiB connection overhead`, where `M`
-  is the largest message the stream accepts (its `max_msg_size`, or the
-  server's `max_payload`, 1 MiB by default) and `F` is the largest formatted
-  frame (at most `max_event_size`). With `shared_subscriptions`, frames are
-  shared between the connections of a topic set, so the second term is paid
-  once per shared subscription rather than per connection.
-  Prefetched messages are raw JetStream messages, so `max_event_size` does not
-  bound them: an oversized message is dropped only after it was pulled.
-  Across an instance, keep `max_connections` × that figure below 70% of the
-  container or VM memory limit.
+  `client_buffer_size` messages prefetched from JetStream, plus up to 18
+  formatted frames on their way to the client: one the feed holds, 16 handed
+  ahead to the writer, and the batch being written (a batch stops growing once
+  it passes 64 KiB, so it is a single frame when frames are that large):
+  `client_buffer_size × M + 18 × F + 64 KiB + 256 KiB connection overhead`,
+  where `M` is the largest message the stream accepts (its `max_msg_size`, or
+  the server's `max_payload`, 1 MiB by default) and `F` is the largest
+  formatted frame (at most `max_event_size`). A client that stops reading
+  reaches this bound and stays there: its consumer stops pulling until the
+  client reads again or `write_timeout` closes the stream
+  (`TestPerformance_StalledClientHoldsABoundedBacklog`). Prefetched messages
+  are raw JetStream messages, so `max_event_size` does not bound them: an
+  oversized message is dropped only after it was pulled. Set the stream's
+  `max_msg_size` to the largest message you publish, at most
+  `max_event_size`, so `M` is not the server's 1 MiB default.
+  With `shared_subscriptions`, connections that keep up share the frames of
+  their topic set: each shared subscription holds its own prefetch, the 18
+  frames on their way, and up to 1024 recent frames (4 MiB) so that
+  connections can join it without a gap. A connection that stops reading
+  falls behind and holds the `client_buffer_size` frames queued for it plus
+  the 18 on their way; its own consumer starts only once it reads again.
+  Across an instance, keep `max_connections` × the per-connection figure below
+  70% of the container or VM memory limit. The production profile in
+  [DEPLOYMENT.md](DEPLOYMENT.md) (`client_buffer_size 8`, `max_event_size`
+  and `max_msg_size` 64 KiB) needs at most about 2 MiB per connection.
 - **Maximum sustainable clients per instance:** the default production target
   is 1,000 concurrent light-traffic SSE clients per instance when messages are
   at most 64 KiB and `client_buffer_size` is at most 8, and the memory formula

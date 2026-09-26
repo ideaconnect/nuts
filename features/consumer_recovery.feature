@@ -23,3 +23,23 @@ Feature: JetStream consumer recovery
     And the SSE stream should still be open
     And the received message event ids should be contiguous
     And the metric 'nuts_consumer_invalidated_total{reason="recreated"}' should have increased
+
+  # A restarted server has forgotten every consumer: NUTS' ordered consumers
+  # keep their state in the server's memory. Each stream recreates its
+  # consumer after the last message it delivered; on disk, the messages
+  # outlive the restart.
+  Scenario Outline: An SSE stream survives a NATS restart without a hole
+    Given the stream "EVENTS" exists on disk with subjects "events.>"
+    And I am connected to SSE endpoint "<endpoint>"
+    When I publish 3 messages to subject "events.restart"
+    Then I should have received 3 SSE message events
+    When NATS restarts
+    And I publish 3 messages to subject "events.restart"
+    Then I should have received 6 SSE message events
+    And the received message event ids should be contiguous
+    And the SSE stream should still be open
+
+    Examples:
+      | endpoint              |
+      | /events?topic=restart |
+      | /shared?topic=restart |

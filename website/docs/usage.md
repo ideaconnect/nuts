@@ -334,6 +334,8 @@ nats stream add EVENTS \
 | `--max-msgs` | `10000` | Maximum messages to keep |
 | `--max-age` | `24h` | Maximum age of messages |
 | `--discard` | `old` | Discard oldest when limit reached |
+| `--max-consumers` | Peak concurrent SSE connections across all NUTS instances | Each SSE connection holds one consumer; nats-server 2.15 allows 1000 per stream unless this is set |
+| `--max-msg-size` | Your largest message, at most `max_event_size` | Bounds the messages each connection prefetches; a producer that exceeds it gets an error instead of a message NUTS would drop |
 
 ## Client-Side Usage
 

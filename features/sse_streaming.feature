@@ -62,6 +62,18 @@ Feature: SSE Streaming with JetStream
     And the received message event ids should be contiguous
     And the SSE stream should still be open
 
+  Scenario: A burst larger than the prefetch reaches a live client without a slow-client disconnect
+    # 500 messages arrive at once, far more than client_buffer_size (64): the
+    # stream stops pulling while the client catches up instead of dropping
+    # the client.
+    Given I am connected to SSE endpoint "/events?topic=burst"
+    And I note the value of metric 'nuts_slow_client_disconnects_total'
+    When I publish 500 messages to subject "events.burst" at once
+    Then I should have received 500 SSE message events
+    And the received message event ids should be contiguous
+    And the SSE stream should still be open
+    And the metric 'nuts_slow_client_disconnects_total' should not have changed
+
   Scenario: Path-based topic subscription
     Given I am connected to SSE endpoint "/mypath"
     When I publish message '{"path": "based"}' to subject "events.mypath"

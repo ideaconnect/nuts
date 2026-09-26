@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -193,6 +194,162 @@ func TestPerformance_MemoryGrowthLargePayloadFormattingWithinBudget(t *testing.T
 	if growth > performanceMemoryGrowthBudgetBytes {
 		t.Fatalf("large payload formatting heap growth = %d bytes, budget %d", growth, performanceMemoryGrowthBudgetBytes)
 	}
+}
+
+// TestPerformance_StalledClientHoldsABoundedBacklog pins the per-connection
+// memory bound (#120). A client that stops reading holds at most
+// client_buffer_size messages prefetched from JetStream and the frames on
+// their way to it: one the feed holds, feedHandoffFrames handed to the
+// writer, and the batch being written (one frame, as these frames are larger
+// than a batch). Then the consumer stops pulling, however much is published.
+// With shared subscriptions the client falls behind instead, holding its
+// queue; its own consumer starts only once it reads again. Either way,
+// nothing is lost once it does.
+func TestPerformance_StalledClientHoldsABoundedBacklog(t *testing.T) {
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		const bufferSize, published = 8, 100
+		// The frames on their way to a stalled client, as docs/PERFORMANCE.md
+		// counts them: 1 in the feed, 16 handed to the writer, 1 being written.
+		const pipelineFrames = 18
+		h, nc := provisionOnStream(t, jetstream.StreamConfig{Name: "EVENTS", Subjects: []string{"events.>"}, Storage: jetstream.MemoryStorage}, func(h *Handler) {
+			h.ClientBufferSize = bufferSize
+			h.MaxEventSize = 70 << 10
+			h.WriteTimeout = 60 // longer than the test: the client stays stalled
+			mode(h)
+		})
+		admin := mustJetStream(t, nc)
+
+		stalled := &gatedFlushLog{flushLog: newFlushLog(), allow: 1, gate: make(chan struct{})}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=stall", nil).WithContext(ctx)
+		done := make(chan error, 1)
+		go func() { done <- h.ServeHTTP(stalled, req, nil) }()
+		released := false
+		defer func() {
+			if !released {
+				close(stalled.gate)
+			}
+			cancel()
+			<-done
+		}()
+		if !stalled.waitFor("event: connected", 3*time.Second) {
+			t.Fatalf("stalled client never connected; flushed %q", stalled.written())
+		}
+
+		js, _ := nc.JetStream()
+		blob := strings.Repeat("x", 65<<10) // each frame outgrows a 64 KiB batch
+		for i := 1; i <= published; i++ {
+			if _, err := js.PublishAsync("events.stall", []byte(`{"n":`+strconv.Itoa(i)+`,"blob":"`+blob+`"}`)); err != nil {
+				t.Fatalf("publish %d: %v", i, err)
+			}
+		}
+		select {
+		case <-js.PublishAsyncComplete():
+		case <-time.After(10 * time.Second):
+			t.Fatal("publishes not acknowledged")
+		}
+
+		consumers, delivered := settledConsumers(t, admin, "EVENTS")
+		t.Logf("stalled client: %d consumers, %d messages delivered, bound %d", consumers, delivered, bufferSize+pipelineFrames)
+		if h.SharedSubscriptions {
+			// The shared consumer closed with its only client gone, and the
+			// client's own consumer waits for it to read again.
+			if consumers != 0 {
+				t.Fatalf("%d consumers pulling for a stalled client, want none", consumers)
+			}
+		} else if consumers != 1 || delivered <= pipelineFrames || delivered > bufferSize+pipelineFrames {
+			t.Fatalf("stalled client: %d consumers, %d messages delivered; want 1 consumer with more than %d and at most %d",
+				consumers, delivered, pipelineFrames, bufferSize+pipelineFrames)
+		}
+
+		released = true
+		close(stalled.gate)
+		if !stalled.waitFor(`{"n":`+strconv.Itoa(published)+`,`, 10*time.Second) {
+			t.Fatalf("the client never caught up; ids=%v", lastN(parseSSEIDs(t, stalled.written()), 5))
+		}
+		// The write that stalled carried a single frame: a batch stops growing
+		// once it passes 64 KiB, which one of these frames does.
+		if batches := stalled.batches(); len(batches) < 2 || strings.Count(batches[1], "event: message") != 1 {
+			t.Fatalf("the stalled write carried %d frames, want 1", strings.Count(batches[1], "event: message"))
+		}
+		ids := parseSSEIDs(t, stalled.written())
+		if len(ids) == 0 || ids[0] != 0 {
+			t.Fatalf("ids start %v, want the connected cursor first", head(ids, 3))
+		}
+		assertContiguousIDs(t, ids[1:], 1, published)
+	})
+}
+
+// gatedFlushLog is a flushLog whose writes after the first allow block until
+// gate is closed: a client that stopped reading, whose flushes still show how
+// the writer batched what it held.
+type gatedFlushLog struct {
+	*flushLog
+	allow int32
+	gate  chan struct{}
+	n     atomic.Int32
+}
+
+func (g *gatedFlushLog) Write(p []byte) (int, error) {
+	if g.n.Add(1) > g.allow {
+		<-g.gate
+	}
+	return g.flushLog.Write(p)
+}
+
+// written is everything flushed so far.
+func (g *gatedFlushLog) written() string { return strings.Join(g.batches(), "") }
+
+// waitFor polls until needle has been flushed or timeout passes.
+func (g *gatedFlushLog) waitFor(needle string, timeout time.Duration) bool {
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if strings.Contains(g.written(), needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// settledConsumers waits until the stream's consumers stop changing, then
+// reports how many there are and how many messages the server delivered to
+// them. Only a quiet window can show that nothing more is pulled.
+func settledConsumers(t *testing.T, js jetstream.JetStream, stream string) (int, uint64) {
+	t.Helper()
+	read := func() (int, uint64) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		s, err := js.Stream(ctx, stream)
+		if err != nil {
+			t.Fatalf("stream: %v", err)
+		}
+		count, delivered := 0, uint64(0)
+		lister := s.ListConsumers(ctx)
+		for info := range lister.Info() {
+			count++
+			delivered += info.Delivered.Consumer
+		}
+		if err := lister.Err(); err != nil {
+			t.Fatalf("list consumers: %v", err)
+		}
+		return count, delivered
+	}
+	const quiet = 500 * time.Millisecond
+	count, delivered := read()
+	since := time.Now()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(50 * time.Millisecond)
+		c, d := read()
+		if c != count || d != delivered {
+			count, delivered, since = c, d, time.Now()
+			continue
+		}
+		if time.Since(since) >= quiet {
+			return count, delivered
+		}
+	}
+	t.Fatalf("consumers still changing after 10 s: %d consumers, %d delivered", count, delivered)
+	return 0, 0
 }
 
 func runReplayLoadScenario(t *testing.T, replayMaxMessages int) (int, time.Duration, uint64) {

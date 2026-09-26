@@ -12,6 +12,14 @@ NUTS replica counts against the same limit. The stream definitions below set
 `--max-consumers 10000`; size it for peak concurrent connections across all
 replicas (at least `max_connections` × replicas).
 
+They also set `--max-msg-size 65536`, matching `max_event_size 65536` in the
+NUTS configuration. Each connection prefetches up to `client_buffer_size`
+raw messages, which only the stream's message size limit bounds (the server's
+`max_payload`, 1 MiB, otherwise); with it, this profile needs at most about
+2 MiB per connection (see [PERFORMANCE.md](PERFORMANCE.md)). A producer that
+publishes a larger message gets an error instead of a message NUTS would
+drop.
+
 ## Production Compose
 
 `compose.yaml`:
@@ -43,6 +51,7 @@ services:
         nats -s nats://nats:4222 stream add EVENTS \
           --subjects "events.>" \
           --max-consumers 10000 \
+          --max-msg-size 65536 \
           --storage file \
           --retention limits \
           --max-msgs 100000 \

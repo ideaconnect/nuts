@@ -331,17 +331,16 @@ func provisionOnStream(t *testing.T, cfg jetstream.StreamConfig, configure func(
 }
 
 // newContractServer provisions a handler against natsURL and serves it over
-// real HTTP.
+// real HTTP. The handler logs nowhere unless configure sets a logger.
 func newContractServer(t *testing.T, natsURL string, configure func(*Handler)) (*Handler, *httptest.Server) {
 	t.Helper()
-	h := &Handler{NatsURL: natsURL, StreamName: "EVENTS", TopicPrefix: "events.", ReconnectWait: 1, MaxReconnects: intPtr(-1)}
+	h := &Handler{NatsURL: natsURL, StreamName: "EVENTS", TopicPrefix: "events.", ReconnectWait: 1, MaxReconnects: intPtr(-1), logger: zap.NewNop()}
 	if configure != nil {
 		configure(h)
 	}
 	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	h.logger = zap.NewNop()
 	t.Cleanup(func() { _ = h.Cleanup() })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = h.ServeHTTP(w, r, nil) }))
 	t.Cleanup(srv.Close)

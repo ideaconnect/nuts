@@ -69,6 +69,48 @@ func TestDeliveryContract_NATSLinkLossLeavesNoHole(t *testing.T) {
 	})
 }
 
+// TestDeliveryContract_NATSRestartLeavesNoHole: a restarted NATS server has
+// forgotten NUTS' ordered consumers, which only live in its memory. Each
+// stream recreates its consumer after the last message it delivered, so it
+// goes on without a hole or a repeat, and the client never reconnects.
+func TestDeliveryContract_NATSRestartLeavesNoHole(t *testing.T) {
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns, restart := startRestartableJetStreamServer(t)
+		nc, err := nats.Connect(ns.ClientURL(), nats.MaxReconnects(-1), nats.ReconnectWait(100*time.Millisecond))
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(nc.Close)
+		// On disk, so the messages outlive the restart.
+		if _, err := mustJetStream(t, nc).CreateStream(context.Background(), jetstream.StreamConfig{
+			Name: "EVENTS", Subjects: []string{"events.>"}, Storage: jetstream.FileStorage,
+		}); err != nil {
+			t.Fatalf("CreateStream: %v", err)
+		}
+		js, _ := nc.JetStream()
+		h, srv := newContractServer(t, ns.ClientURL(), mode)
+
+		stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
+		if connected := stream.collectIDs(1, 3*time.Second); len(connected) != 1 || connected[0] != 0 {
+			t.Fatalf("connected id = %v, want [0]", connected)
+		}
+		publishRange(t, js, "events.alpha", 1, 3)
+		assertContiguousIDs(t, stream.collectIDs(3, 3*time.Second), 1, 3)
+
+		ns.Shutdown()
+		restart()
+		waitForNATSReconnect(t, h)
+		publishRange(t, js, "events.alpha", 4, 6)
+
+		assertContiguousIDs(t, stream.collectIDs(3, 15*time.Second), 4, 6)
+		select {
+		case <-stream.closed:
+			t.Fatal("stream closed; the client would have had to reconnect")
+		default:
+		}
+	})
+}
+
 // TestDeliveryContract_LinkLossBeforeFirstMessageNeitherReplaysNorSkips: an
 // ordered consumer that resets before delivering anything re-applies its
 // original deliver policy. With DeliverNew that skipped everything published

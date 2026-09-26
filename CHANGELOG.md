@@ -102,8 +102,13 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   sign of a client that stopped reading, so it needs a bound by default. `0`
   or omitted now means the default; `-1` disables the deadline (#85).
 - **Breaking: `client_buffer_size` is the per-connection prefetch** from
-  JetStream (default 64). It bounds per-connection memory at roughly
-  `client_buffer_size` × the largest message.
+  JetStream (default 64). A connection holds at most that many messages plus
+  18 formatted frames on their way to the client; one that stops reading
+  reaches this and its stream stops pulling (#120). Before, a stalled client
+  could pin `client_buffer_size` raw messages plus up to 64 MiB in nats.go.
+  Prefetched messages are bounded by the stream's `max_msg_size`, which the
+  deployment examples now set to match `max_event_size`; the formula is in
+  `docs/PERFORMANCE.md`.
 - **Breaking: nats-server 2.10 or newer is required.** The pre-2.10
   multi-topic fallback (subscribe to a common wildcard and filter in NUTS) is
   removed, along with the server-version sniffing that chose it. Multi-topic

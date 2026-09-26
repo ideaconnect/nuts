@@ -59,12 +59,14 @@ flowchart LR
   and then waits for the writer, and the iterator pulls more only as its
   prefetch drains. A slow client therefore slows its own consumer; the backlog
   waits in JetStream, not in NUTS memory. Per-connection memory is bounded by
-  `client_buffer_size` prefetched messages plus the handed-off frames.
+  `client_buffer_size` prefetched messages plus 18 frames on their way: one
+  in the feed, 16 handed off and the batch being written (formula in
+  [PERFORMANCE.md](PERFORMANCE.md)).
 - **Batching.** The writer takes a frame and whatever frames are already
-  waiting, up to 32 frames or 64 KiB, writes them and flushes once, under one
-  write deadline. A batch only holds frames that are already there, so it adds
-  no latency; it saves a flush and a syscall per frame during bursts and
-  replays.
+  waiting, until it holds 32 frames or passes 64 KiB, writes them and flushes
+  once, under one write deadline. A batch only holds frames that are already
+  there, so it adds no latency; it saves a flush and a syscall per frame
+  during bursts and replays.
 - **Slow clients.** A client that stops reading is detected when a write
   misses `write_timeout` (30 s by default). The stream closes with
   `disconnect_reason=slow_client` and the client resumes from its last event

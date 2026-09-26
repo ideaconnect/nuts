@@ -465,16 +465,18 @@ failed / readiness probe degraded), so client-side circuit breakers can keep
 retrying rather than opening the circuit on a healthy backend.
 
 **Sizing memory.** Each connection holds at most `client_buffer_size`
-messages prefetched from JetStream, plus up to 17 formatted frames handed to
-its writer (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md)). Prefetched
-messages are raw NATS messages, so their size is bounded by the NATS server's
-`max_payload` (1 MiB by default), not by `max_event_size`: oversized ones are
-dropped only once they are read. The worst case is therefore about
-`max_connections × client_buffer_size × max_payload`. With defaults that is
-64 MiB per connection; the production profile in
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (`client_buffer_size 8`, 64 KiB
-payloads) needs about 0.5 MiB. A slow client never grows this: the stream
-stops pulling instead.
+messages prefetched from JetStream, plus up to 18 formatted frames on their
+way to the client. A client that stops reading reaches that bound and stays
+there: its stream stops pulling until it reads again or `write_timeout`
+closes it. Prefetched messages are raw NATS messages, bounded by the stream's
+`max_msg_size` or the NATS server's `max_payload` (1 MiB by default), not by
+`max_event_size`: oversized ones are dropped only once they are read. Frames
+are bounded by `max_event_size`. With defaults and 1 MiB messages a
+connection can hold about 82 MiB (64 prefetched messages and 18 frames of
+1 MiB); the production profile in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+(`client_buffer_size 8`, `max_event_size` and the stream's `max_msg_size`
+64 KiB) about 2 MiB. [docs/PERFORMANCE.md](docs/PERFORMANCE.md) has the exact
+formula, including `shared_subscriptions`.
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for latency, memory, and
 per-instance client-count budgets plus the load and benchmark commands used to
@@ -967,6 +969,7 @@ nats stream add
 | `--max-age` | `24h` | Maximum age of messages |
 | `--discard` | `old` | Discard oldest messages when limit reached |
 | `--max-consumers` | Peak concurrent SSE connections across all NUTS instances | Each SSE connection holds one consumer. nats-server 2.15 allows 1000 per stream unless this is set |
+| `--max-msg-size` | Your largest message, at most `max_event_size` | Bounds the messages each connection prefetches (see [Sizing memory](#max_connections)); a producer that exceeds it gets an error instead of a message NUTS would drop |
 
 ### Example Streams
 
