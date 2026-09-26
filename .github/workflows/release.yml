@@ -22,7 +22,42 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A tag must not publish archives unless CI passed for the same commit.
+  # v0.4.2 published archives while CI was red on govulncheck, and CI's
+  # docker jobs (needs: test) never pushed its image.
+  ci-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for CI on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          for attempt in $(seq 1 170); do
+            run=$(gh run list --repo "$REPO" --workflow ci.yml --commit "$SHA" --event push \
+              --limit 1 --json status,conclusion,url --jq '.[0] // empty')
+            if [ -n "$run" ]; then
+              status=$(echo "$run" | jq -r .status)
+              conclusion=$(echo "$run" | jq -r .conclusion)
+              if [ "$status" = "completed" ]; then
+                echo "CI for $SHA completed: $conclusion ($(echo "$run" | jq -r .url))"
+                [ "$conclusion" = "success" ] && exit 0
+                exit 1
+              fi
+            fi
+            echo "Waiting for CI on $SHA (attempt $attempt/170)..."
+            sleep 30
+          done
+          echo "Timed out waiting for CI on $SHA"
+          exit 1
+
   goreleaser:
+    needs: ci-gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

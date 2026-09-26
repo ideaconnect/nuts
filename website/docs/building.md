@@ -15,7 +15,7 @@ Pick whichever matches your environment — they all serve the same SSE endpoint
 
 ## Prerequisites
 
-- **Go 1.26.4+** — only needed if you build the binary yourself ([download](https://go.dev/dl/))
+- **Go 1.26.8+** — only needed if you build the binary yourself ([download](https://go.dev/dl/))
 - **[xcaddy](https://github.com/caddyserver/xcaddy)** — recommended for binary builds
 - **Docker** _(optional)_ — for image / Compose-based runs and the BDD test stack
 - **[NATS CLI](https://github.com/nats-io/natscli)** _(optional)_ — useful for stream management and manual testing

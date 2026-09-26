@@ -64,7 +64,9 @@ jobs:
       - name: Run govulncheck
         # Pinned to match the rest of CI (golangci-lint, trivy, action SHAs).
         # Bump in lockstep with Renovate/Dependabot updates.
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        # -test also scans test-only dependencies (the embedded nats-server),
+        # which ./... alone never reports.
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 -test ./...
 
       - name: Run functional test matrix
         env:

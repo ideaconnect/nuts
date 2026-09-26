@@ -164,7 +164,7 @@ applied — never hard-code root-absolute paths. Deeper conventions are in
 
 ## Coding conventions
 
-- **Go version:** match `go.mod` (Go 1.26.4 at time of writing). Don't bump
+- **Go version:** match `go.mod` (Go 1.26.8 at time of writing). Don't bump
   the toolchain unless asked.
 - **Style:** `gofmt -s -w .`; `make lint` must pass; no new `//nolint`
   directives without a one-line justification on the same line.
