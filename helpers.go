@@ -2,6 +2,7 @@
 package nuts
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -132,6 +133,13 @@ func writeJSONString(b *strings.Builder, s string) {
 	b.WriteByte('"')
 }
 
+// lineSeparatorTail and paragraphSeparatorTail follow the 0xE2 lead byte in
+// the UTF-8 encodings of U+2028 and U+2029, which json.Marshal escapes.
+var (
+	lineSeparatorTail      = []byte{0x80, 0xa8}
+	paragraphSeparatorTail = []byte{0x80, 0xa9}
+)
+
 // writeJSONPayload writes a message payload into the frame's JSON envelope as
 // json.Marshal would: valid JSON compacted and HTML-escaped as for a
 // json.RawMessage, anything else as a JSON string. Valid JSON is copied in
@@ -168,7 +176,7 @@ func writeJSONPayload(b *strings.Builder, data []byte) {
 			b.WriteByte(hex[c>>4])
 			b.WriteByte(hex[c&0xf])
 			start = i + 1
-		case c == 0xe2 && i+2 < len(data) && data[i+1] == 0x80 && data[i+2]&^1 == 0xa8:
+		case c == 0xe2 && (bytes.HasPrefix(data[i+1:], lineSeparatorTail) || bytes.HasPrefix(data[i+1:], paragraphSeparatorTail)):
 			b.Write(data[start:i])
 			b.WriteString(`\u202`)
 			b.WriteByte(hex[data[i+2]&0xf])
