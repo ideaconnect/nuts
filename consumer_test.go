@@ -78,8 +78,8 @@ func TestStreamFeed_DropsOversizedPayloadsBeforeTheWriter(t *testing.T) {
 }
 
 // TestStreamFeed_StopsPullingWhileTheWriterIsBusy is the backpressure
-// contract: with the writer not reading, the feed holds one frame in the
-// hand-off, one in hand, and does not keep pulling from JetStream.
+// contract: with the writer not reading, the feed fills the hand-off, holds
+// one more frame in hand, and stops pulling from JetStream.
 func TestStreamFeed_StopsPullingWhileTheWriterIsBusy(t *testing.T) {
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	it := newFakeIterator(100)
@@ -90,8 +90,8 @@ func TestStreamFeed_StopsPullingWhileTheWriterIsBusy(t *testing.T) {
 	defer feed.stop()
 
 	time.Sleep(100 * time.Millisecond)
-	if got := it.nextCalls(); got > 2 {
-		t.Fatalf("feed pulled %d messages with nobody reading, want at most 2", got)
+	if got := it.nextCalls(); got != feedHandoffFrames+1 {
+		t.Fatalf("feed pulled %d messages with nobody reading, want %d (the hand-off plus one in hand)", got, feedHandoffFrames+1)
 	}
 	if got := receiveFrame(t, feed).StreamSequence; got != 1 {
 		t.Fatalf("first frame seq = %d, want 1", got)

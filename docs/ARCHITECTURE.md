@@ -51,15 +51,20 @@ flowchart LR
 flowchart LR
   js[JetStream consumer] -->|pull, up to client_buffer_size| it[Messages iterator]
   it -->|Next| feed[Feed goroutine: format, drop oversize and control messages]
-  feed -->|hand-off, capacity 1| writer[SSE writer: replay caps, write, flush]
+  feed -->|hand-off, up to 16 frames| writer[SSE writer: replay caps, batched writes, one flush per batch]
   writer -->|write_timeout per write| client[Client]
 ```
 
-- **Backpressure.** The feed goroutine takes the next message only after the
-  writer has taken the previous frame, and the iterator pulls more only as its
+- **Backpressure.** The feed goroutine hands up to 16 formatted frames ahead
+  and then waits for the writer, and the iterator pulls more only as its
   prefetch drains. A slow client therefore slows its own consumer; the backlog
   waits in JetStream, not in NUTS memory. Per-connection memory is bounded by
-  `client_buffer_size` prefetched messages plus the frames in hand.
+  `client_buffer_size` prefetched messages plus the handed-off frames.
+- **Batching.** The writer takes a frame and whatever frames are already
+  waiting, up to 32 frames or 64 KiB, writes them and flushes once, under one
+  write deadline. A batch only holds frames that are already there, so it adds
+  no latency; it saves a flush and a syscall per frame during bursts and
+  replays.
 - **Slow clients.** A client that stops reading is detected when a write
   misses `write_timeout` (30 s by default). The stream closes with
   `disconnect_reason=slow_client` and the client resumes from its last event

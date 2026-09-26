@@ -333,7 +333,7 @@ func (h *Handler) startHybridFeed(ctx context.Context, js jetstream.JetStream, p
 		js:       js,
 		plan:     plan,
 		capacity: h.clientBufferSize(),
-		frames:   make(chan formattedMessageEvent, 1),
+		frames:   make(chan formattedMessageEvent, feedHandoffFrames),
 		errs:     make(chan error, 1),
 		done:     make(chan struct{}),
 	}

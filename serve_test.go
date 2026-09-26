@@ -1400,3 +1400,80 @@ func TestHandler_OpenConsumerStream_RefusedOnceCleanupStarted(t *testing.T) {
 	}
 	h.waitForStreams(time.Second) // nothing was tracked, so this returns at once
 }
+
+func liveFrames(n int, size int) []formattedMessageEvent {
+	frames := make([]formattedMessageEvent, n)
+	for i := range frames {
+		frames[i] = formattedMessageEvent{
+			Frame:             fmt.Sprintf("id: %d\nevent: message\ndata: %s\n\n", i+1, strings.Repeat("x", size)),
+			HasStreamSequence: true,
+			StreamSequence:    uint64(i + 1),
+		}
+	}
+	return frames
+}
+
+// TestServeStream_BatchesQueuedFrames covers #121: frames already waiting
+// when the writer takes one are written with it and flushed together, in
+// batches of at most maxBatchFrames or maxBatchBytes.
+func TestServeStream_BatchesQueuedFrames(t *testing.T) {
+	h := &Handler{HeartbeatInterval: 60, logger: zap.NewNop()}
+	for _, c := range []struct {
+		name       string
+		frames     []formattedMessageEvent
+		wantFrames []int // frames per flush after the connected event
+	}{
+		{name: "everything queued fits one batch", frames: liveFrames(10, 10), wantFrames: []int{10}},
+		{name: "frame count bound", frames: liveFrames(maxBatchFrames+8, 10), wantFrames: []int{maxBatchFrames, 8}},
+		{name: "byte bound", frames: liveFrames(5, 40<<10), wantFrames: []int{2, 2, 1}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			deliveredBefore := counterVal(t, metricsMessagesDelivered)
+			w, _ := serveQueuedFrames(t, h, testFeedPlan, c.frames, len(c.wantFrames)+1)
+			batches := w.batches()[1:] // the connected event is flushed on its own
+			var got []int
+			for _, b := range batches {
+				got = append(got, strings.Count(b, "event: message"))
+			}
+			if !reflect.DeepEqual(got, c.wantFrames) {
+				t.Fatalf("frames per flush = %v, want %v", got, c.wantFrames)
+			}
+			if delivered := counterVal(t, metricsMessagesDelivered) - deliveredBefore; delivered != float64(len(c.frames)) {
+				t.Fatalf("messages_delivered_total moved by %v, want %d", delivered, len(c.frames))
+			}
+		})
+	}
+}
+
+// TestServeStream_OneDeadlinePerBatch: the write deadline is set once per
+// batch and cleared after its flush.
+func TestServeStream_OneDeadlinePerBatch(t *testing.T) {
+	h := &Handler{HeartbeatInterval: 60, WriteTimeout: 30, logger: zap.NewNop()}
+	w, _ := serveQueuedFrames(t, h, testFeedPlan, liveFrames(10, 10), 2)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// connected: set, clear; one batch: set, clear.
+	if len(w.deadlines) != 4 || w.deadlines[2].IsZero() || !w.deadlines[3].IsZero() {
+		t.Fatalf("deadlines = %v, want set/clear for the connected event and once for the batch", w.deadlines)
+	}
+}
+
+// TestServeStream_ReplayCapEndsTheBatch: when replay_max_messages is reached
+// inside a batch, the frames up to the cap are flushed and the stream ends.
+func TestServeStream_ReplayCapEndsTheBatch(t *testing.T) {
+	h := &Handler{HeartbeatInterval: 60, ReplayMaxMessages: 5, logger: zap.NewNop()}
+	plan := testFeedPlan
+	plan.Replay = replayPlan{Mode: replayModeStartSequence, HasLastID: true, HasSnapshot: true, StartSequence: 1, CapSequence: 100}
+	capBefore := counterVal(t, metricsReplayCapReached)
+	w, ended := serveQueuedFrames(t, h, plan, liveFrames(10, 10), 2)
+	if !ended {
+		t.Fatal("stream kept running after replay_max_messages")
+	}
+	batches := w.batches()
+	if len(batches) != 2 || strings.Count(batches[1], "event: message") != 5 || !strings.Contains(batches[1], "id: 5\n") {
+		t.Fatalf("flushes = %q, want the connected event and exactly messages 1..5", batches)
+	}
+	if got := counterVal(t, metricsReplayCapReached); got != capBefore+1 {
+		t.Fatalf("replay_cap_reached_total = %v, want %v", got, capBefore+1)
+	}
+}

@@ -217,22 +217,34 @@ func writeSSEChunk(w io.Writer, rc *http.ResponseController, chunk string) error
 }
 
 func writeSSEChunkWithTimeout(w http.ResponseWriter, rc *http.ResponseController, chunk string, timeout time.Duration) error {
-	if timeout <= 0 {
-		return writeSSEChunk(w, rc, chunk)
-	}
+	return writeSSEChunksWithTimeout(w, rc, timeout, chunk)
+}
 
-	if err := rc.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-		if !errors.Is(err, http.ErrNotSupported) {
+// writeSSEChunksWithTimeout writes frames and flushes them once, under one
+// write deadline when timeout is positive. The deadline is cleared again
+// afterwards: on HTTP/2 a deadline that expires while the stream is idle
+// resets it.
+func writeSSEChunksWithTimeout(w http.ResponseWriter, rc *http.ResponseController, timeout time.Duration, chunks ...string) error {
+	armed := false
+	if timeout > 0 {
+		err := rc.SetWriteDeadline(time.Now().Add(timeout))
+		if err != nil && !errors.Is(err, http.ErrNotSupported) {
 			return err
 		}
-		return writeSSEChunk(w, rc, chunk)
+		armed = err == nil
 	}
-
-	if err := writeSSEChunk(w, rc, chunk); err != nil {
+	for _, chunk := range chunks {
+		if _, err := io.WriteString(w, chunk); err != nil {
+			return err
+		}
+	}
+	if err := rc.Flush(); err != nil {
 		return err
 	}
-	if err := rc.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
-		return err
+	if armed {
+		if err := rc.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
 	}
 	return nil
 }

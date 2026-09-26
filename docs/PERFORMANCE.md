@@ -60,11 +60,15 @@ Use these as release gates before increasing traffic or connection limits:
   browser count. The CI budget is deliberately looser because it uses an
   embedded NATS server and shared test runner resources.
 - **Memory per connection:** each connection holds at most
-  `client_buffer_size` messages prefetched from JetStream, plus two formatted
-  frames on their way to the client:
-  `client_buffer_size * M + 2 * F + 256 KiB connection overhead`, where `M`
+  `client_buffer_size` messages prefetched from JetStream, plus up to 17
+  formatted frames on their way to the client (the feed hands up to 16 ahead
+  to the writer, which batches them):
+  `client_buffer_size * M + 17 * F + 256 KiB connection overhead`, where `M`
   is the largest message the stream accepts (its `max_msg_size`, or the
-  server's `max_payload`, 1 MiB by default) and `F` is `max_event_size`.
+  server's `max_payload`, 1 MiB by default) and `F` is the largest formatted
+  frame (at most `max_event_size`). With `shared_subscriptions`, frames are
+  shared between the connections of a topic set, so the second term is paid
+  once per shared subscription rather than per connection.
   Prefetched messages are raw JetStream messages, so `max_event_size` does not
   bound them: an oversized message is dropped only after it was pulled.
   Across an instance, keep `max_connections` × that figure below 70% of the

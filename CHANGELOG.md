@@ -135,6 +135,11 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
 - The example alert rules and Grafana dashboard cover the stream consumer
   limit, consumer recoveries, oversized drops by reason, write failures by
   site, NATS slow consumers and lame duck mode (#86).
+- Frames that are already waiting are written together and flushed once, up
+  to 32 frames or 64 KiB, with one write deadline per batch instead of one
+  per frame (#121). To let batches form, each connection's feed hands up to
+  16 formatted frames ahead to its writer. Catching up on a 3000-message
+  backlog now takes about half as long.
 - Message frames are built in one pass (#122): the payload is validated once
   and copied once into the frame, instead of being compacted, re-encoded by
   `json.Marshal` and copied three more times. A small JSON message takes

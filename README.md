@@ -465,7 +465,8 @@ failed / readiness probe degraded), so client-side circuit breakers can keep
 retrying rather than opening the circuit on a healthy backend.
 
 **Sizing memory.** Each connection holds at most `client_buffer_size`
-messages prefetched from JetStream, plus the frame being written. Prefetched
+messages prefetched from JetStream, plus up to 17 formatted frames handed to
+its writer (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md)). Prefetched
 messages are raw NATS messages, so their size is bounded by the NATS server's
 `max_payload` (1 MiB by default), not by `max_event_size`: oversized ones are
 dropped only once they are read. The worst case is therefore about

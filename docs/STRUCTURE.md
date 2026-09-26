@@ -47,7 +47,7 @@ HTTP/SSE request handling — the core streaming loop. Contains:
 The JetStream side of one SSE stream. Contains:
 
 - `openConsumerStream()` — creates the request's ordered pull consumer (`orderedConsumerConfig()`: filters, explicit start position, inactive threshold capped by the stream's consumer limit) and starts pulling with `pullOptions()` (`client_buffer_size` prefetch, `nats_idle_heartbeat`).
-- `startStreamFeed()` — the feed goroutine: pulls one message at a time, formats it, drops what cannot be sent, and hands frames to the writer; the hand-off blocks while the writer is busy, which is what stops pulling.
+- `startStreamFeed()` — the feed goroutine: pulls one message at a time, formats it, drops what cannot be sent, and hands frames to the writer; the hand-off holds 16 frames and blocks when full, which is what stops pulling. The writer (`serveStream` via `collectBatch()`) writes queued frames in batches with one flush each.
 - `consumerStream.close()` / `deleteConsumer()` — stops the feed and deletes the consumer in the background, logging failures and telling `Cleanup()` when it is gone.
 
 ### caddyfile.go

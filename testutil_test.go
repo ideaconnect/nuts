@@ -318,3 +318,78 @@ func provisionOnStream(t *testing.T, cfg jetstream.StreamConfig, configure func(
 	t.Cleanup(func() { _ = h.Cleanup() })
 	return h, nc
 }
+
+// flushLog is a response writer that records what was written before each
+// flush, and every write deadline, safe to read while a stream writes.
+type flushLog struct {
+	mu        sync.Mutex
+	header    http.Header
+	pending   strings.Builder
+	flushed   []string
+	deadlines []time.Time
+}
+
+func newFlushLog() *flushLog { return &flushLog{header: make(http.Header)} }
+
+func (f *flushLog) Header() http.Header { return f.header }
+func (f *flushLog) WriteHeader(int)     {}
+
+func (f *flushLog) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pending.Write(p)
+}
+
+func (f *flushLog) Flush() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.flushed = append(f.flushed, f.pending.String())
+	f.pending.Reset()
+}
+
+func (f *flushLog) SetWriteDeadline(deadline time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deadlines = append(f.deadlines, deadline)
+	return nil
+}
+
+// batches returns what each flush carried.
+func (f *flushLog) batches() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.flushed...)
+}
+
+// serveQueuedFrames runs serveStream over a feed whose frames are all queued
+// before the stream starts, and returns once it has written wantFlushes
+// flushes (the connected event included) or ended.
+func serveQueuedFrames(t *testing.T, h *Handler, plan streamPlan, frames []formattedMessageEvent, wantFlushes int) (*flushLog, bool) {
+	t.Helper()
+	ch := make(chan formattedMessageEvent, len(frames))
+	for _, f := range frames {
+		ch <- f
+	}
+	feed := &streamFeed{frames: ch, errs: make(chan error), stop: func() {}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newFlushLog()
+	done := make(chan struct{})
+	go func() {
+		_ = h.serveStream(w, httptest.NewRequest(http.MethodGet, "/events", nil).WithContext(ctx), plan, feed, nil)
+		close(done)
+	}()
+	deadline := time.After(3 * time.Second)
+	for len(w.batches()) < wantFlushes {
+		select {
+		case <-done:
+			return w, true
+		case <-deadline:
+			t.Fatalf("stream flushed %d times, want %d", len(w.batches()), wantFlushes)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+	return w, false
+}

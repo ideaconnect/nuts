@@ -854,6 +854,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 
 	replayDelivered := 0
 	history := newReplayHistory(plan)
+	batch := make([]string, 0, maxBatchFrames)
 
 	ctx := r.Context()
 	for {
@@ -884,34 +885,25 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 			return nil
 
 		case formatted := <-feed.frames:
-			historical := history.isHistory(formatted)
-			if historical && shouldSkipReplayWindowMessage(plan, formatted) {
-				metricsMessagesDropped.WithLabelValues(dropReasonReplayWindow).Inc()
-				h.log().Debug("skipping replayed message older than replay_window",
-					appendStreamLogFields(plan, zap.Uint64("stream_sequence", formatted.StreamSequence))...,
-				)
-				continue
-			}
-
-			if err := writeSSEChunkWithTimeout(w, rc, formatted.Frame, writeTimeout); err != nil {
-				h.recordWriteDisconnect(plan, "message", err, zap.String("message_subject", formatted.Subject))
-				return nil
-			}
-			metricsMessagesDelivered.Inc()
-
-			if historical && h.ReplayMaxMessages > 0 {
-				replayDelivered++
-				if replayDelivered >= h.ReplayMaxMessages {
-					metricsReplayCapReached.Inc()
-					h.log().Warn("closing SSE stream: replay_max_messages reached",
-						appendStreamLogFields(plan,
-							zap.String("disconnect_reason", "replay_cap_reached"),
-							zap.Int("replay_max_messages", h.ReplayMaxMessages),
-							zap.Int("replay_delivered", replayDelivered),
-						)...,
-					)
+			var capReached bool
+			batch, capReached = h.collectBatch(batch[:0], plan, feed.frames, formatted, history, &replayDelivered)
+			if len(batch) > 0 {
+				if err := writeSSEChunksWithTimeout(w, rc, writeTimeout, batch...); err != nil {
+					h.recordWriteDisconnect(plan, "message", err, zap.String("message_subject", formatted.Subject))
 					return nil
 				}
+				metricsMessagesDelivered.Add(float64(len(batch)))
+			}
+			if capReached {
+				metricsReplayCapReached.Inc()
+				h.log().Warn("closing SSE stream: replay_max_messages reached",
+					appendStreamLogFields(plan,
+						zap.String("disconnect_reason", "replay_cap_reached"),
+						zap.Int("replay_max_messages", h.ReplayMaxMessages),
+						zap.Int("replay_delivered", replayDelivered),
+					)...,
+				)
+				return nil
 			}
 
 		case <-heartbeat.C:
@@ -919,6 +911,50 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 				h.recordWriteDisconnect(plan, "heartbeat", err)
 				return nil
 			}
+		}
+	}
+}
+
+// maxBatchFrames and maxBatchBytes bound a batch: frames already waiting when
+// the writer takes one are written with it and flushed together, which saves
+// a flush, a syscall and a deadline set/clear per frame during bursts and
+// replays (#121). A batch only ever holds frames that are already queued, so
+// it adds no latency.
+const (
+	maxBatchFrames = 32
+	maxBatchBytes  = 64 << 10
+)
+
+// collectBatch appends the frame just received, and whatever frames are
+// queued behind it, to batch. Each frame goes through the replay_window
+// filter and counts towards replay_max_messages; when the cap is reached the
+// batch ends with that frame and the stream is to be closed.
+func (h *Handler) collectBatch(batch []string, plan streamPlan, frames <-chan formattedMessageEvent, frame formattedMessageEvent, history *replayHistory, replayDelivered *int) ([]string, bool) {
+	size := 0
+	for {
+		historical := history.isHistory(frame)
+		if historical && shouldSkipReplayWindowMessage(plan, frame) {
+			metricsMessagesDropped.WithLabelValues(dropReasonReplayWindow).Inc()
+			h.log().Debug("skipping replayed message older than replay_window",
+				appendStreamLogFields(plan, zap.Uint64("stream_sequence", frame.StreamSequence))...,
+			)
+		} else {
+			batch = append(batch, frame.Frame)
+			size += len(frame.Frame)
+			if historical && h.ReplayMaxMessages > 0 {
+				*replayDelivered++
+				if *replayDelivered >= h.ReplayMaxMessages {
+					return batch, true
+				}
+			}
+		}
+		if len(batch) >= maxBatchFrames || size >= maxBatchBytes {
+			return batch, false
+		}
+		select {
+		case frame = <-frames:
+		default:
+			return batch, false
 		}
 	}
 }

@@ -245,12 +245,16 @@ type streamFeed struct {
 	stop   func()
 }
 
+// feedHandoffFrames is how many formatted frames a feed hands ahead to its
+// writer, so a burst can be written in batches (see maxBatchFrames).
+const feedHandoffFrames = 16
+
 // startStreamFeed pulls from the iterator on its own goroutine, formats each
 // message, drops the ones that cannot be sent, and hands the rest to the
-// writer. The hand-off blocks while the writer is busy, which is what stops
-// further pulls.
+// writer. The hand-off holds feedHandoffFrames frames and blocks when full,
+// which is what stops further pulls while the writer is busy.
 func (h *Handler) startStreamFeed(it jetstream.MessagesContext, plan streamPlan) *streamFeed {
-	frames := make(chan formattedMessageEvent, 1)
+	frames := make(chan formattedMessageEvent, feedHandoffFrames)
 	errs := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {

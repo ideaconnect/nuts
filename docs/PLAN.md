@@ -369,8 +369,8 @@ the pull prefetch bound.
 
 **Both paths:**
 
-- [ ] **[#121] Batch already-queued frames.** *minor · M*
-  - [ ] One write, one flush, and one deadline set/clear per batch. Keep the
+- [x] **[#121] Batch already-queued frames.** *minor · M*
+  - [x] One write, one flush, and one deadline set/clear per batch. Keep the
     clear on HTTP/2.
 - [ ] **[#107] Delivery visibility.** *nit · S–M*
   - [ ] Write `id:` last in the frame.
