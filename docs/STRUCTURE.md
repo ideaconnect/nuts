@@ -62,7 +62,7 @@ Caddyfile configuration parsing. Contains:
 Standalone utility functions used across the module. Contains:
 
 - `toJSON()` — marshals any value to a JSON string.
-- `tryParseJSON()` — attempts to unmarshal `[]byte` as JSON; falls back to a plain string. Callers are expected to bound input length first.
+- `writeJSONPayload()` / `writeJSONString()` — write a message payload and strings into the frame's JSON envelope in one pass, byte-identical to `json.Marshal` (valid JSON compacted and HTML-escaped, anything else as a JSON string). Callers are expected to bound input length first.
 - `writeSSEChunk()` / `writeSSEChunkWithTimeout()` — writes one SSE frame to the `http.ResponseWriter`, optionally applying a per-frame write deadline before flushing.
 - `isValidTopic()` — accepts only `[A-Za-z0-9._-]`; rejects empty, overlength (>256), wildcard (`*`, `>`), system (`$`-prefix), control-char, leading/trailing dot, and consecutive-dot topics.
 - `isValidCookieName()` — validates `subscriber_jwt_cookie` against the HTTP token character set.

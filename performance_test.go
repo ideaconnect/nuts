@@ -33,7 +33,6 @@ const (
 
 var (
 	benchmarkFormatted formattedMessageEvent
-	benchmarkParsed    interface{}
 	benchmarkBool      bool
 )
 
@@ -325,26 +324,6 @@ func BenchmarkFormatMessageEvent(b *testing.B) {
 	}
 	if benchmarkFormatted.Dropped {
 		b.Fatalf("formatted event was unexpectedly dropped: %#v", benchmarkFormatted)
-	}
-}
-
-func BenchmarkTryParseJSON(b *testing.B) {
-	cases := []struct {
-		name string
-		data []byte
-	}{
-		{name: "small-json", data: []byte(`{"value": 123, "ok": true}`)},
-		{name: "large-json", data: []byte(`{"blob":"` + strings.Repeat("x", performanceLargePayloadBytes) + `"}`)},
-		{name: "raw-string", data: []byte(strings.Repeat("not-json", 128))},
-	}
-
-	for _, tc := range cases {
-		b.Run(tc.name, func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				benchmarkParsed = tryParseJSON(tc.data)
-			}
-		})
 	}
 }
 

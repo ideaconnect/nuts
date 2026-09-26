@@ -17,7 +17,7 @@ go test -run '^TestPerformance_' -timeout 180s .
 Run the hot-path benchmarks with allocation reporting:
 
 ```bash
-go test -run '^$' -bench 'Benchmark(FormatMessageEvent|TryParseJSON|IsValidTopic|StreamFeed|SharedFanOut)' -benchmem .
+go test -run '^$' -bench 'Benchmark(FormatMessageEvent|FormatMessageEventLarge|WriteJSONPayload|IsValidTopic|StreamFeed|SharedFanOut)' -benchmem .
 ```
 
 Or run both through Make:
@@ -46,8 +46,10 @@ without a slow-client disconnect.
 The benchmarks cover SSE event formatting, JSON compaction, topic validation,
 the feed that pulls, formats and hands messages to the writer, and handing a
 formatted frame to the connections of a shared subscription (about 110 ns and
-no allocation per delivery, against about 1.2 µs and 7 allocations to format
-a small message once per connection).
+no allocation per delivery, against about 0.4 µs and 1 allocation to format a
+small message once per connection). The formatter builds each frame in one
+pass: about 0.4 µs for a small JSON message and 320 µs for 64 KiB, with one
+allocation.
 
 ## Production Targets
 

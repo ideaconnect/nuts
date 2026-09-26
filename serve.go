@@ -1077,29 +1077,30 @@ func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formatted
 		return formatted
 	}
 
-	payload := messageEventPayload{
-		Topic:   strings.TrimPrefix(msg.Subject, h.TopicPrefix),
-		Payload: tryParseJSON(msg.Data),
-	}
-	if msg.HasMetadata {
-		payload.Time = msg.Timestamp.UTC().Format(time.RFC3339)
-	} else {
-		payload.Time = now.UTC().Format(time.RFC3339)
-	}
-
-	// Pre-size the SSE frame builder to avoid reallocations: payload + a
-	// rough envelope budget (id/event/data lines plus JSON wrapper).
+	// Build the frame in one pass. The data line is the JSON encoding of
+	// messageEventPayload, written by hand: the payload is validated once
+	// and copied once, compacted and HTML-escaped exactly as json.Marshal
+	// embeds a json.RawMessage (#122). Pre-size for the payload plus the
+	// envelope (id/event/data lines and the JSON wrapper).
 	var event strings.Builder
 	event.Grow(len(msg.Data) + 128)
+	var scratch [64]byte
 	if msg.HasMetadata {
 		event.WriteString("id: ")
-		event.WriteString(strconv.FormatUint(msg.StreamSequence, 10))
-		event.WriteString("\n")
+		event.Write(strconv.AppendUint(scratch[:0], msg.StreamSequence, 10))
+		event.WriteByte('\n')
 	}
-	event.WriteString("event: message\n")
-	event.WriteString("data: ")
-	event.WriteString(toJSON(payload))
-	event.WriteString("\n\n")
+	event.WriteString("event: message\ndata: {\"topic\":")
+	writeJSONString(&event, strings.TrimPrefix(msg.Subject, h.TopicPrefix))
+	event.WriteString(`,"payload":`)
+	writeJSONPayload(&event, msg.Data)
+	event.WriteString(`,"time":"`)
+	timestamp := now
+	if msg.HasMetadata {
+		timestamp = msg.Timestamp
+	}
+	event.Write(timestamp.UTC().AppendFormat(scratch[:0], time.RFC3339))
+	event.WriteString("\"}\n\n")
 
 	if h.MaxEventSize > 0 && event.Len() > h.MaxEventSize {
 		formatted.Dropped = true

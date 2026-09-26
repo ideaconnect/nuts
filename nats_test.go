@@ -1575,54 +1575,6 @@ func TestToJSON(t *testing.T) {
 	}
 }
 
-func TestTryParseJSON(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    []byte
-		isJSON   bool
-		expected interface{}
-	}{
-		{
-			name:   "valid JSON object",
-			input:  []byte(`{"key":"value"}`),
-			isJSON: true,
-		},
-		{
-			name:   "valid JSON array",
-			input:  []byte(`[1,2,3]`),
-			isJSON: true,
-		},
-		{
-			name:     "invalid JSON returns string",
-			input:    []byte(`not json`),
-			isJSON:   false,
-			expected: "not json",
-		},
-		{
-			name:     "empty string",
-			input:    []byte(``),
-			isJSON:   false,
-			expected: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tryParseJSON(tt.input)
-			if tt.isJSON {
-				// For valid JSON, just verify it doesn't return a string type
-				if _, ok := result.(string); ok && len(tt.input) > 0 {
-					t.Error("expected parsed JSON, got string")
-				}
-			} else {
-				if str, ok := result.(string); !ok || str != tt.expected {
-					t.Errorf("expected %q, got %v", tt.expected, result)
-				}
-			}
-		})
-	}
-}
-
 func TestHandler_CaddyModule(t *testing.T) {
 	h := Handler{}
 	info := h.CaddyModule()

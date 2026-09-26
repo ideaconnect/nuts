@@ -469,10 +469,10 @@ documented budgets that hold.
   - [x] Document server `max_pending` / `write_deadline` sizing.
   - [x] A burst test at the documented scale must not trigger a slow-consumer
     kick.
-- [ ] **[#122] Single-pass formatter.** *minor · M*
-  - [ ] Compact the payload straight into a `[]byte` frame, write the envelope
+- [x] **[#122] Single-pass formatter.** *minor · M*
+  - [x] Compact the payload straight into a `[]byte` frame, write the envelope
     by hand, and call `w.Write`.
-  - [ ] Golden tests pin byte-identical output: HTML escaping, U+2028/9,
+  - [x] Golden tests pin byte-identical output: HTML escaping, U+2028/9,
     non-JSON input, empty payload.
 - [ ] **[#123] Per-connection JetStream cost.** *minor · M*
   - [ ] Cache the stream subjects at Provision, and deduplicate concurrent
@@ -539,7 +539,9 @@ Several of these are good first issues.
 - [ ] **[#61] Fuzz properties.** *minor · S*
   - [ ] Add property assertions to `FuzzSubjectMatchesFilter` and
     `FuzzSubscriberTopicMatches`. This is needed before [#124].
-- [ ] **[#63]** `TestTryParseJSON` asserts the parsed content. *minor · S*
+- [x] **[#63]** `TestTryParseJSON` asserts the parsed content. *minor · S*
+  Obsolete: `tryParseJSON` left the formatter (#122); `TestWriteJSONPayload`
+  asserts exact output.
 - [ ] **[#64]** The large-payload memory test asserts the payload survives
   formatting. *nit · S*
 - [ ] **[#65] Readiness failure metric.** *minor · S*

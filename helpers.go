@@ -2,7 +2,6 @@
 package nuts
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -117,19 +116,67 @@ func toJSON(v any) string {
 	return string(b)
 }
 
-// tryParseJSON attempts to preserve raw JSON values without coercing numbers
-// through any / float64. If the bytes are valid JSON, a compacted
-// json.RawMessage is returned so json.Marshal embeds it directly in the SSE
-// envelope. Otherwise the raw bytes are returned as a plain string.
-//
-// Callers MUST bound len(data) before invoking this function — JSON compaction
-// allocates and is unsafe on untrusted unbounded input.
-func tryParseJSON(data []byte) any {
-	var compacted bytes.Buffer
-	if err := json.Compact(&compacted, data); err != nil {
-		return string(data)
+// writeJSONString writes s as a JSON string, escaped exactly as json.Marshal
+// escapes it, HTML characters included. Printable ASCII without characters
+// that need escaping, which covers every topic, skips the encoder.
+func writeJSONString(b *strings.Builder, s string) {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c > 0x7e || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			encoded, _ := json.Marshal(s) // a string always encodes
+			b.Write(encoded)
+			return
+		}
 	}
-	return json.RawMessage(compacted.Bytes())
+	b.WriteByte('"')
+	b.WriteString(s)
+	b.WriteByte('"')
+}
+
+// writeJSONPayload writes a message payload into the frame's JSON envelope as
+// json.Marshal would: valid JSON compacted and HTML-escaped as for a
+// json.RawMessage, anything else as a JSON string. Valid JSON is copied in
+// one pass: whitespace outside strings is dropped, and '<', '>', '&', U+2028
+// and U+2029, which valid JSON can only hold inside strings, are escaped.
+func writeJSONPayload(b *strings.Builder, data []byte) {
+	if !json.Valid(data) {
+		writeJSONString(b, string(data))
+		return
+	}
+	const hex = "0123456789abcdef"
+	start := 0 // first byte not yet written
+	inString := false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if !inString {
+			switch c {
+			case '"':
+				inString = true
+			case ' ', '\t', '\n', '\r':
+				b.Write(data[start:i])
+				start = i + 1
+			}
+			continue
+		}
+		switch {
+		case c == '\\':
+			i++ // the escaped byte cannot end the string or need escaping
+		case c == '"':
+			inString = false
+		case c == '<' || c == '>' || c == '&':
+			b.Write(data[start:i])
+			b.WriteString(`\u00`)
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0xf])
+			start = i + 1
+		case c == 0xe2 && i+2 < len(data) && data[i+1] == 0x80 && data[i+2]&^1 == 0xa8:
+			b.Write(data[start:i])
+			b.WriteString(`\u202`)
+			b.WriteByte(hex[data[i+2]&0xf])
+			i += 2
+			start = i + 1
+		}
+	}
+	b.Write(data[start:])
 }
 
 // supportsFlush reports whether w, or any writer it wraps via Unwrap, can

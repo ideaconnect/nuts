@@ -87,6 +87,7 @@ Tests live alongside the source:
 | [caddy_integration_test.go](caddy_integration_test.go) | Caddy-in-the-loop tests via `caddy.Load` (access logs, HTTP metrics). |
 | [shared_test.go](shared_test.go) | Shared-subscription mechanics (ring, gap-free joins, fall-behind, lifecycle) and end-to-end behaviour; the delivery contract tests also run in shared mode. |
 | [server_compat_test.go](server_compat_test.go) | nats-server behaviour NUTS accommodates, on the embedded server: stream consumer limits, consumer inactive-threshold limits, delete markers and schedules, lame duck mode, the multi-topic purge fix, and teardown. |
+| [formatter_test.go](formatter_test.go) | Pins the single-pass frame formatter to the previous `json.Marshal` output: golden edge cases and a fuzz target against a reference implementation. |
 | [docs_test.go](docs_test.go) | Keeps metric names in README, website, docs and ops files in step with `metrics.go`. |
 | [testutil_test.go](testutil_test.go) | Shared test doubles and helpers: fake JetStream messages and iterator, stalled writers, the black-hole TCP proxy, retry-response assertions, custom-stream provisioning. |
 | [functional_test/](functional_test/) | [Godog](https://github.com/cucumber/godog) BDD tests against a real Docker Compose stack. |

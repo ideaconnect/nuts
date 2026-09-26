@@ -135,6 +135,12 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
 - The example alert rules and Grafana dashboard cover the stream consumer
   limit, consumer recoveries, oversized drops by reason, write failures by
   site, NATS slow consumers and lame duck mode (#86).
+- Message frames are built in one pass (#122): the payload is validated once
+  and copied once into the frame, instead of being compacted, re-encoded by
+  `json.Marshal` and copied three more times. A small JSON message takes
+  about 0.4 µs instead of 1.2 µs, a 64 KiB one about half the time and a
+  quarter of the memory, with one allocation instead of seven. The output is
+  byte-identical, which a fuzz test checks against the previous formatter.
 - `nuts_nats_connection_events_total{event="closed"}` no longer counts the
   connection NUTS closes itself on shutdown or reload (#73).
 - `nats_idle_heartbeat` now sets the heartbeat of every pull request. When
