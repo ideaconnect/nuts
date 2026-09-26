@@ -4,6 +4,10 @@
 }
 
 :8080 {
+	# Access logging wraps the response writer in Caddy's recorder (no
+	# http.Flusher); keeping it on guards the streaming path against #114.
+	log
+
 	handle /health {
 		respond 200
 	}

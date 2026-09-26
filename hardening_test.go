@@ -1233,7 +1233,7 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 
 func TestWriteSSEChunkWithTimeout_SetsAndClearsDeadline(t *testing.T) {
 	rr := &deadlineFlushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	if err := writeSSEChunkWithTimeout(rr, rr, "event: ping\n\n", time.Second); err != nil {
+	if err := writeSSEChunkWithTimeout(rr, http.NewResponseController(rr), "event: ping\n\n", time.Second); err != nil {
 		t.Fatalf("writeSSEChunkWithTimeout: %v", err)
 	}
 	if got := rr.Body.String(); got != "event: ping\n\n" {

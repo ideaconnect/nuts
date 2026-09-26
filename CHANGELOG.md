@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **SSE streams returned `500 Streaming not supported` whenever Caddy access
+  logging or HTTP request metrics were enabled** (#114). With the `log`
+  directive, or the global `metrics` option, Caddy wraps the response writer in
+  a recorder that implements `FlushError()` and `Unwrap()` but not
+  `http.Flusher`, and the handler's `w.(http.Flusher)` check rejected every
+  stream. Flushing and write deadlines now go through
+  `http.NewResponseController`, which follows the wrapper chain. The
+  functional-test Caddyfile now enables `log`, so the Godog suite runs through
+  the wrapper.
+- A failed flush is now reported as a write error, so the stream closes and
+  `nuts_messages_delivered_total` counts only frames that were flushed.
+  Previously the flush error was discarded and the failure surfaced only on
+  the next write, up to `heartbeat_interval` later.
+
+### Security
+- Go toolchain 1.26.4 → **1.26.8** (`go.mod`, both Dockerfiles). This clears
+  the reachable stdlib vulnerabilities `govulncheck` reported in `net/http`
+  (GO-2026-6089, GO-2026-5026), `crypto/tls` (GO-2026-6090, GO-2026-5856),
+  `net/url`, `html/template`, `encoding/xml`, `encoding/asn1` and `os` (#108).
+- Indirect modules bumped past their advisories: `google.golang.org/grpc`
+  1.84.0 (GO-2026-6348, GO-2026-6061), `golang.org/x/text` 0.42.0
+  (GO-2026-5970), `go.opentelemetry.io/otel` 1.44.0 (GO-2026-5158) (#108).
+- Embedded test server `nats-server/v2` 2.14.2 → 2.15.0. This test-only
+  dependency carried CVE-2026-58207 and CVE-2026-58210 (high) among others
+  (#109).
+
+### Changed
+- `github.com/nats-io/nats.go` 1.52.0 → 1.54.0. It fixes a `DecodeHeadersMsg`
+  panic on malformed status lines (nats.go#2101). Also bumped:
+  `prometheus/client_golang` 1.24.1, `client_model` 0.6.3 and `godog` 0.16.0
+  (#109).
+- CI runs `govulncheck -test ./...`, so test-only dependencies are scanned too
+  (#109).
+- The release workflow waits for CI to succeed on the tagged commit before
+  GoReleaser publishes anything. v0.4.2 published archives while CI was red,
+  and its Docker image was never pushed (#108).
+
+### Notes
+- **v0.4.2 has no Docker image.** Its CI run failed `govulncheck`, so the
+  image jobs never ran. Its release archives were built with Go 1.26.4.
+  Upgrade to this release instead.
+
 ## [0.4.2] - 2026-09-23
 
 Project-site release. **No module code changes** — the `nuts` handler

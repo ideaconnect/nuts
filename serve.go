@@ -336,8 +336,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if !supportsFlush(w) {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return nil
 	}
@@ -402,7 +401,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	defer h.cleanupStream(done, result.Subscriptions)
 
-	return h.serveStream(w, flusher, r, plan, msgChan, slowClient, runtime.shutdown)
+	return h.serveStream(w, r, plan, msgChan, slowClient, runtime.shutdown)
 }
 
 // handleControlRequest short-circuits requests that aren't SSE subscriptions:
@@ -930,10 +929,13 @@ func (h *Handler) cleanupStream(done chan struct{}, subscriptions []*nats.Subscr
 // Returns nil on every termination path: SSE has no notion of an HTTP error
 // after streaming has begun, so all exits are observable as a normal
 // connection close.
-func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *http.Request, plan streamPlan, msgChan <-chan *nats.Msg, slowClient <-chan string, shutdown <-chan struct{}) error {
+func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan streamPlan, msgChan <-chan *nats.Msg, slowClient <-chan string, shutdown <-chan struct{}) error {
 	metricsActiveConnections.Inc()
 	defer metricsActiveConnections.Dec()
 	writeTimeout := time.Duration(h.WriteTimeout) * time.Second
+	// All flushing and write deadlines go through the ResponseController so
+	// they reach the connection through Caddy's wrapping writers.
+	rc := http.NewResponseController(w)
 
 	// CORS headers were already applied at the top of ServeHTTP — repeating
 	// the call here is harmless (idempotent) but unnecessary.
@@ -948,7 +950,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 		w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"nuts\"", h.HubURL))
 	}
 
-	if err := writeSSEChunkWithTimeout(w, flusher, formatConnectedEvent(plan.Topics), writeTimeout); err != nil {
+	if err := writeSSEChunkWithTimeout(w, rc, formatConnectedEvent(plan.Topics), writeTimeout); err != nil {
 		metricsWriteDisconnects.WithLabelValues("connected").Inc()
 		h.log().Warn("failed to write connected event",
 			appendStreamLogFields(plan,
@@ -1011,7 +1013,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 				continue
 			}
 
-			if err := writeSSEChunkWithTimeout(w, flusher, formatted.Frame, writeTimeout); err != nil {
+			if err := writeSSEChunkWithTimeout(w, rc, formatted.Frame, writeTimeout); err != nil {
 				metricsWriteDisconnects.WithLabelValues("message").Inc()
 				h.log().Warn("failed to write message event",
 					appendStreamLogFields(plan,
@@ -1042,7 +1044,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, flusher http.Flusher, r *ht
 			}
 
 		case <-heartbeat.C:
-			if err := writeSSEChunkWithTimeout(w, flusher, formatHeartbeatEvent(time.Now()), writeTimeout); err != nil {
+			if err := writeSSEChunkWithTimeout(w, rc, formatHeartbeatEvent(time.Now()), writeTimeout); err != nil {
 				metricsWriteDisconnects.WithLabelValues("heartbeat").Inc()
 				h.log().Warn("failed to write heartbeat",
 					appendStreamLogFields(plan,

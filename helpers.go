@@ -132,32 +132,51 @@ func tryParseJSON(data []byte) any {
 	return json.RawMessage(compacted.Bytes())
 }
 
-// writeSSEChunk writes a complete SSE frame to the client and flushes it.
-func writeSSEChunk(w io.Writer, flusher http.Flusher, chunk string) error {
+// supportsFlush reports whether w, or any writer it wraps via Unwrap, can
+// flush. It mirrors http.ResponseController's lookup: Caddy wraps the writer
+// in a recorder that implements FlushError and Unwrap but not http.Flusher
+// whenever access logging or HTTP metrics are enabled, so a plain
+// w.(http.Flusher) assertion wrongly rejects every stream.
+func supportsFlush(w http.ResponseWriter) bool {
+	for w != nil {
+		switch w.(type) {
+		case interface{ FlushError() error }, http.Flusher:
+			return true
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return false
+		}
+		w = unwrapper.Unwrap()
+	}
+	return false
+}
+
+// writeSSEChunk writes a complete SSE frame and flushes it. The flush error is
+// returned so a frame that never reached the client is not counted as sent.
+func writeSSEChunk(w io.Writer, rc *http.ResponseController, chunk string) error {
 	if _, err := io.WriteString(w, chunk); err != nil {
 		return err
 	}
-	flusher.Flush()
-	return nil
+	return rc.Flush()
 }
 
-func writeSSEChunkWithTimeout(w http.ResponseWriter, flusher http.Flusher, chunk string, timeout time.Duration) error {
+func writeSSEChunkWithTimeout(w http.ResponseWriter, rc *http.ResponseController, chunk string, timeout time.Duration) error {
 	if timeout <= 0 {
-		return writeSSEChunk(w, flusher, chunk)
+		return writeSSEChunk(w, rc, chunk)
 	}
 
-	controller := http.NewResponseController(w)
-	if err := controller.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+	if err := rc.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		if !errors.Is(err, http.ErrNotSupported) {
 			return err
 		}
-		return writeSSEChunk(w, flusher, chunk)
+		return writeSSEChunk(w, rc, chunk)
 	}
 
-	if err := writeSSEChunk(w, flusher, chunk); err != nil {
+	if err := writeSSEChunk(w, rc, chunk); err != nil {
 		return err
 	}
-	if err := controller.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		return err
 	}
 	return nil

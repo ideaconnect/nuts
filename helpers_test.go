@@ -3,6 +3,7 @@ package nuts
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -48,7 +49,7 @@ func (e *errOnSetDeadlineRecorder) SetWriteDeadline(_ time.Time) error { return 
 func TestWriteSSEChunkWithTimeout_FallbackAndErrors(t *testing.T) {
 	t.Run("zero timeout writes through", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		if err := writeSSEChunkWithTimeout(rr, &noDeadlineRecorder{ResponseRecorder: rr}, "data: x\n\n", 0); err != nil {
+		if err := writeSSEChunkWithTimeout(rr, http.NewResponseController(&noDeadlineRecorder{ResponseRecorder: rr}), "data: x\n\n", 0); err != nil {
 			t.Fatalf("err = %v", err)
 		}
 		if rr.Body.String() != "data: x\n\n" {
@@ -57,7 +58,7 @@ func TestWriteSSEChunkWithTimeout_FallbackAndErrors(t *testing.T) {
 	})
 	t.Run("falls back when deadline unsupported", func(t *testing.T) {
 		nr := &noDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
-		if err := writeSSEChunkWithTimeout(nr, nr, "data: x\n\n", time.Second); err != nil {
+		if err := writeSSEChunkWithTimeout(nr, http.NewResponseController(nr), "data: x\n\n", time.Second); err != nil {
 			t.Fatalf("err = %v", err)
 		}
 		if nr.Body.String() != "data: x\n\n" {
@@ -67,7 +68,7 @@ func TestWriteSSEChunkWithTimeout_FallbackAndErrors(t *testing.T) {
 	t.Run("propagates non-not-supported deadline error", func(t *testing.T) {
 		boom := errors.New("boom")
 		er := &errOnSetDeadlineRecorder{ResponseRecorder: httptest.NewRecorder(), err: boom}
-		err := writeSSEChunkWithTimeout(er, er, "data: x\n\n", time.Second)
+		err := writeSSEChunkWithTimeout(er, http.NewResponseController(er), "data: x\n\n", time.Second)
 		if err == nil || !errors.Is(err, boom) {
 			t.Fatalf("err = %v, want boom", err)
 		}
@@ -211,4 +212,82 @@ func TestMetrics_ConsumerInvalidated_RegisteredWithExpectedLabels(t *testing.T) 
 			}
 		})
 	}
+}
+
+// flushErrorOnlyWriter has the shape of caddyhttp's responseRecorder (used when
+// access logs or HTTP metrics are on): it wraps a ResponseWriter and exposes
+// FlushError and Unwrap, but not http.Flusher.
+type flushErrorOnlyWriter struct {
+	http.ResponseWriter
+	flushErr error
+	flushes  int
+}
+
+func (f *flushErrorOnlyWriter) FlushError() error {
+	f.flushes++
+	return f.flushErr
+}
+
+func (f *flushErrorOnlyWriter) Unwrap() http.ResponseWriter { return f.ResponseWriter }
+
+type unwrapOnlyWriter struct{ http.ResponseWriter }
+
+func (u *unwrapOnlyWriter) Unwrap() http.ResponseWriter { return u.ResponseWriter }
+
+type nilUnwrapWriter struct{ http.ResponseWriter }
+
+func (n *nilUnwrapWriter) Unwrap() http.ResponseWriter { return nil }
+
+func TestSupportsFlush(t *testing.T) {
+	cases := []struct {
+		name string
+		w    http.ResponseWriter
+		want bool
+	}{
+		{name: "http.Flusher", w: httptest.NewRecorder(), want: true},
+		{name: "FlushError only (Caddy recorder shape)", w: &flushErrorOnlyWriter{ResponseWriter: newPlainRecorder()}, want: true},
+		{name: "Unwrap to a Flusher", w: &unwrapOnlyWriter{ResponseWriter: httptest.NewRecorder()}, want: true},
+		{name: "Unwrap chain to a Flusher", w: &unwrapOnlyWriter{ResponseWriter: &unwrapOnlyWriter{ResponseWriter: httptest.NewRecorder()}}, want: true},
+		{name: "no flush support", w: newPlainRecorder(), want: false},
+		{name: "Unwrap to a non-flusher", w: &unwrapOnlyWriter{ResponseWriter: newPlainRecorder()}, want: false},
+		{name: "Unwrap returns nil", w: &nilUnwrapWriter{ResponseWriter: newPlainRecorder()}, want: false},
+		{name: "nil writer", w: nil, want: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := supportsFlush(c.w); got != c.want {
+				t.Fatalf("supportsFlush() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestWriteSSEChunk_FlushesThroughFlushErrorAndReturnsItsError(t *testing.T) {
+	t.Run("success flushes exactly once", func(t *testing.T) {
+		rec := newPlainRecorder()
+		fw := &flushErrorOnlyWriter{ResponseWriter: rec}
+		if err := writeSSEChunk(fw, http.NewResponseController(fw), "data: x\n\n"); err != nil {
+			t.Fatalf("writeSSEChunk: %v", err)
+		}
+		if fw.flushes != 1 {
+			t.Fatalf("flushes = %d, want 1", fw.flushes)
+		}
+		if got := rec.body.String(); got != "data: x\n\n" {
+			t.Fatalf("body = %q", got)
+		}
+	})
+	t.Run("flush error is returned", func(t *testing.T) {
+		boom := errors.New("flush failed")
+		fw := &flushErrorOnlyWriter{ResponseWriter: newPlainRecorder(), flushErr: boom}
+		if err := writeSSEChunk(fw, http.NewResponseController(fw), "data: x\n\n"); !errors.Is(err, boom) {
+			t.Fatalf("writeSSEChunk err = %v, want %v", err, boom)
+		}
+	})
+	t.Run("flush error is returned under a write deadline", func(t *testing.T) {
+		boom := errors.New("flush failed")
+		fw := &flushErrorOnlyWriter{ResponseWriter: newPlainRecorder(), flushErr: boom}
+		if err := writeSSEChunkWithTimeout(fw, http.NewResponseController(fw), "data: x\n\n", time.Second); !errors.Is(err, boom) {
+			t.Fatalf("writeSSEChunkWithTimeout err = %v, want %v", err, boom)
+		}
+	})
 }
