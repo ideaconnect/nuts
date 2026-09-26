@@ -97,6 +97,10 @@ filters when correlating logs with alerts.
 2. Run `nats stream info <STREAM>` and verify the configured subject filters
    cover the expected `topic_prefix`.
 3. Recreate or restore the stream before routing traffic to the NUTS instance.
+4. If clients were connected while the stream was recreated, reload Caddy with
+   `caddy reload --force`. Their open streams otherwise stay silent until the
+   new stream passes their old position; see
+   [TROUBLESHOOTING.md](TROUBLESHOOTING.md#streams-stall-after-the-stream-was-recreated).
 
 ## Incident: Oversized messages dropped
 

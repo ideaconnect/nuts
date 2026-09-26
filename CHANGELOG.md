@@ -10,7 +10,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Planned as the next **MAJOR** release. Each SSE stream is now backed by an
 ordered **pull** consumer instead of a push consumer. That removes a class of
 silent message loss, and clients that fall behind no longer get disconnected.
-Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
+Read **Upgrading** and **Changed** before upgrading. **nats-server 2.10 or
+newer is required.**
+
+### Upgrading
+
+**Operator impact.** Upgrade urgency: **high** for anyone who relies on every
+message arriving. 0.4.x could lose messages that were in flight when NUTS'
+NATS connection dropped (#99), disconnected fast clients during replays and
+bursts (#100) and let a client that stopped reading pin memory without bound
+(#120), and none of its metrics reached a Prometheus scrape of Caddy (see
+**Fixed**).
+
+Before upgrading:
+
+1. **Run nats-server 2.10 or newer**; 2.14.7 or newer (2.15 recommended) if
+   clients subscribe to several topics at once. See *Why nats-server 2.9 is no
+   longer supported* below.
+2. **Raise the stream's consumer limit.** Every SSE connection now holds one
+   JetStream consumer, and nats-server 2.15 allows 1000 per stream unless
+   `max_consumers` is set. Set it (`nats stream edit EVENTS --max-consumers
+   10000`) to at least your peak connections across all NUTS instances, or
+   turn on `shared_subscriptions`. At the limit, browsers are told to retry
+   and other clients get `503`.
+3. **Set the stream's `max_msg_size`** to your largest message (at most
+   `max_event_size`). A connection prefetches up to `client_buffer_size` raw
+   messages, and only this bounds their size; see "Sizing memory" in README.
+4. **Review the Breaking entries below.** Most affect custom clients and
+   dashboards rather than browsers: the `id:` line now ends each event, a
+   valid `Last-Event-ID` header wins over `?last-id=`, transient failures
+   answer `EventSource` with a `200` retry stream, and `write_timeout`
+   defaults to 30 seconds. Configurations that could never work as intended
+   (for example `nats_tls_ca` with `nats_tls_insecure_skip_verify`, or a
+   `nats_url` scheme other than `nats`, `tls`, `ws` or `wss`) now fail at load
+   time. Run `caddy validate` on your config first; it provisions NUTS, so it
+   also connects to NATS.
+5. **Update dashboards and alerts** from `ops/`: new series (shared
+   subscriptions, consumer limit, lame duck, control-message drops) and
+   changed meanings (`nuts_slow_client_disconnects_total` now means a write
+   missed `write_timeout`).
+
+Rollback to 0.4.3 needs no data migration: NUTS keeps no state in NATS beyond
+per-connection ephemeral consumers, which are deleted when streams end or
+expire after their inactive threshold. Remove `shared_subscriptions` from the
+config first; 0.4.3 does not know the directive.
+
+**Why nats-server 2.9 is no longer supported.** A request for several topics
+needs a consumer that filters on several subjects, which nats-server supports
+from 2.10 on. For 2.9, NUTS subscribed to a common wildcard instead, threw away
+the messages the client had not asked for (`nuts_wildcard_filter_drops_total`),
+and chose between the two paths by reading the server's version string.
+Keeping that fallback in 1.0 would have meant:
+
+- a second delivery path to hold to the new no-loss contract, on a server
+  version the test matrix no longer runs;
+- replacing the version check, which JetStream's own guidance (ADR-44) calls
+  unreliable because a leafnode can report a different version than the
+  JetStream domain that creates the consumer, with a try-then-fall-back on
+  the server's multi-filter error;
+- sending every message on the wildcard across the NATS link, only for NUTS
+  to discard most of it.
+
+nats-server 2.9 has been out of support since 2024 (its last release was
+2.9.25) and gets no security fixes. 1.0 requires 2.10, where every request
+uses server-side `FilterSubjects`; the test matrix covers 2.10, 2.12, 2.14 and
+2.15. `nuts_wildcard_filter_drops_total` stays registered at zero until the
+next major release.
+
+**Known issue.** Deleting and recreating a stream while clients are
+connected leaves their open streams silent until the new stream passes their
+old position. Run `caddy reload --force` afterwards; see "Streams Stall
+After The Stream Was Recreated" in `docs/TROUBLESHOOTING.md`.
+
+**Compatibility.** Caddy 2.11.x; Go 1.26.8 to build; nats-server 2.10 or newer
+(2.14.7 or newer for multi-topic subscriptions, 2.15 recommended).
+
+**Verification.** Unit and race suites, the Godog functional suite on
+nats-server 2.10, 2.12, 2.14 and 2.15, the delivery-contract suite (no hole
+across a NATS link loss or restart, backlogs and bursts on one connection,
+bounded memory for stalled clients), nightly fuzzing, and mutation testing
+(see `docs/mutation/`). Release artefacts: see `docs/RELEASE.md` for the
+Docker image, SBOM and signature checks.
 
 ### Added
 - **`shared_subscriptions`** (off by default) lets connections that are

@@ -142,6 +142,26 @@ client reconnects with its last event ID. Check that the requested sequence is
 still retained (`replay_fallback_reason` in the logs) and, for multi-topic
 streams, the nats-server version.
 
+## Streams Stall After The Stream Was Recreated
+
+Deleting a stream and creating it again (or restoring an older backup of it)
+while clients are connected can leave their open SSE streams silent. Each
+connection's consumer resumes after the last stream sequence it delivered, and
+the new stream numbers its messages from 1 again, so those connections receive
+nothing until the new stream passes their old position. Heartbeats continue,
+so neither the browser nor the readiness probe notices.
+
+Clients that connect afterwards are not affected: a `Last-Event-ID` or
+`?last-id=` ahead of the stream falls back to the retained replay
+(`replay_window` when configured), as the `replay fallback` log line shows.
+
+After recreating a stream under live traffic, reload Caddy with
+`caddy reload --force` (a reload with an unchanged config is skipped) or
+restart it. Every stream closes, clients reconnect with their last event ID,
+and each one takes the fallback above. Operations that keep the stream,
+such as `nats stream purge`, do not reset its sequence numbers and need
+nothing.
+
 ## Docker Image Starts But Config Looks Wrong
 
 The shipped Caddyfile reads only these environment variables:

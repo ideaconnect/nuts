@@ -601,6 +601,12 @@ Several of these are good first issues.
 
 These are carried over from the v0.4 burn-list (P2 product polish).
 
+- [ ] P1: Detect a stream recreated under live connections. Their consumers
+  resume after the old last sequence and stay silent until the new stream
+  passes it, skipping everything before (reproduced in both subscription
+  modes). End such streams, for example when the stream's creation time
+  changes, so clients reconnect and take the cursor-ahead fallback (#103).
+  Documented in `docs/TROUBLESHOOTING.md` meanwhile.
 - [ ] P2: Optional event-type mapping from topic or metadata.
 - [ ] P2: Optional payload envelope customization for raw payload-only events.
 - [ ] P2: Expose the NATS server version and stream metadata in health or
