@@ -286,6 +286,14 @@ Docker image, SBOM and signature checks.
   next major release.
 
 ### Fixed
+- The Docker image logged `unable to create folder for config autosave` at
+  every start, and Caddy had nowhere to keep certificates or locks: the
+  image's `nuts` user has no home directory. The image now sets
+  `XDG_CONFIG_HOME=/config` and `XDG_DATA_HOME=/data`, both owned by `nuts`,
+  as the official Caddy image does. Mount a volume at `/data` if Caddy
+  manages TLS certificates. Caddy now also autosaves the active config,
+  credentials included, to `/config/caddy/autosave.json` (mode 0600); the
+  global option `persist_config off` turns that off.
 - **No `nuts_*` metric reached a Prometheus scrape of Caddy.** NUTS
   registered its metrics on Prometheus' default registry, but Caddy's metrics
   handler and admin `/metrics` endpoint serve a registry of their own,

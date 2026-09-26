@@ -607,6 +607,14 @@ These are carried over from the v0.4 burn-list (P2 product polish).
   modes). End such streams, for example when the stream's creation time
   changes, so clients reconnect and take the cursor-ahead fallback (#103).
   Documented in `docs/TROUBLESHOOTING.md` meanwhile.
+- [ ] P1: Notice a silently dead NATS server sooner. NUTS keeps nats.go's
+  two-minute ping interval, so after packets start being dropped it takes
+  minutes to declare the connection stale, and meanwhile each new request
+  waits about 7–10 s for JetStream timeouts before it is told to retry
+  (seen in the example stack with a paused NATS container). Set a shorter
+  `PingInterval` (for example 20 s with two outstanding) or add a
+  `nats_ping_interval` directive. Documented in `docs/TROUBLESHOOTING.md`
+  meanwhile.
 - [ ] P2: Optional event-type mapping from topic or metadata.
 - [ ] P2: Optional payload envelope customization for raw payload-only events.
 - [ ] P2: Expose the NATS server version and stream metadata in health or

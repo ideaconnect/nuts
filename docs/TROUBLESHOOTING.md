@@ -96,6 +96,14 @@ Browsers see none of these as errors: requests sent with
 `retry:` delay for every transient case, and the browser reconnects on its
 own. Only the topic error stays a `503`, since retrying cannot fix it.
 
+When NATS stops answering without closing the connection (packets dropped, a
+paused VM or container), NUTS only learns that it is disconnected once two
+pings go unanswered, which takes several minutes with nats.go's default
+two-minute ping interval. Until then each new request waits for its JetStream
+calls to time out, about 7 to 10 seconds, before it gets one of the answers
+above. Streams that are already open stay open and continue without a gap
+once NATS answers again.
+
 Metrics that help narrow this down include
 `nuts_connections_rejected_total{reason}` and
 `nuts_subscription_errors_total`.

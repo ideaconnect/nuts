@@ -24,7 +24,15 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates wget \
-    && adduser -D -H -u 10001 nuts
+    && adduser -D -H -u 10001 nuts \
+    && mkdir -p /config/caddy /data/caddy \
+    && chown -R nuts:nuts /config /data
+
+# The nuts user has no home directory. Caddy keeps its autosaved config and
+# its data (certificates, locks) here instead, as the official Caddy image
+# does.
+ENV XDG_CONFIG_HOME=/config \
+    XDG_DATA_HOME=/data
 
 WORKDIR /app
 

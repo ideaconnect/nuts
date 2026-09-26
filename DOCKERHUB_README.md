@@ -16,7 +16,8 @@ docker pull idcttech/nuts:latest
 ```
 
 The image contains Caddy with the `http.handlers.nuts` module linked in. It
-runs as the non-root `nuts` user, listens on port `8080`, and starts with:
+runs as the non-root `nuts` user, listens on port `8080`, keeps Caddy's data
+in `/data` and its autosaved config in `/config`, and starts with:
 
 ```bash
 /app/caddy run --config /app/Caddyfile
@@ -104,6 +105,11 @@ Common mounts:
 | `./Caddyfile` | `/app/Caddyfile:ro` | Replace the default NUTS/Caddy config. |
 | `./nats.creds` | `/run/secrets/nats.creds:ro` | NATS credentials file for `nats_credentials`. |
 | `./tls/` | `/etc/nuts/tls:ro` | NATS CA/client certs for `nats_tls_*`. |
+| a named volume | `/data` | Caddy's certificates and locks; persist it when Caddy manages TLS certificates. |
+
+Caddy saves the active config to `/config/caddy/autosave.json` (readable only
+by `nuts`), credentials included. Add `persist_config off` to the Caddyfile's
+global options if it should not be written.
 
 Example with a custom Caddyfile:
 
