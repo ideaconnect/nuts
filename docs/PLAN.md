@@ -618,29 +618,48 @@ These are carried over from the v0.4 burn-list (P2 product polish).
 
 ## Exit criteria
 
-- [ ] Every critical and major issue in M9, M10 and M11 is closed, or rejected
-  with the rationale recorded in the issue.
-- [ ] CI is green on `main`.
-- [ ] `govulncheck ./...` and `govulncheck -test ./...` are clean.
-- [ ] Every release tag has a published, signed Docker image.
-- [ ] The delivery-contract suite passes these scenarios:
-  - [ ] contiguous ids across a NATS link loss;
-  - [ ] a 3000-message backlog replays on one connection at default settings;
-  - [ ] a 1000-message burst causes no `slow_client`;
-  - [ ] a reload before the first message loses nothing;
-  - [ ] an EventSource-style reconnect with `?last-id` in the URL resumes from
-    the header cursor;
-  - [ ] a recreated stream resumes correctly;
-  - [ ] a consumer deleted mid-stream is recovered.
-- [ ] The functional matrix is green on every supported server (per D3),
-  including 2.15.
-- [ ] The unit package runs in 20 s or less, and no fixed sleep is used as
-  synchronisation.
+- [~] Every critical and major issue in M9, M10 and M11 is closed, or rejected
+  with the rationale recorded in the issue. Every open one is named in a
+  `Closes #N` on `v1-remediation` and closes when the branch merges.
+- [ ] CI is green on `main`. Waits for the push.
+- [x] `govulncheck ./...` and `govulncheck -test ./...` are clean (exit 0).
+  Uncalled findings remain in Caddy's dependencies: cel-go 0.30.0, which
+  fixes one, does not build with Caddy 2.11.4, and grpc's fix is not yet in
+  a release.
+- [ ] Every release tag has a published, signed Docker image. Waits for the
+  v0.4.3 and major-release tags.
+- [x] The delivery-contract suite passes these scenarios:
+  - [x] contiguous ids across a NATS link loss
+    (`TestDeliveryContract_NATSLinkLossLeavesNoHole`; a server restart too:
+    `TestDeliveryContract_NATSRestartLeavesNoHole`);
+  - [x] a 3000-message backlog replays on one connection at default settings
+    (`TestDeliveryContract_LargeBacklogOnOneConnection`);
+  - [x] a 1000-message burst causes no `slow_client`
+    (`TestDeliveryContract_LiveBurstKeepsFastClientsConnected`);
+  - [x] a reload before the first message loses nothing
+    (`TestHandler_ReconnectBeforeFirstMessageLosesNothing`,
+    `TestDeliveryContract_LinkLossBeforeFirstMessageNeitherReplaysNorSkips`);
+  - [x] an EventSource-style reconnect with `?last-id` in the URL resumes from
+    the header cursor
+    (`TestDeliveryContract_EventSourceReconnectWithURLCursorMakesProgress`);
+  - [x] a recreated stream resumes correctly for a client that reconnects
+    (`TestDeliveryContract_CursorFromARecreatedStreamStillDelivers`); open
+    streams across a recreation are a known limitation, see the backlog;
+  - [x] a consumer deleted mid-stream is recovered
+    (`TestHandler_ConsumerDeletedMidStream_RecreatesAndResumes`).
+- [x] The functional matrix is green on every supported server (per D3),
+  including 2.15: 27 of 27 scenarios on 2.10, 2.12, 2.14 and 2.15.
+- [x] The unit package runs in 20 s or less, and no fixed sleep is used as
+  synchronisation. About 17 s (21.5 s under `-race`). The sleeps left are
+  assertions (the replay-window age, the window in which no late callback may
+  run) or simulate a slow client.
 - [ ] Statement mutants mA, mB, mE, mF, mI and mW are killed, and the gremlins
   baseline is re-recorded.
-- [ ] README, `docs/CONFIGURATION.md`, `docs/OPERATIONS.md` and
+- [x] README, `docs/CONFIGURATION.md`, `docs/OPERATIONS.md` and
   `docs/PERFORMANCE.md` match the shipped behaviour, and a test verifies the
-  memory formula.
+  memory formula (`TestPerformance_StalledClientHoldsABoundedBacklog`).
+  `docs_test.go` holds the configuration defaults, metric names, the fuzz
+  matrix and the AGENTS.md file map to the code.
 
 ## Issue index
 

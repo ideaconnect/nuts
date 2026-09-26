@@ -1,14 +1,20 @@
 package nuts
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 )
 
 // metricReference matches the metric names NUTS registers: every counter ends
@@ -168,5 +174,92 @@ func TestAgentsFileMapListsEveryGoFile(t *testing.T) {
 		if !strings.Contains(string(agents), "["+file+"]("+file+")") {
 			t.Errorf("AGENTS.md does not list %s", file)
 		}
+	}
+}
+
+// TestDocumentedDefaultsMatchProvision keeps the Default column of
+// docs/CONFIGURATION.md in step with what Provision applies. Provision
+// normalises every optional setting before it dials NATS, so a server that
+// refuses the connection still leaves the defaults in place to compare.
+func TestDocumentedDefaultsMatchProvision(t *testing.T) {
+	doc, err := os.ReadFile(filepath.Join("docs", "CONFIGURATION.md"))
+	if err != nil {
+		t.Fatalf("read CONFIGURATION.md: %v", err)
+	}
+	h := &Handler{NatsURL: "nats://127.0.0.1:1", StreamName: "EVENTS", logger: zap.NewNop()}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err == nil {
+		t.Fatal("Provision connected to nats://127.0.0.1:1")
+	}
+	raw, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// Absent (omitempty), false, zero and empty all read as "".
+	normalise := func(s string) string {
+		if s == "false" || s == "0" {
+			return ""
+		}
+		return s
+	}
+	describe := func(v any) string {
+		switch v := v.(type) {
+		case float64:
+			return strconv.FormatFloat(v, 'f', -1, 64)
+		case string:
+			return v
+		case bool:
+			return strconv.FormatBool(v)
+		case []any:
+			parts := make([]string, len(v))
+			for i, item := range v {
+				parts[i] = fmt.Sprint(item)
+			}
+			return strings.Join(parts, " ")
+		}
+		return ""
+	}
+	firstCode := regexp.MustCompile("`([^`]*)`")
+	checked, inTable := 0, false
+	for _, line := range strings.Split(string(doc), "\n") {
+		if strings.HasPrefix(line, "| Caddyfile directive | JSON field | Default |") {
+			inTable = true
+			continue
+		}
+		if !strings.HasPrefix(line, "|") {
+			inTable = false
+		}
+		if !inTable || strings.HasPrefix(line, "| ---") {
+			continue
+		}
+		cells := strings.Split(line, "|")
+		if len(cells) < 4 {
+			t.Fatalf("malformed row: %s", line)
+		}
+		field := strings.Trim(strings.TrimSpace(cells[2]), "`")
+		documented := strings.TrimSpace(cells[3])
+		want := ""
+		switch documented {
+		case "Required":
+			continue
+		case "Empty":
+		default:
+			m := firstCode.FindStringSubmatch(documented)
+			if m == nil {
+				t.Errorf("%s: cannot read the documented default %q", field, documented)
+				continue
+			}
+			want = m[1]
+		}
+		if actual := describe(got[field]); normalise(actual) != normalise(want) {
+			t.Errorf("%s: CONFIGURATION.md says the default is %q, Provision leaves %q", field, want, actual)
+		}
+		checked++
+	}
+	if checked < 25 {
+		t.Fatalf("checked only %d defaults; the table format changed", checked)
 	}
 }
