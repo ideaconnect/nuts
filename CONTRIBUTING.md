@@ -45,28 +45,41 @@ make test-functional
 - Include unit tests for new behavior. If the change affects the HTTP surface,
   also add a Godog scenario under [features/](features/).
 
+### Where tests go
+
+Tests for `x.go` live in `x_test.go`. End-to-end `ServeHTTP` tests
+against an embedded server live in `serve_integration_test.go`; the
+cross-cutting suites (delivery contract, performance, server
+compatibility, Caddy integration, fuzzing, documentation drift) have
+files of their own. A helper used by more than one test file belongs in
+[testutil_test.go](testutil_test.go); one used by a single file stays in
+that file. Start embedded servers with `startJetStreamServer` (options
+adjust `server.Options`; the server stops when the test ends), and use
+`startRestartableJetStreamServer` for tests that restart NATS.
+
 ### Test response recorders
 
 Pick the right recorder for the test pattern, otherwise `-race` (run on
 the full unit suite in CI) will flag a data race:
 
 - **`safeFlushRecorder` / `newSafeRecorder()`** (in
-  [handler_integration_test.go](handler_integration_test.go)) — use when
+  [testutil_test.go](testutil_test.go)) — use when
   the test reads `rr.Body()` **while** the handler goroutine is still
   writing. Internally serialises Write/Body via a mutex. This is the
   right choice for polling-style tests that wait for SSE output to
   appear before cancelling.
 - **`flushRecorder`** (a thin `*httptest.ResponseRecorder` wrapper, in
-  [nats_test.go](nats_test.go)) — use when the test waits for the
+  [testutil_test.go](testutil_test.go)) — use when the test waits for the
   handler goroutine to finish (`<-done`) **before** reading
   `rr.Body.String()`. The wait happens-before any read, so there's no
   race even though `httptest.ResponseRecorder` is not internally
   synchronised.
 - **`failingFlushRecorder`** / **`newFailingFlushRecorder(allowedWrites
-  int)`** — use to exercise write-error disconnect paths (allow N
-  writes, then return an error on every subsequent write). The
-  underlying state is mutex-protected so concurrent reads of `Body()`
-  during a goroutine write are safe.
+  int)`** (in [serve_integration_test.go](serve_integration_test.go)) —
+  use to exercise write-error disconnect paths (allow N writes, then
+  return an error on every subsequent write). It is not synchronised
+  and has no `Body()`: wait for the handler to return (`<-done`) before
+  reading what it recorded.
 
 If you change the synchronisation contract of a streaming test (e.g.
 remove a `<-done` wait, switch to polling), upgrade the recorder
@@ -84,12 +97,13 @@ heartbeat interval) are fine — document why timing is the assertion.
 
 ### Subtest fixture isolation
 
-For tests with multiple `t.Run(...)` subtests that share a single
-`*Handler` and `defer h.Cleanup()`, prefer constructing one handler per
-subtest (or use `t.Cleanup` per-subtest). Shared fixtures couple
-subtest order; a regression in subtest A can corrupt subtest B in ways
-that are hard to bisect. The existing pattern is being phased out — new
-tests should be order-independent.
+Give each `t.Run(...)` subtest its own `*Handler`, cleaned up with
+`t.Cleanup` (`connectHandler` does both). Subtests may share an embedded
+server and stream when each uses subjects of its own and takes stream
+sequences from its publish acks rather than assuming them. Shared
+fixtures couple subtest order; a regression in subtest A can corrupt
+subtest B in ways that are hard to bisect. Every subtest should pass on
+its own: `go test -run 'TestName/^subtest$' .`.
 
 ## Mutation testing
 

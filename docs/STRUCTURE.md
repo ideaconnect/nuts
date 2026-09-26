@@ -74,31 +74,19 @@ Build entry point. Imports the standard Caddy modules plus this module (`github.
 
 ### metrics.go
 
-Prometheus counters and gauges registered via `promauto`. The README metrics table describes each one; `docs_test.go` fails when a document or the ops files name a metric that is not registered here, or when the README or website leave one out.
+Prometheus counters and gauges, registered on the default registry via `promauto` and, at `Provision`, on the registry Caddy's metrics endpoints serve. The README metrics table describes each one; `docs_test.go` fails when a document or the ops files name a metric that is not registered here, or when the README or website leave one out.
 
-### nats_test.go
+### Tests
 
-Core unit and integration tests. Uses an embedded NATS server with JetStream to test validation, Caddyfile parsing, topic filtering, SSE streaming, replay, slow-client disconnect, oversized-event dropping, and cleanup.
+Tests for `x.go` live in `x_test.go`: `caddyfile_test.go`, `provision_test.go` (validation, `Provision`, NATS connections with each auth mode, `Cleanup`), `handler_test.go`, `auth_test.go`, `serve_test.go` (request parsing, replay planning and formatting without live NATS), `consumer_test.go`, `shared_test.go`, `helpers_test.go` and `metrics_test.go`. Alongside them:
 
-### hardening_test.go
-
-Focused tests for security hardening and related correctness items: configurable CORS headers/methods, subscriber JWT authorization, oversized-raw-payload drop, `max_connections` rejection + metric increment, write timeout behavior, config validation (URL schemes, origins, sentinels), cleartext-auth and insecure-TLS warnings, TLS cert/key pairing, `MaxReconnects=0` vs default, integer-directive junk-suffix rejection, custom `health_path`, distinct `live_path` / `ready_path` probe behavior, negative `MaxEventSize` disabling the limit, `replay_max_messages` capping retained replay, `replay_window` switching old cursors to `StartTime`, pre-flight config rejection, and `Cleanup()` waking in-flight SSE handlers.
-
-### handler_integration_test.go
-
-Runtime integration tests for handler behavior that depends on embedded NATS, JetStream state, metrics, TLS material, SSE heartbeat framing, topic-prefix translation, NATS reconnects, retained-message persistence, and multi-topic subscription paths.
-
-### auth_test.go
-
-Unit tests for JWT parsing and validation, subscriber token extraction, and topic-filter validation.
-
-### helpers_test.go
-
-Unit tests for helper edge cases such as cookie-name validation and SSE write deadline behavior.
-
-### serve_test.go
-
-Unit tests for request parsing, replay planning, message formatting, replay cap accounting, subject-filter helpers, readiness responses, and other `serve.go` pure helper behavior.
+- `serve_integration_test.go` runs `ServeHTTP` end to end on an embedded JetStream server: streaming, replay cursors, write failures, probes, heartbeats, topic prefixes and NATS restarts.
+- `hardening_test.go` covers request hardening: CORS, connection, topic and event-size limits, probe paths, replay caps and windows.
+- `delivery_contract_test.go` holds the end-to-end delivery contract over real HTTP, in both subscription modes.
+- `server_compat_test.go` pins the nats-server behaviour NUTS accommodates; `caddy_integration_test.go` runs NUTS inside Caddy.
+- `performance_test.go` holds the load-confidence tests and benchmarks ([PERFORMANCE.md](PERFORMANCE.md)); `fuzz_test.go` and `formatter_test.go` the fuzz targets.
+- `docs_test.go` keeps documentation, ops files, the fuzz workflow and the AGENTS.md file map in step with the code.
+- `testutil_test.go` holds the helpers more than one test file uses: embedded servers, handler set-up, response writers, SSE readers, fakes, metric and log readers, subscriber JWTs.
 
 ### functional_test/main_test.go & steps_test.go
 

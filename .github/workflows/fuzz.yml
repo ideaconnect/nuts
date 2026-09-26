@@ -1,7 +1,8 @@
 name: Fuzz
 
-# Runs Go's native fuzz engine against the five Fuzz* targets defined in
-# fuzz_test.go. PR CI only exercises the seed corpus (every `go test .`
+# Runs Go's native fuzz engine against every Fuzz* target in the package
+# (fuzz_test.go, formatter_test.go; docs_test.go fails when the matrix
+# below misses one). PR CI only exercises the seed corpus (every `go test .`
 # invocation runs the seeds as plain table tests); this workflow adds the
 # random-input exploration phase that catches accept-by-accident edge
 # cases the seeds can't reach.
@@ -35,6 +36,7 @@ jobs:
           - FuzzIsValidCookieName
           - FuzzSubjectMatchesFilter
           - FuzzSubscriberTopicMatches
+          - FuzzFormatMessageEventMatchesReference
 
     steps:
       - name: Checkout
@@ -47,7 +49,7 @@ jobs:
           cache: true
 
       # Per-target duration: the workflow_dispatch input wins; the
-      # scheduled default is 5m per target (25m total across the matrix
+      # scheduled default is 5m per target (30m total across the matrix
       # in parallel, ~5m wall clock).
       - name: Resolve fuzztime
         id: ft

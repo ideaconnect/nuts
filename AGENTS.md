@@ -75,21 +75,25 @@ Tests live alongside the source:
 
 | File | What it covers |
 | --- | --- |
-| [nats_test.go](nats_test.go) | Core unit and integration tests against an embedded NATS server. |
-| [hardening_test.go](hardening_test.go) | Security hardening tests (CORS, JWT, oversized payloads, max connections, timeouts, TLS, replay caps). |
-| [handler_integration_test.go](handler_integration_test.go) | Runtime integration tests for metrics, TLS config, heartbeat, topic prefixing, reconnect, persistence, and multi-topic subscription paths. |
-| [auth_test.go](auth_test.go) | Subscriber JWT parsing, verification, token extraction, and topic-filter validation tests. |
-| [helpers_test.go](helpers_test.go) | Helper edge-case tests for cookie names and SSE write behavior. |
-| [performance_test.go](performance_test.go) | `TestPerformance_*` confidence tests and benchmarks. |
+| [handler_test.go](handler_test.go) | Caddy module registration. |
+| [caddyfile_test.go](caddyfile_test.go) | Caddyfile parsing: every directive, missing and malformed arguments, sentinel values. |
+| [provision_test.go](provision_test.go) | `Validate` and `Provision` (defaults, rejections before dialling, failures that leave nothing behind), NATS connections with token, user/password and TLS auth, reconnects, configuration warnings, `Cleanup`. |
+| [auth_test.go](auth_test.go) | Subscriber JWT parsing, verification, token extraction, topic-filter validation, and enforcement before a consumer exists. |
 | [serve_test.go](serve_test.go) | Request parsing, replay planning, formatting, and stream helper unit tests without live NATS. |
-| [consumer_test.go](consumer_test.go) | Feed unit tests (ordering, oversize drops, backpressure, failure and stop paths) with a fake iterator. |
-| [delivery_contract_test.go](delivery_contract_test.go) | End-to-end delivery contract over real HTTP: no hole after a NATS link loss, large backlogs on one connection, bursts without disconnects, cursor precedence and replay edge cases, plus the server start-sequence behaviour planning relies on. |
-| [caddy_integration_test.go](caddy_integration_test.go) | Caddy-in-the-loop tests via `caddy.Load` (access logs, HTTP metrics). |
+| [serve_integration_test.go](serve_integration_test.go) | `ServeHTTP` end to end on an embedded JetStream server: streaming, replay cursors, write failures, probes, hub discovery, heartbeats, topic prefixes, NATS restarts. |
+| [hardening_test.go](hardening_test.go) | Request hardening: CORS, connection, topic and event-size limits, probe paths, replay caps and windows, oversized cursors. |
+| [consumer_test.go](consumer_test.go) | Feed unit tests (ordering, oversize drops, backpressure, failure and stop paths) with a fake iterator; recovery of a deleted consumer. |
 | [shared_test.go](shared_test.go) | Shared-subscription mechanics (ring, gap-free joins, fall-behind, lifecycle) and end-to-end behaviour; the delivery contract tests also run in shared mode. |
-| [server_compat_test.go](server_compat_test.go) | nats-server behaviour NUTS accommodates, on the embedded server: stream consumer limits, consumer inactive-threshold limits, delete markers and schedules, lame duck mode, the multi-topic purge fix, and teardown. |
+| [helpers_test.go](helpers_test.go) | Helper edge cases: topic and cookie validation, JSON, URL redaction, SSE writes and deadlines, NATS error classification. |
+| [metrics_test.go](metrics_test.go) | Each metric moves with the event it counts; registration on Caddy's registry. |
 | [formatter_test.go](formatter_test.go) | Pins the single-pass frame formatter to the previous `json.Marshal` output: golden edge cases and a fuzz target against a reference implementation. |
-| [docs_test.go](docs_test.go) | Keeps metric names in README, website, docs and ops files in step with `metrics.go`. |
-| [testutil_test.go](testutil_test.go) | Shared test doubles and helpers: fake JetStream messages and iterator, stalled writers, the black-hole TCP proxy, retry-response assertions, custom-stream provisioning. |
+| [delivery_contract_test.go](delivery_contract_test.go) | End-to-end delivery contract over real HTTP: no hole after a NATS link loss, large backlogs on one connection, bursts without disconnects, cursor precedence and replay edge cases, plus the server start-sequence behaviour planning relies on. |
+| [server_compat_test.go](server_compat_test.go) | nats-server behaviour NUTS accommodates, on the embedded server: stream consumer limits, consumer inactive-threshold limits, delete markers and schedules, lame duck mode, the multi-topic purge fix, and teardown. |
+| [caddy_integration_test.go](caddy_integration_test.go) | Caddy-in-the-loop tests via `caddy.Load` (access logs, HTTP metrics, the metrics endpoint). |
+| [performance_test.go](performance_test.go) | `TestPerformance_*` confidence tests and benchmarks. |
+| [fuzz_test.go](fuzz_test.go) | Fuzz targets holding the topic, filter and cookie validators to their contracts in both directions, and the subject matchers to a reference; the nightly Fuzz workflow runs every target. |
+| [docs_test.go](docs_test.go) | Keeps metric names in README, website, docs and ops files in step with `metrics.go`, and the nightly fuzz matrix in step with the `Fuzz` functions. |
+| [testutil_test.go](testutil_test.go) | Helpers shared by more than one test file, by theme: embedded NATS servers (and restarts on the same port), handler set-up, response writers, SSE stream readers and assertions, fakes for the stream path, metric and log readers, subscriber JWTs. A helper used by one file lives in that file. |
 | [functional_test/](functional_test/) | [Godog](https://github.com/cucumber/godog) BDD tests against a real Docker Compose stack. |
 | [features/](features/) | Gherkin `.feature` files driving the Godog suite. |
 
@@ -131,9 +135,10 @@ go build ./cmd/caddy       # equivalent
 | `make lint` | golangci-lint via the pinned container image. |
 | `make release-check` | GoReleaser config validation in a container. |
 
-Race-test policy is intentionally focused — see the `Run focused race tests`
-step in [.github/workflows/ci.yml](.github/workflows/ci.yml). Adding broad
-`-race` runs without justification will not be accepted.
+CI runs the whole unit package under `-race` (the `Run unit tests with -race
+(full package)` step in [.github/workflows/ci.yml](.github/workflows/ci.yml))
+and one functional pass under `-race`. Run `go test -race .` locally before
+pushing changes to concurrent code.
 
 ### Local single-test loop
 

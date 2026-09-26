@@ -305,9 +305,9 @@ func TestHandler_LogSubscriptionCountsOnlyFallbacks(t *testing.T) {
 		{replayModeFallbackStartTime, 1},
 		{replayModeFallbackDeliverAll, 1},
 	} {
-		before := counterVal(t, metricsReplayFallbacks)
+		before := metricValue(t, metricsReplayFallbacks)
 		h.logSubscription(streamPlan{Replay: replayPlan{Mode: c.mode}})
-		if got := counterVal(t, metricsReplayFallbacks) - before; got != c.want {
+		if got := metricValue(t, metricsReplayFallbacks) - before; got != c.want {
 			t.Errorf("mode %s: nuts_replay_fallbacks_total delta = %v, want %v", c.mode, got, c.want)
 		}
 	}
@@ -362,7 +362,7 @@ func TestReplayHistory(t *testing.T) {
 
 func TestHandler_RecordDroppedMessageLogsFormattedEvent(t *testing.T) {
 	h := &Handler{MaxEventSize: 64, logger: zap.NewNop()}
-	before := counterValue(metricsMessagesDropped, dropReasonFormattedSSEMessage)
+	before := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonFormattedSSEMessage))
 
 	h.recordDroppedMessage(formattedMessageEvent{
 		Subject:    "events.big",
@@ -370,7 +370,7 @@ func TestHandler_RecordDroppedMessageLogsFormattedEvent(t *testing.T) {
 		DropSize:   128,
 	})
 
-	if got := counterValue(metricsMessagesDropped, dropReasonFormattedSSEMessage); got != before+1 {
+	if got := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonFormattedSSEMessage)); got != before+1 {
 		t.Fatalf("messages dropped metric (reason=formatted_sse_message) did not increment: before=%v got=%v", before, got)
 	}
 }
@@ -385,9 +385,9 @@ func TestHandler_ServeReadinessCheckReportsMissingRuntime(t *testing.T) {
 	// metric must keep its 1:1 with probe-failure count so
 	// sum(rate(nuts_readiness_failures_total[...])) tracks the real
 	// /readyz error rate.
-	beforeNats := counterValue(metricsReadinessFailures, "nats_disconnected")
-	beforeJS := counterValue(metricsReadinessFailures, "jetstream_missing")
-	beforeStream := counterValue(metricsReadinessFailures, "stream_info_error")
+	beforeNats := metricValue(t, metricsReadinessFailures.WithLabelValues("nats_disconnected"))
+	beforeJS := metricValue(t, metricsReadinessFailures.WithLabelValues("jetstream_missing"))
+	beforeStream := metricValue(t, metricsReadinessFailures.WithLabelValues("stream_info_error"))
 
 	if err := h.serveReadinessCheck(rr); err != nil {
 		t.Fatalf("serveReadinessCheck: %v", err)
@@ -401,15 +401,15 @@ func TestHandler_ServeReadinessCheckReportsMissingRuntime(t *testing.T) {
 		}
 	}
 	// First matched cause (nats_disconnected) increments by exactly 1.
-	if got := counterValue(metricsReadinessFailures, "nats_disconnected"); got != beforeNats+1 {
+	if got := metricValue(t, metricsReadinessFailures.WithLabelValues("nats_disconnected")); got != beforeNats+1 {
 		t.Errorf("nuts_readiness_failures_total{cause=nats_disconnected} = %v, want %v (exactly one increment)", got, beforeNats+1)
 	}
 	// Subsequent causes must NOT increment for the same 503 — the one-shot
 	// guard prevents the documented 1:1 contract from being violated.
-	if got := counterValue(metricsReadinessFailures, "jetstream_missing"); got != beforeJS {
+	if got := metricValue(t, metricsReadinessFailures.WithLabelValues("jetstream_missing")); got != beforeJS {
 		t.Errorf("nuts_readiness_failures_total{cause=jetstream_missing} = %v, want %v (must not double-count when nats_disconnected already fired)", got, beforeJS)
 	}
-	if got := counterValue(metricsReadinessFailures, "stream_info_error"); got != beforeStream {
+	if got := metricValue(t, metricsReadinessFailures.WithLabelValues("stream_info_error")); got != beforeStream {
 		t.Errorf("nuts_readiness_failures_total{cause=stream_info_error} = %v, want %v", got, beforeStream)
 	}
 }
@@ -1030,7 +1030,7 @@ func TestServeStream_ReplayWindowFilterSparesLiveMessages(t *testing.T) {
 	windowStart := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
 	old := windowStart.Add(-time.Hour)
 	plan := streamPlan{Replay: replayPlan{HasLastID: true, HasSnapshot: true, CapSequence: 10, Mode: replayModeFallbackStartTime, StartTime: windowStart}}
-	before := counterValue(metricsMessagesDropped, dropReasonReplayWindow)
+	before := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonReplayWindow))
 
 	body, _ := runServeStreamWithFrames(t, h, plan, []formattedMessageEvent{frameAt(9, old), frameAt(10, windowStart), frameAt(11, old)})
 
@@ -1040,7 +1040,7 @@ func TestServeStream_ReplayWindowFilterSparesLiveMessages(t *testing.T) {
 	if !strings.Contains(body, "id: 10\n") || !strings.Contains(body, "id: 11\n") {
 		t.Fatalf("in-window history or the live message is missing; body=%q", body)
 	}
-	if got := counterValue(metricsMessagesDropped, dropReasonReplayWindow); got != before+1 {
+	if got := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonReplayWindow)); got != before+1 {
 		t.Fatalf("messages_dropped_total{replay_window} = %v, want %v", got, before+1)
 	}
 }
@@ -1053,7 +1053,7 @@ func TestServeStream_ReplayCapHoldsWithoutSnapshot(t *testing.T) {
 	plan := streamPlan{Replay: replayPlan{HasLastID: true, Mode: replayModeStartSequence, StartSequence: 1}}
 	first := frameAt(1, time.Now())
 	first.NumPending = 9
-	before := counterVal(t, metricsReplayCapReached)
+	before := metricValue(t, metricsReplayCapReached)
 
 	body, ended := runServeStreamWithFrames(t, h, plan, []formattedMessageEvent{first, frameAt(2, time.Now()), frameAt(3, time.Now())})
 
@@ -1063,7 +1063,7 @@ func TestServeStream_ReplayCapHoldsWithoutSnapshot(t *testing.T) {
 	if strings.Contains(body, "id: 3\n") {
 		t.Fatalf("message past the cap was delivered; body=%q", body)
 	}
-	if got := counterVal(t, metricsReplayCapReached); got != before+1 {
+	if got := metricValue(t, metricsReplayCapReached); got != before+1 {
 		t.Fatalf("replay_cap_reached_total = %v, want %v", got, before+1)
 	}
 }
@@ -1228,8 +1228,8 @@ func TestHandler_RejectConsumerFailure(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			core, obs := observer.New(zap.DebugLevel)
 			h := &Handler{logger: zap.New(core)}
-			rejectedBefore := counterValue(metricsConnectionsRejected, "stream_consumer_limit")
-			errorsBefore := counterVal(t, metricsSubscriptionErrors)
+			rejectedBefore := metricValue(t, metricsConnectionsRejected.WithLabelValues("stream_consumer_limit"))
+			errorsBefore := metricValue(t, metricsSubscriptionErrors)
 
 			rr := httptest.NewRecorder()
 			h.rejectConsumerFailure(rr, httptest.NewRequest(http.MethodGet, "/events?topic=alpha", nil), testFeedPlan, c.err)
@@ -1240,10 +1240,10 @@ func TestHandler_RejectConsumerFailure(t *testing.T) {
 			if !hasLogField(obs, "disconnect_reason", c.wantReason) {
 				t.Fatalf("missing disconnect_reason=%s: %v", c.wantReason, obs.All())
 			}
-			if got := counterValue(metricsConnectionsRejected, "stream_consumer_limit") - rejectedBefore; got != c.wantRejected {
+			if got := metricValue(t, metricsConnectionsRejected.WithLabelValues("stream_consumer_limit")) - rejectedBefore; got != c.wantRejected {
 				t.Fatalf("connections_rejected_total{stream_consumer_limit} moved by %v, want %v", got, c.wantRejected)
 			}
-			if got := counterVal(t, metricsSubscriptionErrors) - errorsBefore; got != c.wantErrors {
+			if got := metricValue(t, metricsSubscriptionErrors) - errorsBefore; got != c.wantErrors {
 				t.Fatalf("subscription_errors_total moved by %v, want %v", got, c.wantErrors)
 			}
 			if c.wantCode != 0 && !hasIntLogField(obs, "jetstream_error_code", c.wantCode) {
@@ -1251,19 +1251,6 @@ func TestHandler_RejectConsumerFailure(t *testing.T) {
 			}
 		})
 	}
-}
-
-// hasIntLogField reports whether any observed entry carries an integer field
-// with the given key and value.
-func hasIntLogField(obs *observer.ObservedLogs, key string, value int64) bool {
-	for _, entry := range obs.All() {
-		for _, f := range entry.Context {
-			if f.Key == key && f.Integer == value {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func TestJetStreamErrorFields(t *testing.T) {
@@ -1391,13 +1378,6 @@ func TestHandler_LogStreamLimits(t *testing.T) {
 	(&Handler{logger: zap.NewNop()}).logStreamLimits(nil) // must not panic
 }
 
-func btoi(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}
-
 func TestHandler_OpenConsumerStream_RefusedOnceCleanupStarted(t *testing.T) {
 	h := &Handler{closing: true}
 	if _, err := h.openConsumerStream(context.Background(), nil, testFeedPlan); !errors.Is(err, errHandlerClosing) {
@@ -1433,7 +1413,7 @@ func TestServeStream_BatchesQueuedFrames(t *testing.T) {
 		{name: "byte bound", frames: liveFrames(5, 40<<10), wantFrames: []int{2, 2, 1}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			deliveredBefore := counterVal(t, metricsMessagesDelivered)
+			deliveredBefore := metricValue(t, metricsMessagesDelivered)
 			w, _ := serveQueuedFrames(t, h, testFeedPlan, c.frames, len(c.wantFrames)+1)
 			batches := w.batches()[1:] // the connected event is flushed on its own
 			var got []int
@@ -1443,7 +1423,7 @@ func TestServeStream_BatchesQueuedFrames(t *testing.T) {
 			if !reflect.DeepEqual(got, c.wantFrames) {
 				t.Fatalf("frames per flush = %v, want %v", got, c.wantFrames)
 			}
-			if delivered := counterVal(t, metricsMessagesDelivered) - deliveredBefore; delivered != float64(len(c.frames)) {
+			if delivered := metricValue(t, metricsMessagesDelivered) - deliveredBefore; delivered != float64(len(c.frames)) {
 				t.Fatalf("messages_delivered_total moved by %v, want %d", delivered, len(c.frames))
 			}
 		})
@@ -1469,7 +1449,7 @@ func TestServeStream_ReplayCapEndsTheBatch(t *testing.T) {
 	h := &Handler{HeartbeatInterval: 60, ReplayMaxMessages: 5, logger: zap.NewNop()}
 	plan := testFeedPlan
 	plan.Replay = replayPlan{Mode: replayModeStartSequence, HasLastID: true, HasSnapshot: true, StartSequence: 1, CapSequence: 100}
-	capBefore := counterVal(t, metricsReplayCapReached)
+	capBefore := metricValue(t, metricsReplayCapReached)
 	w, ended := serveQueuedFrames(t, h, plan, liveFrames(10, 10), 2)
 	if !ended {
 		t.Fatal("stream kept running after replay_max_messages")
@@ -1478,7 +1458,7 @@ func TestServeStream_ReplayCapEndsTheBatch(t *testing.T) {
 	if len(batches) != 2 || strings.Count(batches[1], "event: message") != 5 || !strings.Contains(batches[1], "id: 5\n") {
 		t.Fatalf("flushes = %q, want the connected event and exactly messages 1..5", batches)
 	}
-	if got := counterVal(t, metricsReplayCapReached); got != capBefore+1 {
+	if got := metricValue(t, metricsReplayCapReached); got != capBefore+1 {
 		t.Fatalf("replay_cap_reached_total = %v, want %v", got, capBefore+1)
 	}
 }
@@ -1605,5 +1585,60 @@ func TestHandler_SetSSEHeaders(t *testing.T) {
 				t.Fatalf("%s = %q, want %q", name, got, value)
 			}
 		}
+	}
+}
+
+func TestSubjectAllowedByStream(t *testing.T) {
+	tests := []struct {
+		name           string
+		subject        string
+		streamSubjects []string
+		want           bool
+	}{
+		{
+			name:           "full wildcard allows nested subject",
+			subject:        "events.alpha.beta",
+			streamSubjects: []string{"events.>"},
+			want:           true,
+		},
+		{
+			name:           "single token wildcard allows one token",
+			subject:        "events.alpha",
+			streamSubjects: []string{"events.*"},
+			want:           true,
+		},
+		{
+			name:           "single token wildcard rejects nested token",
+			subject:        "events.alpha.beta",
+			streamSubjects: []string{"events.*"},
+			want:           false,
+		},
+		{
+			name:           "exact subject match",
+			subject:        "events.alpha",
+			streamSubjects: []string{"events.alpha"},
+			want:           true,
+		},
+		{
+			name:           "unmatched subject",
+			subject:        "orders.alpha",
+			streamSubjects: []string{"events.>"},
+			want:           false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := subjectAllowedByStream(tt.subject, tt.streamSubjects); got != tt.want {
+				t.Fatalf("subjectAllowedByStream(%q, %v) = %v, want %v", tt.subject, tt.streamSubjects, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAllowedMethodsHeader_FiltersToServedMethods(t *testing.T) {
+	got := allowedMethodsHeader([]string{"POST", "get", "GET", "OPTIONS", "TRACE"})
+	if got != "GET, OPTIONS" {
+		t.Fatalf("allowedMethodsHeader() = %q, want GET, OPTIONS", got)
 	}
 }

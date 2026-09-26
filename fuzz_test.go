@@ -7,9 +7,10 @@
 // existing positive/negative examples from the unit suite so the
 // engine starts from known-interesting inputs.
 //
-// CI runs each target for a short bounded time on PR via
-// `go test -run '^$' -fuzz Fuzz... -fuzztime 30s .` Local runs can use
-// a longer fuzztime for deeper exploration.
+// Every `go test` run executes the seed corpus as table tests. The
+// nightly Fuzz workflow (.github/workflows/fuzz.yml) runs each target
+// under the fuzz engine for five minutes; locally, use for example
+// `go test -run '^$' -fuzz '^FuzzIsValidTopic$' -fuzztime 1m .`
 package nuts
 
 import (
@@ -18,11 +19,39 @@ import (
 	"testing"
 )
 
-// FuzzIsValidTopic ensures the topic-character-class predicate never
-// panics on random input and that any accepted topic is composed of
-// only the documented character set (ASCII letters, digits, dot, dash,
-// underscore) without leading/trailing/consecutive dots and no
-// wildcards or system prefixes.
+// topicContractViolation says why in breaks isValidTopic's documented
+// contract, or "" when it meets it: non-empty, at most 256 bytes, no '$'
+// prefix (system subjects), no leading, trailing or consecutive dots, and
+// only ASCII letters, digits, dot, dash and underscore. Written out apart
+// from the validator, so the fuzzer can hold it to the contract both ways.
+func topicContractViolation(in string) string {
+	switch {
+	case in == "":
+		return "empty"
+	case len(in) > maxSubjectLen:
+		return "longer than 256 bytes"
+	case in[0] == '$':
+		return "system-subject $ prefix"
+	case in[0] == '.' || in[len(in)-1] == '.':
+		return "leading or trailing dot"
+	}
+	for i := 0; i < len(in); i++ {
+		c := in[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_'
+		if !ok {
+			return "disallowed byte 0x" + strconv.FormatUint(uint64(c), 16) + " at " + strconv.Itoa(i)
+		}
+		if i > 0 && c == '.' && in[i-1] == '.' {
+			return "consecutive dots at " + strconv.Itoa(i)
+		}
+	}
+	return ""
+}
+
+// FuzzIsValidTopic holds isValidTopic to its documented contract in both
+// directions: it accepts no topic the contract forbids (wildcards, system
+// prefixes, stray dots, bytes outside the set) and rejects none it allows.
 func FuzzIsValidTopic(f *testing.F) {
 	for _, s := range []string{
 		"", "orders", "orders.created", "orders_new", "orders-new",
@@ -30,157 +59,125 @@ func FuzzIsValidTopic(f *testing.F) {
 		"*", ">", "$SYS", "orders.>", "orders.*",
 		"orders.created\n", "orders/created", "événements",
 		"a" + "\x00" + "b",
+		strings.Repeat("a", maxSubjectLen), strings.Repeat("a", maxSubjectLen+1),
 	} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, in string) {
-		// Predicate must not panic regardless of input.
-		got := isValidTopic(in)
-		if !got {
-			return
-		}
-		// If accepted, verify the documented contract (helpers.go:117):
-		// non-empty, ≤ 256 bytes, no '$' prefix (system subject), no
-		// leading/trailing/consecutive dots, and only allowed bytes
-		// (ASCII letters, digits, dot, dash, underscore).
-		if in == "" {
-			t.Fatal("isValidTopic accepted empty string")
-		}
-		const maxTopicLen = 256
-		if len(in) > maxTopicLen {
-			t.Fatalf("accepted topic of length %d (max %d): %q", len(in), maxTopicLen, in)
-		}
-		if in[0] == '$' {
-			t.Fatalf("accepted system-subject topic with $-prefix: %q", in)
-		}
-		if in[0] == '.' || in[len(in)-1] == '.' {
-			t.Fatalf("accepted topic with leading/trailing dot: %q", in)
-		}
-		for i := 0; i < len(in); i++ {
-			c := in[i]
-			ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-				(c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_'
-			if !ok {
-				t.Fatalf("accepted topic %q has disallowed byte 0x%02x at position %d", in, c, i)
-			}
-			if i > 0 && c == '.' && in[i-1] == '.' {
-				t.Fatalf("accepted topic %q has consecutive dots at position %d", in, i)
-			}
+		violation := topicContractViolation(in)
+		switch got := isValidTopic(in); {
+		case got && violation != "":
+			t.Fatalf("isValidTopic accepted %q: %s", in, violation)
+		case !got && violation == "":
+			t.Fatalf("isValidTopic rejected %q, which meets the documented contract", in)
 		}
 	})
 }
 
-// FuzzIsValidTopicFilter exercises the JWT-claim filter validator.
-// Accepts:
-//   - the bare wildcards "*" and ">"
-//   - any non-empty filter ≤ 256 bytes, no '$' prefix, no leading/
-//     trailing/consecutive dots, where each dot-separated token is
-//     either "*" or ">" (the latter only as the final token) or a
-//     non-empty string of [A-Za-z0-9_-].
-//
-// The fuzz body asserts every accepted input meets this contract so a
-// regression that opened the filter to whitespace, NULs, $-prefixes,
-// or '>' in non-final position would surface.
+// topicFilterContractViolation says why in breaks isValidTopicFilter's
+// documented contract, or "" when it meets it: the bare wildcards "*" and
+// ">", or a non-empty filter of at most 256 bytes, without a '$' prefix or
+// leading, trailing or consecutive dots, whose dot-separated tokens are "*",
+// ">" (final token only) or non-empty runs of [A-Za-z0-9_-].
+func topicFilterContractViolation(in string) string {
+	switch {
+	case in == "":
+		return "empty"
+	case len(in) > maxSubjectLen:
+		return "longer than 256 bytes"
+	case in[0] == '$':
+		return "system-subject $ prefix"
+	case in == "*" || in == ">":
+		return ""
+	case in[0] == '.' || in[len(in)-1] == '.':
+		return "leading or trailing dot"
+	}
+	tokens := strings.Split(in, ".")
+	for idx, tok := range tokens {
+		switch tok {
+		case "":
+			return "empty token at " + strconv.Itoa(idx)
+		case ">":
+			if idx != len(tokens)-1 {
+				return "'>' before the final token"
+			}
+			continue
+		case "*":
+			continue
+		}
+		for j := 0; j < len(tok); j++ {
+			c := tok[j]
+			ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') || c == '-' || c == '_'
+			if !ok {
+				return "token " + strconv.Quote(tok) + " has disallowed byte 0x" + strconv.FormatUint(uint64(c), 16)
+			}
+		}
+	}
+	return ""
+}
+
+// FuzzIsValidTopicFilter holds the JWT-claim filter validator to its
+// documented contract in both directions, so a regression that opened the
+// filter to whitespace, NULs, $-prefixes or a non-final '>', or one that
+// started refusing legitimate filters, surfaces.
 func FuzzIsValidTopicFilter(f *testing.F) {
 	for _, s := range []string{
 		"", "*", ">", "orders.>", "orders.created", "orders.*",
 		"a.>", "a.b.>", "a..>", ".>", ">.", ".", "..", "a..b",
-		"a/b", "ä", "a\x00b", "ABC", "A1.B2.C3",
+		"a/b", "ä", "a\x00b", "ABC", "A1.B2.C3", "*.*.>", "a.>.b",
+		"tenant-1.orders_new.*", "orders-created",
+		strings.Repeat("a", maxSubjectLen), strings.Repeat("a", maxSubjectLen+1),
 	} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, in string) {
-		got := isValidTopicFilter(in)
-		if !got {
-			return
-		}
-		// Contract: non-empty, ≤ 256 bytes, no '$' prefix.
-		if in == "" {
-			t.Fatal("isValidTopicFilter accepted empty string")
-		}
-		const maxFilterLen = 256
-		if len(in) > maxFilterLen {
-			t.Fatalf("accepted filter of length %d (max %d): %q", len(in), maxFilterLen, in)
-		}
-		if in[0] == '$' {
-			t.Fatalf("accepted system-subject filter with $-prefix: %q", in)
-		}
-		// Bare wildcards are accepted and short-circuit token parsing.
-		if in == "*" || in == ">" {
-			return
-		}
-		// No leading/trailing/consecutive dots.
-		if in[0] == '.' || in[len(in)-1] == '.' {
-			t.Fatalf("accepted filter with leading/trailing dot: %q", in)
-		}
-		for i := 1; i < len(in); i++ {
-			if in[i] == '.' && in[i-1] == '.' {
-				t.Fatalf("accepted filter with consecutive dots: %q", in)
-			}
-		}
-		// Token-level contract.
-		tokens := strings.Split(in, ".")
-		for idx, tok := range tokens {
-			if tok == "" {
-				t.Fatalf("accepted filter with empty token at index %d: %q", idx, in)
-			}
-			if tok == ">" {
-				if idx != len(tokens)-1 {
-					t.Fatalf("accepted '>' token not in final position (idx=%d/%d): %q", idx, len(tokens)-1, in)
-				}
-				continue
-			}
-			if tok == "*" {
-				continue
-			}
-			for j := 0; j < len(tok); j++ {
-				c := tok[j]
-				ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-					(c >= '0' && c <= '9') || c == '-' || c == '_'
-				if !ok {
-					t.Fatalf("accepted filter token %q has disallowed byte 0x%02x: %q", tok, c, in)
-				}
-			}
+		violation := topicFilterContractViolation(in)
+		switch got := isValidTopicFilter(in); {
+		case got && violation != "":
+			t.Fatalf("isValidTopicFilter accepted %q: %s", in, violation)
+		case !got && violation == "":
+			t.Fatalf("isValidTopicFilter rejected %q, which meets the documented contract", in)
 		}
 	})
 }
 
-// FuzzIsValidCookieName exercises the cookie-name validator. RFC 6265
-// allows: letters, digits, and !#$%&'*+-.^_`|~ . Anything else must
-// be rejected; the predicate must never panic.
+// cookieNameContractViolation says why in is not an RFC 6265 cookie name,
+// or "" when it is one: a non-empty run of letters, digits and
+// !#$%&'*+-.^_`|~ .
+func cookieNameContractViolation(in string) string {
+	const allowedPunct = "!#$%&'*+-.^_`|~"
+	if in == "" {
+		return "empty"
+	}
+	for i := 0; i < len(in); i++ {
+		c := in[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || strings.IndexByte(allowedPunct, c) >= 0
+		if !ok {
+			return "disallowed byte 0x" + strconv.FormatUint(uint64(c), 16) + " at " + strconv.Itoa(i)
+		}
+	}
+	return ""
+}
+
+// FuzzIsValidCookieName holds the cookie-name validator to RFC 6265 in both
+// directions.
 func FuzzIsValidCookieName(f *testing.F) {
 	for _, s := range []string{
 		"", "session", "session_id", "X-Auth", "a.b.c",
 		"contains space", "with;semicolon", "tab\tinside",
-		"unicode_ä", "0", "A", "a" + "\x00" + "b", "@@@",
+		"unicode_ä", "0", "A", "a" + "\x00" + "b", "@@@", "!#$%&'*+-.^_`|~",
 	} {
 		f.Add(s)
 	}
-	const allowedPunct = "!#$%&'*+-.^_`|~"
 	f.Fuzz(func(t *testing.T, in string) {
-		got := isValidCookieName(in)
-		if !got {
-			return
-		}
-		if in == "" {
-			t.Fatal("isValidCookieName accepted empty string")
-		}
-		for i := 0; i < len(in); i++ {
-			c := in[i]
-			ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-				(c >= '0' && c <= '9')
-			if !ok {
-				// Punctuation check via the allowed set.
-				for j := 0; j < len(allowedPunct); j++ {
-					if c == allowedPunct[j] {
-						ok = true
-						break
-					}
-				}
-			}
-			if !ok {
-				t.Fatalf("accepted cookie name %q has disallowed byte 0x%02x at position %d", in, c, i)
-			}
+		violation := cookieNameContractViolation(in)
+		switch got := isValidCookieName(in); {
+		case got && violation != "":
+			t.Fatalf("isValidCookieName accepted %q: %s", in, violation)
+		case !got && violation == "":
+			t.Fatalf("isValidCookieName rejected %q, which meets RFC 6265", in)
 		}
 	})
 }

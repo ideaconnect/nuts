@@ -165,6 +165,12 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   about 0.4 µs instead of 1.2 µs, a 64 KiB one about half the time and a
   quarter of the memory, with one allocation instead of seven. The output is
   byte-identical, which a fuzz test checks against the previous formatter.
+- The unit tests follow the source layout (#131): tests for `x.go` live in
+  `x_test.go`, helpers shared between files in `testutil_test.go`, and every
+  subtest gets its own handler and passes on its own. Duplicate tests were
+  merged. The validator fuzz tests also check that valid input is accepted,
+  and the nightly fuzz workflow now runs the formatter's fuzz target, which
+  it had never run.
 - `nuts_nats_connection_events_total{event="closed"}` no longer counts the
   connection NUTS closes itself on shutdown or reload (#73).
 - `nats_idle_heartbeat` now sets the heartbeat of every pull request. When

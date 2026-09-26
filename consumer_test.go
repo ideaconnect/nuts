@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -15,8 +16,6 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
-
-var testFeedPlan = streamPlan{Topics: []string{"alpha"}, FullSubjects: []string{"events.alpha"}}
 
 func receiveFrame(t *testing.T, feed *streamFeed) formattedMessageEvent {
 	t.Helper()
@@ -61,7 +60,7 @@ func TestStreamFeed_DropsOversizedPayloadsBeforeTheWriter(t *testing.T) {
 	it := newFakeIterator(8)
 	feed := h.startStreamFeed(it, testFeedPlan)
 	defer feed.stop()
-	before := counterValue(metricsMessagesDropped, dropReasonRawPayload)
+	before := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonRawPayload))
 
 	it.msgs <- newFakeJSMsg("events.alpha", 1, "c_1", `{"ok":1}`)
 	it.msgs <- newFakeJSMsg("events.alpha", 2, "c_1", `{"blob":"`+strings.Repeat("x", 200)+`"}`)
@@ -73,7 +72,7 @@ func TestStreamFeed_DropsOversizedPayloadsBeforeTheWriter(t *testing.T) {
 	if got := receiveFrame(t, feed).StreamSequence; got != 3 {
 		t.Fatalf("second frame seq = %d, want 3 (2 is oversized)", got)
 	}
-	if got := counterValue(metricsMessagesDropped, dropReasonRawPayload); got != before+1 {
+	if got := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonRawPayload)); got != before+1 {
 		t.Fatalf("messages_dropped_total{raw_payload} = %v, want %v", got, before+1)
 	}
 }
@@ -166,7 +165,7 @@ func TestServeStream_ClosesWhenTheConsumerCannotBeRecreated(t *testing.T) {
 	errs := make(chan error, 1)
 	errs <- errFakeResetFailed
 	feed := &streamFeed{frames: make(chan formattedMessageEvent), errs: errs, stop: func() {}}
-	before := counterValue(metricsConsumerInvalidated, "unrecoverable")
+	before := metricValue(t, metricsConsumerInvalidated.WithLabelValues("unrecoverable"))
 
 	done := make(chan error, 1)
 	go func() {
@@ -180,7 +179,7 @@ func TestServeStream_ClosesWhenTheConsumerCannotBeRecreated(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("serveStream kept running after the consumer failed for good")
 	}
-	if got := counterValue(metricsConsumerInvalidated, "unrecoverable"); got != before+1 {
+	if got := metricValue(t, metricsConsumerInvalidated.WithLabelValues("unrecoverable")); got != before+1 {
 		t.Fatalf("consumer_invalidated_total{unrecoverable} = %v, want %v", got, before+1)
 	}
 	if !hasLogField(obs, "disconnect_reason", "consumer_unrecoverable") {
@@ -204,14 +203,6 @@ func (f fakeDeleteJS) DeleteConsumer(context.Context, string, string) error {
 }
 
 func (f fakeDeleteJS) Conn() *nats.Conn { return f.conn }
-
-// fakeConsumer is a jetstream.Consumer with fixed cached info.
-type fakeConsumer struct {
-	jetstream.Consumer
-	info *jetstream.ConsumerInfo
-}
-
-func (f fakeConsumer) CachedInfo() *jetstream.ConsumerInfo { return f.info }
 
 // TestConsumerStream_DeleteFailureIsLogged covers #84: a failed consumer
 // delete names the stream's topics and the consumer, so the lingering
@@ -291,4 +282,60 @@ func TestConsumerStream_NoDeleteWhileDisconnected(t *testing.T) {
 		t.Fatal("tried to delete the consumer over a dead connection")
 	case <-time.After(50 * time.Millisecond):
 	}
+}
+
+// TestHandler_ConsumerDeletedMidStream_RecreatesAndResumes covers what M9
+// Batch B was meant to fix: a consumer lost on the server (reaped, deleted,
+// dropped with a leafnode route) used to leave the SSE stream open and silent.
+// The ordered consumer detects the missing heartbeats, recreates itself from
+// the last delivered sequence, and the stream continues without a gap.
+func TestHandler_ConsumerDeletedMidStream_RecreatesAndResumes(t *testing.T) {
+	h, _, nc := newProvisionedHandler(t)
+	defer nc.Close()
+	defer h.Cleanup()
+	h.NatsIdleHeartbeat = 1
+	h.HeartbeatInterval = 60
+	core, obs := observer.New(zap.InfoLevel)
+	h.logger = zap.New(core)
+	js, _ := nc.JetStream()
+	admin, _ := jetstream.New(nc)
+
+	rr, cancel, done := startSSE(t, h, "/events?topic=alpha", "")
+	if _, err := js.Publish("events.alpha", []byte(`{"n":1}`)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if !waitForSSEBody(rr, `{"n":1}`, 3*time.Second) {
+		t.Fatalf("first message not delivered; body=%q", rr.Body())
+	}
+	info := waitForFirstConsumer(t, admin, "EVENTS", time.Second)
+	if info == nil {
+		t.Fatal("no consumer to delete")
+	}
+	recreatedBefore := metricValue(t, metricsConsumerInvalidated.WithLabelValues("recreated"))
+	if err := admin.DeleteConsumer(context.Background(), "EVENTS", info.Name); err != nil {
+		t.Fatalf("DeleteConsumer: %v", err)
+	}
+	for _, n := range []string{"2", "3"} {
+		if _, err := js.Publish("events.alpha", []byte(`{"n":`+n+`}`)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+	if !waitForSSEBody(rr, `{"n":3}`, 10*time.Second) {
+		t.Fatalf("stream did not recover after the consumer was deleted; body=%q", rr.Body())
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("SSE handler exited (err=%v) instead of recovering", err)
+	default:
+	}
+	if got := parseSSEIDs(t, rr.Body()); !reflect.DeepEqual(got, []uint64{0, 1, 2, 3}) {
+		t.Fatalf("ids = %v, want contiguous [0 1 2 3]", got)
+	}
+	if got := metricValue(t, metricsConsumerInvalidated.WithLabelValues("recreated")); got <= recreatedBefore {
+		t.Fatalf("nuts_consumer_invalidated_total{reason=recreated} = %v, want > %v", got, recreatedBefore)
+	}
+	if !hasLogField(obs, "previous_consumer", info.Name) {
+		t.Fatalf("no recreation log naming the deleted consumer %q; logs=%v", info.Name, obs.All())
+	}
+	stopSSE(t, cancel, done)
 }

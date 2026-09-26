@@ -37,8 +37,7 @@ var (
 )
 
 func TestPerformance_ConcurrentSSEClientsReceiveRealisticMessageRate(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
+	h, _, nc := newProvisionedHandler(t)
 	defer nc.Close()
 	defer h.Cleanup()
 	h.ClientBufferSize = 128
@@ -97,15 +96,14 @@ func TestPerformance_ConcurrentSSEClientsReceiveRealisticMessageRate(t *testing.
 }
 
 func TestPerformance_SlowReaderDisconnectsWithoutGoroutineLeak(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
+	h, _, nc := newProvisionedHandler(t)
 	defer nc.Close()
 	defer h.Cleanup()
 	h.WriteTimeout = 1
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = h.ServeHTTP(w, r, nil) }))
 	defer srv.Close()
 	jsPub, _ := nc.JetStream()
-	slowBefore := counterVal(t, metricsSlowClientDisconnects)
+	slowBefore := metricValue(t, metricsSlowClientDisconnects)
 	baselineGoroutines := runtime.NumGoroutine()
 
 	// A client that sends the request and never reads the response.
@@ -130,7 +128,7 @@ func TestPerformance_SlowReaderDisconnectsWithoutGoroutineLeak(t *testing.T) {
 		}
 	}
 	start := time.Now()
-	for counterVal(t, metricsSlowClientDisconnects) == slowBefore {
+	for metricValue(t, metricsSlowClientDisconnects) == slowBefore {
 		if time.Since(start) > performanceSlowDisconnectBudget {
 			t.Fatalf("stalled reader not disconnected within %s", performanceSlowDisconnectBudget)
 		}
@@ -386,7 +384,7 @@ func TestPerformance_SharedFanOutBurst(t *testing.T) {
 	if got := consumerCount(mustJetStream(t, nc), "EVENTS"); got != 1 {
 		t.Fatalf("consumers = %d, want 1 shared", got)
 	}
-	reconnectsBefore := counterValue(metricsNATSConnectionEvents, "reconnect")
+	reconnectsBefore := metricValue(t, metricsNATSConnectionEvents.WithLabelValues("reconnect"))
 	js, _ := nc.JetStream()
 	payload := []byte(`{"blob":"` + strings.Repeat("x", 64*1024) + `"}`)
 	start := time.Now()
@@ -405,7 +403,7 @@ func TestPerformance_SharedFanOutBurst(t *testing.T) {
 	if elapsed > performanceSharedBurstBudget {
 		t.Fatalf("fan-out took %s, budget %s", elapsed, performanceSharedBurstBudget)
 	}
-	if got := counterValue(metricsNATSConnectionEvents, "reconnect"); got != reconnectsBefore {
+	if got := metricValue(t, metricsNATSConnectionEvents.WithLabelValues("reconnect")); got != reconnectsBefore {
 		t.Fatalf("NATS reconnected %v times during the burst", got-reconnectsBefore)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -111,27 +112,61 @@ func TestNutsCollectorsCoverEveryMetric(t *testing.T) {
 	}
 }
 
-func TestRegisterMetrics(t *testing.T) {
-	registry := prometheus.NewPedanticRegistry()
-	for i := 0; i < 2; i++ { // a second nuts handler in the same config
-		if err := registerMetrics(registry); err != nil {
-			t.Fatalf("registerMetrics (call %d): %v", i+1, err)
-		}
-	}
-	families, err := registry.Gather()
+// TestFuzzWorkflowRunsEveryTarget keeps the nightly fuzz workflow's matrix
+// in step with the package's Fuzz functions, so a new target does not end up
+// running only against its seeds.
+func TestFuzzWorkflowRunsEveryTarget(t *testing.T) {
+	workflow, err := os.ReadFile(filepath.Join(".github", "workflows", "fuzz.yml"))
 	if err != nil {
-		t.Fatalf("Gather: %v", err)
+		t.Fatalf("read fuzz.yml: %v", err)
 	}
-	found := false
-	for _, family := range families {
-		if family.GetName() == "nuts_active_connections" {
-			found = true
+	inMatrix := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(?m)^\s+- (Fuzz\w+)\s*$`).FindAllStringSubmatch(string(workflow), -1) {
+		inMatrix[m[1]] = true
+	}
+	files, err := filepath.Glob("*_test.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	defined := map[string]bool{}
+	for _, file := range files {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		for _, m := range regexp.MustCompile(`(?m)^func (Fuzz\w+)\(f \*testing\.F\)`).FindAllStringSubmatch(string(src), -1) {
+			defined[m[1]] = true
 		}
 	}
-	if !found {
-		t.Fatal("nuts_active_connections missing from the registry")
+	if len(defined) == 0 {
+		t.Fatal("found no Fuzz functions; the pattern is out of date")
 	}
-	if err := registerMetrics(nil); err != nil {
-		t.Fatalf("registerMetrics(nil) = %v, want no-op", err)
+	for name := range defined {
+		if !inMatrix[name] {
+			t.Errorf("%s is missing from the matrix in .github/workflows/fuzz.yml", name)
+		}
+	}
+	for name := range inMatrix {
+		if !defined[name] {
+			t.Errorf(".github/workflows/fuzz.yml runs %s, which no test file defines", name)
+		}
+	}
+}
+
+// TestAgentsFileMapListsEveryGoFile keeps the file map in AGENTS.md from
+// drifting when source or test files are added, split or renamed.
+func TestAgentsFileMapListsEveryGoFile(t *testing.T) {
+	agents, err := os.ReadFile("AGENTS.md")
+	if err != nil {
+		t.Fatalf("read AGENTS.md: %v", err)
+	}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	for _, file := range files {
+		if !strings.Contains(string(agents), "["+file+"]("+file+")") {
+			t.Errorf("AGENTS.md does not list %s", file)
+		}
 	}
 }

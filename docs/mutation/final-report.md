@@ -73,7 +73,7 @@ explicitly-accepted defensive guards in `serve.go`.
 | File | Tests added |
 | ---- | ----------- |
 | [`serve_test.go`](../../serve_test.go) | `TestHandler_ReadStreamSnapshot_StreamInfoErrorReturnsEmptySnapshot`, `TestHandler_ReadStreamSnapshot_GetMsgErrorKeepsSnapshotWithoutStartTime`, `TestHandler_FinalizeStreamedMessage` (table-driven, 3 sub-cases) |
-| [`handler_integration_test.go`](../../handler_integration_test.go) | `TestHandler_ConnectNATS_TLSConfigErrorPropagates` |
+| [`provision_test.go`](../../provision_test.go) (then `handler_integration_test.go`) | `TestHandler_ConnectNATS_TLSConfigErrorPropagates` |
 
 No new tests were written for `auth.go` or `helpers.go`. The character-class
 refactor surfaced the coverage that was already there from existing tests.

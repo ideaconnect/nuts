@@ -12,7 +12,6 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,8 +39,8 @@ func TestServeHTTP_StreamConsumerLimitIsRetryable(t *testing.T) {
 	h.logger = zap.New(core)
 	_, cancel, done := startSSE(t, h, "/events?topic=a", "")
 	defer stopSSE(t, cancel, done)
-	rejectedBefore := counterValue(metricsConnectionsRejected, "stream_consumer_limit")
-	errorsBefore := counterVal(t, metricsSubscriptionErrors)
+	rejectedBefore := metricValue(t, metricsConnectionsRejected.WithLabelValues("stream_consumer_limit"))
+	errorsBefore := metricValue(t, metricsSubscriptionErrors)
 
 	rr := httptest.NewRecorder()
 	if err := h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/events?topic=b", nil), nil); err != nil {
@@ -60,10 +59,10 @@ func TestServeHTTP_StreamConsumerLimitIsRetryable(t *testing.T) {
 	}
 	assertRetryStream(t, rr, "Stream consumer limit reached")
 
-	if got := counterValue(metricsConnectionsRejected, "stream_consumer_limit"); got != rejectedBefore+2 {
+	if got := metricValue(t, metricsConnectionsRejected.WithLabelValues("stream_consumer_limit")); got != rejectedBefore+2 {
 		t.Fatalf("connections_rejected_total{stream_consumer_limit} = %v, want %v", got, rejectedBefore+2)
 	}
-	if got := counterVal(t, metricsSubscriptionErrors); got != errorsBefore {
+	if got := metricValue(t, metricsSubscriptionErrors); got != errorsBefore {
 		t.Fatalf("subscription_errors_total moved %v -> %v for a limit rejection", errorsBefore, got)
 	}
 	if !hasLogField(obs, "disconnect_reason", "stream_consumer_limit") {
@@ -112,7 +111,7 @@ func TestServeStream_SkipsSubjectDeleteMarkers(t *testing.T) {
 	js := mustJetStream(t, nc)
 	rr, cancel, done := startSSE(t, h, "/events?topic=expiring", "")
 	defer stopSSE(t, cancel, done)
-	droppedBefore := counterValue(metricsMessagesDropped, dropReasonControlMessage)
+	droppedBefore := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonControlMessage))
 
 	ctx, cancelPub := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelPub()
@@ -137,7 +136,7 @@ func TestServeStream_SkipsSubjectDeleteMarkers(t *testing.T) {
 	if strings.Contains(rr.Body(), `"payload":""`) {
 		t.Fatalf("marker reached the client as an empty event; body=%q", rr.Body())
 	}
-	if got := counterValue(metricsMessagesDropped, dropReasonControlMessage); got != droppedBefore+1 {
+	if got := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonControlMessage)); got != droppedBefore+1 {
 		t.Fatalf("messages_dropped_total{control_message} = %v, want %v", got, droppedBefore+1)
 	}
 }
@@ -197,7 +196,6 @@ func waitForLastMsg(t *testing.T, js jetstream.JetStream, subject string, match 
 // logging through a handler Caddy had already unloaded.
 func TestConnectNATS_NoCallbacksAfterCleanup(t *testing.T) {
 	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
 	nc, err := nats.Connect(ns.ClientURL())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
@@ -209,7 +207,7 @@ func TestConnectNATS_NoCallbacksAfterCleanup(t *testing.T) {
 	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	closedBefore := counterValue(metricsNATSConnectionEvents, "closed")
+	closedBefore := metricValue(t, metricsNATSConnectionEvents.WithLabelValues("closed"))
 
 	if err := h.Cleanup(); err != nil {
 		t.Fatalf("Cleanup: %v", err)
@@ -218,7 +216,7 @@ func TestConnectNATS_NoCallbacksAfterCleanup(t *testing.T) {
 	if obs.FilterMessage("NATS connection closed").Len() != 0 {
 		t.Fatalf("closed callback ran after Cleanup: %v", obs.All())
 	}
-	if got := counterValue(metricsNATSConnectionEvents, "closed"); got != closedBefore {
+	if got := metricValue(t, metricsNATSConnectionEvents.WithLabelValues("closed")); got != closedBefore {
 		t.Fatalf("nats_connection_events_total{closed} moved %v -> %v after Cleanup", closedBefore, got)
 	}
 }
@@ -227,22 +225,10 @@ func TestConnectNATS_NoCallbacksAfterCleanup(t *testing.T) {
 // entering lame duck mode is about to go away, which operators want to see
 // before the disconnect.
 func TestConnectNATS_LameDuckModeIsLoggedAndCounted(t *testing.T) {
-	ns, err := server.NewServer(&server.Options{
-		Host:                "127.0.0.1",
-		Port:                -1,
-		JetStream:           true,
-		StoreDir:            t.TempDir(),
-		LameDuckDuration:    time.Second,
-		LameDuckGracePeriod: 100 * time.Millisecond,
+	ns := startJetStreamServer(t, func(o *server.Options) {
+		o.LameDuckDuration = time.Second
+		o.LameDuckGracePeriod = 100 * time.Millisecond
 	})
-	if err != nil {
-		t.Fatalf("server: %v", err)
-	}
-	go ns.Start()
-	if !ns.ReadyForConnections(5 * time.Second) {
-		t.Fatal("server not ready")
-	}
-	defer ns.Shutdown()
 	nc, err := nats.Connect(ns.ClientURL())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
@@ -256,14 +242,14 @@ func TestConnectNATS_LameDuckModeIsLoggedAndCounted(t *testing.T) {
 		t.Fatalf("Provision: %v", err)
 	}
 	defer h.Cleanup()
-	before := counterValue(metricsNATSConnectionEvents, "lame_duck")
+	before := metricValue(t, metricsNATSConnectionEvents.WithLabelValues("lame_duck"))
 
 	go ns.LameDuckShutdown()
 	deadline := time.Now().Add(5 * time.Second)
-	for counterValue(metricsNATSConnectionEvents, "lame_duck") == before && time.Now().Before(deadline) {
+	for metricValue(t, metricsNATSConnectionEvents.WithLabelValues("lame_duck")) == before && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if got := counterValue(metricsNATSConnectionEvents, "lame_duck"); got != before+1 {
+	if got := metricValue(t, metricsNATSConnectionEvents.WithLabelValues("lame_duck")); got != before+1 {
 		t.Fatalf("nats_connection_events_total{lame_duck} = %v, want %v", got, before+1)
 	}
 	if obs.FilterMessageSnippet("lame duck mode").Len() != 1 {
@@ -276,8 +262,7 @@ func TestConnectNATS_LameDuckModeIsLoggedAndCounted(t *testing.T) {
 // deleting their consumers, leaving them on the server until
 // InactiveThreshold reaped them.
 func TestCleanup_DeletesStreamConsumersBeforeClosing(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
+	h, _, nc := newProvisionedHandler(t)
 	defer nc.Close()
 	admin := mustJetStream(t, nc)
 
@@ -312,22 +297,6 @@ func TestCleanup_DeletesStreamConsumersBeforeClosing(t *testing.T) {
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("request after Cleanup = %d, want 503", rr.Code)
 	}
-}
-
-// gatedWriter lets the first allow writes through and blocks the rest until
-// gate is closed, standing in for a client that has stopped reading.
-type gatedWriter struct {
-	*safeFlushRecorder
-	allow int32
-	gate  chan struct{}
-	n     atomic.Int32
-}
-
-func (g *gatedWriter) Write(p []byte) (int, error) {
-	if g.n.Add(1) > g.allow {
-		<-g.gate
-	}
-	return g.safeFlushRecorder.Write(p)
 }
 
 // TestServeStream_PurgingOneTopicKeepsTheOthersPending covers #111: purging
@@ -437,14 +406,14 @@ func TestConnectNATS_ClosedEventCountsTerminalCloses(t *testing.T) {
 		t.Fatalf("connectNATS: %v", err)
 	}
 	defer h.Cleanup()
-	before := counterValue(metricsNATSConnectionEvents, "closed")
+	before := metricValue(t, metricsNATSConnectionEvents.WithLabelValues("closed"))
 
 	ns.Shutdown() // with max_reconnects 0 the connection closes for good
 	deadline := time.Now().Add(5 * time.Second)
-	for counterValue(metricsNATSConnectionEvents, "closed") == before && time.Now().Before(deadline) {
+	for metricValue(t, metricsNATSConnectionEvents.WithLabelValues("closed")) == before && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := counterValue(metricsNATSConnectionEvents, "closed"); got != before+1 {
+	if got := metricValue(t, metricsNATSConnectionEvents.WithLabelValues("closed")); got != before+1 {
 		t.Fatalf("nats_connection_events_total{closed} = %v, want %v", got, before+1)
 	}
 	if obs.FilterMessage("NATS connection closed").Len() != 1 {

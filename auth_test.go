@@ -13,6 +13,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
+	"go.uber.org/zap"
 )
 
 func TestJWTHMACHash_AllAlgs(t *testing.T) {
@@ -154,7 +157,7 @@ func TestExtractSubscriberToken_InvalidAuthHeaderShapes(t *testing.T) {
 func TestVerifySubscriberJWT_DecodeErrors(t *testing.T) {
 	secret := []byte("test-secret")
 	now := time.Unix(1700000000, 0)
-	validPayload := encodeJWTPartTesting(t, map[string]interface{}{"subscribe": "*", "exp": now.Add(time.Hour).Unix()})
+	validPayload := encodeTestJWTPart(t, map[string]interface{}{"subscribe": "*", "exp": now.Add(time.Hour).Unix()})
 
 	t.Run("header b64 invalid", func(t *testing.T) {
 		token := "!!!." + validPayload + "." + base64.RawURLEncoding.EncodeToString([]byte("sig"))
@@ -170,14 +173,14 @@ func TestVerifySubscriberJWT_DecodeErrors(t *testing.T) {
 		}
 	})
 	t.Run("signature b64 invalid", func(t *testing.T) {
-		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		header := encodeTestJWTPart(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
 		token := header + "." + validPayload + ".!!!"
 		if _, err := verifySubscriberJWT(token, secret, now); err == nil {
 			t.Fatal("expected signature decode error")
 		}
 	})
 	t.Run("payload b64 invalid", func(t *testing.T) {
-		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		header := encodeTestJWTPart(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
 		badPayload := "!!!"
 		mac := hmac.New(sha256.New, secret)
 		mac.Write([]byte(header + "." + badPayload))
@@ -187,7 +190,7 @@ func TestVerifySubscriberJWT_DecodeErrors(t *testing.T) {
 		}
 	})
 	t.Run("payload JSON invalid", func(t *testing.T) {
-		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		header := encodeTestJWTPart(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
 		badPayload := base64.RawURLEncoding.EncodeToString([]byte("not-json"))
 		mac := hmac.New(sha256.New, secret)
 		mac.Write([]byte(header + "." + badPayload))
@@ -197,8 +200,8 @@ func TestVerifySubscriberJWT_DecodeErrors(t *testing.T) {
 		}
 	})
 	t.Run("HS512 token verifies", func(t *testing.T) {
-		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS512", "typ": "JWT"})
-		payload := encodeJWTPartTesting(t, map[string]interface{}{"subscribe": "*"})
+		header := encodeTestJWTPart(t, map[string]interface{}{"alg": "HS512", "typ": "JWT"})
+		payload := encodeTestJWTPart(t, map[string]interface{}{"subscribe": "*"})
 		mac := hmac.New(sha512.New, secret)
 		mac.Write([]byte(header + "." + payload))
 		token := header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
@@ -230,7 +233,7 @@ func TestAuth_LimitBoundaries(t *testing.T) {
 	// flipping `>` to `>=` would pass all those subtests.
 	buildSizedToken := func(t *testing.T, totalLen int) string {
 		t.Helper()
-		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		header := encodeTestJWTPart(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
 		// Iterative calibration: each loop adjusts pad to converge on the
 		// target. Worst case we converge in a couple of iterations because
 		// each padded byte adds a known amount of base64-encoded output.
@@ -240,7 +243,7 @@ func TestAuth_LimitBoundaries(t *testing.T) {
 				"subscribe": "*",
 				"pad":       strings.Repeat("A", pad),
 			}
-			payload := encodeJWTPartTesting(t, payloadObj)
+			payload := encodeTestJWTPart(t, payloadObj)
 			mac := hmac.New(sha256.New, secret)
 			mac.Write([]byte(header + "." + payload))
 			sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
@@ -302,12 +305,12 @@ func TestAuth_LimitBoundaries(t *testing.T) {
 	})
 
 	t.Run("subscribe claim at filter count limit accepted", func(t *testing.T) {
-		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
+		header := encodeTestJWTPart(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
 		filters := make([]string, maxSubscribeClaimFilters)
 		for i := range filters {
 			filters[i] = fmt.Sprintf("topic.f%d", i)
 		}
-		payload := encodeJWTPartTesting(t, map[string]interface{}{"subscribe": filters})
+		payload := encodeTestJWTPart(t, map[string]interface{}{"subscribe": filters})
 		mac := hmac.New(sha256.New, secret)
 		mac.Write([]byte(header + "." + payload))
 		token := header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
@@ -356,15 +359,6 @@ func toInterfaceSlice(s []string) []interface{} {
 	return out
 }
 
-func encodeJWTPartTesting(t *testing.T, value interface{}) string {
-	t.Helper()
-	b, err := json.Marshal(value)
-	if err != nil {
-		t.Fatalf("marshal JWT part: %v", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
 // TestAuthorizeStreamRequest_RejectionMetrics asserts that each rejection
 // branch in authorizeStreamRequest bumps the documented label on
 // nuts_connections_rejected_total. Without this an attacker probing the
@@ -377,25 +371,21 @@ func TestAuthorizeStreamRequest_RejectionMetrics(t *testing.T) {
 	plan := streamPlan{Topics: []string{"orders.created"}}
 
 	t.Run("auth_missing_token", func(t *testing.T) {
-		before := counterValue(metricsConnectionsRejected, "auth_missing_token")
+		before := metricValue(t, metricsConnectionsRejected.WithLabelValues("auth_missing_token"))
 		req := httptest.NewRequest(http.MethodGet, "/events?topic=orders.created", nil)
 		err := h.authorizeStreamRequest(req, plan)
 		if err == nil || err.status != http.StatusUnauthorized {
 			t.Fatalf("want 401 token-missing rejection, got %#v", err)
 		}
-		if got := counterValue(metricsConnectionsRejected, "auth_missing_token"); got != before+1 {
+		if got := metricValue(t, metricsConnectionsRejected.WithLabelValues("auth_missing_token")); got != before+1 {
 			t.Errorf("auth_missing_token counter did not increment: %v -> %v", before, got)
 		}
 	})
 
 	t.Run("auth_invalid_token", func(t *testing.T) {
-		before := counterValue(metricsConnectionsRejected, "auth_invalid_token")
+		before := metricValue(t, metricsConnectionsRejected.WithLabelValues("auth_invalid_token"))
 		// Structurally valid HS256 token signed with a different key.
-		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
-		payload := encodeJWTPartTesting(t, map[string]interface{}{"subscribe": "*", "exp": now.Add(time.Hour).Unix()})
-		mac := hmac.New(sha256.New, []byte("wrong-secret"))
-		mac.Write([]byte(header + "." + payload))
-		token := header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		token := signTestSubscriberJWT(t, "wrong-secret", map[string]interface{}{"subscribe": "*", "exp": now.Add(time.Hour).Unix()})
 
 		req := httptest.NewRequest(http.MethodGet, "/events?topic=orders.created", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -403,22 +393,18 @@ func TestAuthorizeStreamRequest_RejectionMetrics(t *testing.T) {
 		if err == nil || err.status != http.StatusUnauthorized {
 			t.Fatalf("want 401 invalid-token rejection, got %#v", err)
 		}
-		if got := counterValue(metricsConnectionsRejected, "auth_invalid_token"); got != before+1 {
+		if got := metricValue(t, metricsConnectionsRejected.WithLabelValues("auth_invalid_token")); got != before+1 {
 			t.Errorf("auth_invalid_token counter did not increment: %v -> %v", before, got)
 		}
 	})
 
 	t.Run("auth_topic_forbidden", func(t *testing.T) {
-		before := counterValue(metricsConnectionsRejected, "auth_topic_forbidden")
+		before := metricValue(t, metricsConnectionsRejected.WithLabelValues("auth_topic_forbidden"))
 		// Valid token whose subscribe claim does NOT include orders.created.
-		header := encodeJWTPartTesting(t, map[string]interface{}{"alg": "HS256", "typ": "JWT"})
-		payload := encodeJWTPartTesting(t, map[string]interface{}{
+		token := signTestSubscriberJWT(t, secret, map[string]interface{}{
 			"subscribe": []string{"other.topic"},
 			"exp":       now.Add(time.Hour).Unix(),
 		})
-		mac := hmac.New(sha256.New, []byte(secret))
-		mac.Write([]byte(header + "." + payload))
-		token := header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 
 		req := httptest.NewRequest(http.MethodGet, "/events?topic=orders.created", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -426,8 +412,239 @@ func TestAuthorizeStreamRequest_RejectionMetrics(t *testing.T) {
 		if err == nil || err.status != http.StatusForbidden {
 			t.Fatalf("want 403 topic-forbidden rejection, got %#v", err)
 		}
-		if got := counterValue(metricsConnectionsRejected, "auth_topic_forbidden"); got != before+1 {
+		if got := metricValue(t, metricsConnectionsRejected.WithLabelValues("auth_topic_forbidden")); got != before+1 {
 			t.Errorf("auth_topic_forbidden counter did not increment: %v -> %v", before, got)
 		}
 	})
+}
+
+func TestHandler_SubscriberJWT_RequiresTokenBeforeStreaming(t *testing.T) {
+	h := &Handler{SubscriberJWTKey: "test-secret", logger: zap.NewNop()}
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=private", nil)
+	rr := httptest.NewRecorder()
+
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+	if got := rr.Header().Get("WWW-Authenticate"); got == "" {
+		t.Fatal("missing WWW-Authenticate header")
+	}
+	if strings.Contains(rr.Body.String(), "JetStream not available") {
+		t.Fatalf("unauthenticated request reached streaming runtime: %q", rr.Body.String())
+	}
+}
+
+func TestHandler_SubscriberJWT_AuthorizesTopicClaims(t *testing.T) {
+	secret := "test-secret"
+	token := signTestSubscriberJWT(t, secret, map[string]interface{}{
+		"sub":       "alice",
+		"subscribe": []string{"orders.*", "invoices.paid"},
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	h := &Handler{SubscriberJWTKey: secret, logger: zap.NewNop()}
+
+	allowedReq := httptest.NewRequest(http.MethodGet, "/events?topic=orders.created&topic=invoices.paid", nil)
+	allowedReq.Header.Set("Authorization", "Bearer "+token)
+	allowedPlan, requestErr := h.parseStreamRequest(allowedReq)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest: %v", requestErr)
+	}
+	if authErr := h.authorizeStreamRequest(allowedReq, allowedPlan); authErr != nil {
+		t.Fatalf("authorizeStreamRequest returned %#v, want allowed", authErr)
+	}
+
+	blockedReq := httptest.NewRequest(http.MethodGet, "/events?topic=admin.audit", nil)
+	blockedReq.Header.Set("Authorization", "Bearer "+token)
+	blockedPlan, requestErr := h.parseStreamRequest(blockedReq)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest: %v", requestErr)
+	}
+	if authErr := h.authorizeStreamRequest(blockedReq, blockedPlan); authErr == nil || authErr.status != http.StatusForbidden {
+		t.Fatalf("authorizeStreamRequest = %#v, want 403", authErr)
+	}
+}
+
+func TestHandler_SubscriberJWT_AcceptsConfiguredCookie(t *testing.T) {
+	secret := "test-secret"
+	token := signTestSubscriberJWT(t, secret, map[string]interface{}{
+		"sub":       "browser-client",
+		"subscribe": "tenant-a.>",
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	h := &Handler{
+		SubscriberJWTKey:    secret,
+		SubscriberJWTCookie: "nuts_session",
+		logger:              zap.NewNop(),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=tenant-a.orders", nil)
+	req.AddCookie(&http.Cookie{Name: "nuts_session", Value: token})
+	plan, requestErr := h.parseStreamRequest(req)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest: %v", requestErr)
+	}
+	if authErr := h.authorizeStreamRequest(req, plan); authErr != nil {
+		t.Fatalf("authorizeStreamRequest returned %#v, want allowed", authErr)
+	}
+}
+
+func TestHandler_SubscriberJWT_RejectsExpiredToken(t *testing.T) {
+	secret := "test-secret"
+	token := signTestSubscriberJWT(t, secret, map[string]interface{}{
+		"sub":       "alice",
+		"subscribe": "*",
+		"exp":       time.Now().Add(-time.Minute).Unix(),
+	})
+	h := &Handler{SubscriberJWTKey: secret, logger: zap.NewNop()}
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=orders", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	plan, requestErr := h.parseStreamRequest(req)
+	if requestErr != nil {
+		t.Fatalf("parseStreamRequest: %v", requestErr)
+	}
+	if authErr := h.authorizeStreamRequest(req, plan); authErr == nil || authErr.status != http.StatusUnauthorized {
+		t.Fatalf("authorizeStreamRequest = %#v, want 401", authErr)
+	}
+}
+
+func unsignedTestJWT(t *testing.T, alg string, claims map[string]interface{}) string {
+	t.Helper()
+	return encodeTestJWTPart(t, map[string]interface{}{"alg": alg, "typ": "JWT"}) + "." + encodeTestJWTPart(t, claims) + "."
+}
+
+func TestSubscriberJWTVerifier_RejectsInvalidTokens(t *testing.T) {
+	secret := "test-secret"
+	now := time.Now()
+	tooManyFilters := make([]string, maxSubscribeClaimFilters+1)
+	for i := range tooManyFilters {
+		tooManyFilters[i] = "orders"
+	}
+	tests := []struct {
+		name  string
+		token string
+	}{
+		{name: "oversized token", token: strings.Repeat("a", maxSubscriberJWTLen+1)},
+		{name: "malformed", token: "one.two"},
+		{name: "unsupported algorithm", token: unsignedTestJWT(t, "none", map[string]interface{}{"subscribe": "*"})},
+		{name: "bad signature", token: signTestSubscriberJWT(t, "wrong-secret", map[string]interface{}{"subscribe": "*", "exp": now.Add(time.Hour).Unix()})},
+		{name: "missing subscribe", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"exp": now.Add(time.Hour).Unix()})},
+		{name: "empty subscribe", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": []string{}, "exp": now.Add(time.Hour).Unix()})},
+		{name: "too many subscribe entries", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": tooManyFilters, "exp": now.Add(time.Hour).Unix()})},
+		{name: "invalid subscribe filter", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": "orders/created", "exp": now.Add(time.Hour).Unix()})},
+		{name: "not before future", token: signTestSubscriberJWT(t, secret, map[string]interface{}{"subscribe": "*", "nbf": now.Add(time.Hour).Unix()})},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := verifySubscriberJWT(tt.token, []byte(secret), now); err == nil {
+				t.Fatal("expected verifySubscriberJWT to reject token")
+			}
+		})
+	}
+}
+
+func TestSubscriberTopicMatches(t *testing.T) {
+	tests := []struct {
+		name   string
+		topic  string
+		filter string
+		want   bool
+	}{
+		{name: "exact", topic: "orders.created", filter: "orders.created", want: true},
+		{name: "single token wildcard", topic: "orders.created", filter: "orders.*", want: true},
+		{name: "tail wildcard", topic: "tenant-a.orders.created", filter: "tenant-a.>", want: true},
+		{name: "route wildcard", topic: "anything.here", filter: "*", want: true},
+		{name: "single token wildcard does not cross dots", topic: "orders.created.high", filter: "orders.*", want: false},
+		{name: "different tenant", topic: "tenant-b.orders", filter: "tenant-a.>", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := subscriberTopicMatches(tt.topic, tt.filter); got != tt.want {
+				t.Fatalf("subscriberTopicMatches(%q, %q) = %v, want %v", tt.topic, tt.filter, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHandler_SubscriberJWT_RejectionCreatesNoConsumer asserts that a
+// JWT-rejected request short-circuits BEFORE any JetStream consumer is
+// created. A regression that flipped the order (subscribe first, auth
+// later) would silently weaken auth: a forged token would still have
+// caused server-side state to be allocated, leaving room for amplification
+// or resource-exhaustion attacks.
+func TestHandler_SubscriberJWT_RejectionCreatesNoConsumer(t *testing.T) {
+	ns := startJetStreamServer(t)
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	h := &Handler{
+		NatsURL:           ns.ClientURL(),
+		StreamName:        "EVENTS",
+		TopicPrefix:       "events.",
+		HeartbeatInterval: 30,
+		AllowedOrigins:    []string{"*"},
+		SubscriberJWTKey:  "test-secret-with-sufficient-length-12345",
+		logger:            zap.NewNop(),
+	}
+	js := connectHandler(t, h)
+
+	// Baseline: no consumers on the stream.
+	if !waitForConsumerCount(t, js, "EVENTS", 0, 500*time.Millisecond) {
+		t.Fatalf("baseline: expected 0 consumers, got otherwise")
+	}
+
+	// Request with a deliberately invalid JWT.
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=secret", nil)
+	req.Header.Set("Authorization", "Bearer not.a.valid.token")
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+
+	// Post-rejection: assert no consumer was created. authorizeStreamRequest
+	// runs SYNCHRONOUSLY inside ServeHTTP before executeSubscriptionPlan
+	// and before any goroutine is spawned on the auth-reject path, so a
+	// single post-call check is sufficient — there is no later moment at
+	// which a racing consumer-create could appear. The 401 above proves
+	// we took the reject branch; this assertion proves the branch did
+	// not allocate JetStream state on the way out.
+	if got := consumerCount(js, "EVENTS"); got != 0 {
+		t.Fatalf("post-rejection: consumer count = %d, want 0 (auth must run before the consumer is created)", got)
+	}
+}
+
+// TestHandler_SubscriberJWT_CookieConfiguredButMissing covers #87: with the
+// cookie transport configured, a request without the cookie, or with an
+// empty one, and no Authorization header is refused.
+func TestHandler_SubscriberJWT_CookieConfiguredButMissing(t *testing.T) {
+	h := &Handler{SubscriberJWTKey: "test-secret", SubscriberJWTCookie: "nuts_session", logger: zap.NewNop()}
+	for name, cookie := range map[string]*http.Cookie{
+		"no cookie":    nil,
+		"empty cookie": {Name: "nuts_session", Value: ""},
+		"other cookie": {Name: "unrelated", Value: "x"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/events?topic=a", nil)
+			if cookie != nil {
+				req.AddCookie(cookie)
+			}
+			rr := httptest.NewRecorder()
+			if err := h.ServeHTTP(rr, req, nil); err != nil {
+				t.Fatalf("ServeHTTP: %v", err)
+			}
+			if rr.Code != http.StatusUnauthorized || rr.Header().Get("WWW-Authenticate") != `Bearer realm="nuts"` {
+				t.Fatalf("response = %d (WWW-Authenticate %q), want 401 with a Bearer challenge", rr.Code, rr.Header().Get("WWW-Authenticate"))
+			}
+		})
+	}
 }

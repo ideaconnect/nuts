@@ -11,32 +11,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"go.uber.org/zap"
 )
-
-// newTestSharedSub builds a shared subscription without a JetStream consumer,
-// registered under key "k". stopped counts calls that would stop its feed.
-func newTestSharedSub(floor uint64) (*sharedSub, *int) {
-	stopped := 0
-	registry := newSharedRegistry()
-	sub := &sharedSub{
-		h:        &Handler{logger: zap.NewNop()},
-		registry: registry,
-		key:      "k",
-		stream: &consumerStream{
-			feed:     &streamFeed{stop: func() { stopped++ }},
-			consumer: fakeConsumer{},
-			release:  func() {},
-			log:      zap.NewNop(),
-		},
-		done:    make(chan struct{}),
-		floor:   floor,
-		clients: map[*sharedClient]struct{}{},
-	}
-	registry.subs["k"] = sub
-	metricsSharedSubscriptions.Inc()
-	return sub, &stopped
-}
 
 func sharedFrame(seq uint64) formattedMessageEvent {
 	return formattedMessageEvent{StreamSequence: seq, HasStreamSequence: true, Frame: "frame"}
@@ -115,7 +90,7 @@ func TestSharedSub_FullQueueMovesTheClientOff(t *testing.T) {
 	sub, _ := newTestSharedSub(0)
 	slow := sub.attach(0, 2)
 	fast := sub.attach(0, 64)
-	before := counterValue(metricsSharedTransitions, sharedTransitionFellBehind)
+	before := metricValue(t, metricsSharedTransitions.WithLabelValues(sharedTransitionFellBehind))
 	for seq := uint64(1); seq <= 3; seq++ {
 		sub.publish(sharedFrame(seq))
 	}
@@ -131,7 +106,7 @@ func TestSharedSub_FullQueueMovesTheClientOff(t *testing.T) {
 	if got := drain(fast); len(got) != 3 {
 		t.Fatalf("fast client got %v, want all 3", got)
 	}
-	if got := counterValue(metricsSharedTransitions, sharedTransitionFellBehind); got != before+1 {
+	if got := metricValue(t, metricsSharedTransitions.WithLabelValues(sharedTransitionFellBehind)); got != before+1 {
 		t.Fatalf("shared_transitions_total{fell_behind} = %v, want %v", got, before+1)
 	}
 }
@@ -163,7 +138,7 @@ func TestSharedSub_ClosesWhenEveryClientFellBehind(t *testing.T) {
 
 func TestSharedSub_LastLeaveClosesTheSubscription(t *testing.T) {
 	sub, stopped := newTestSharedSub(0)
-	gauge := gaugeVal(t, metricsSharedSubscriptions)
+	gauge := metricValue(t, metricsSharedSubscriptions)
 	a := sub.attach(0, 4)
 	b := sub.attach(0, 4)
 	sub.leave(a)
@@ -178,7 +153,7 @@ func TestSharedSub_LastLeaveClosesTheSubscription(t *testing.T) {
 	if sub.registry.subs["k"] != nil {
 		t.Fatal("closed subscription still registered")
 	}
-	if got := gaugeVal(t, metricsSharedSubscriptions); got != gauge-1 {
+	if got := metricValue(t, metricsSharedSubscriptions); got != gauge-1 {
 		t.Fatalf("shared_subscriptions = %v, want %v", got, gauge-1)
 	}
 	if c := sub.attach(0, 4); c != nil {
@@ -220,7 +195,7 @@ func sharedStreamConfig() jetstream.StreamConfig {
 func TestShared_LiveClientsShareOneConsumer(t *testing.T) {
 	_, srv, nc := newSharedContractServer(t, nil)
 	js, _ := nc.JetStream()
-	gaugeBefore := gaugeVal(t, metricsSharedSubscriptions)
+	gaugeBefore := metricValue(t, metricsSharedSubscriptions)
 
 	var streams []*sseReader
 	for i := 0; i < 5; i++ {
@@ -233,7 +208,7 @@ func TestShared_LiveClientsShareOneConsumer(t *testing.T) {
 	if got := consumerCount(mustJetStream(t, nc), "EVENTS"); got != 1 {
 		t.Fatalf("consumers for 5 live clients = %d, want 1 shared", got)
 	}
-	if got := gaugeVal(t, metricsSharedSubscriptions); got != gaugeBefore+1 {
+	if got := metricValue(t, metricsSharedSubscriptions); got != gaugeBefore+1 {
 		t.Fatalf("shared_subscriptions = %v, want %v", got, gaugeBefore+1)
 	}
 	publishRange(t, js, "events.a", 1, 20)
@@ -252,7 +227,7 @@ func TestShared_ReplayClientJoinsAfterCatchingUp(t *testing.T) {
 	js, _ := nc.JetStream()
 	admin := mustJetStream(t, nc)
 	publishRange(t, js, "events.a", 1, 50)
-	joinedBefore := counterValue(metricsSharedTransitions, sharedTransitionJoined)
+	joinedBefore := metricValue(t, metricsSharedTransitions.WithLabelValues(sharedTransitionJoined))
 
 	live := openSSEStream(t, srv.URL+"/events?topic=a", "")
 	live.collectIDs(1, 3*time.Second)
@@ -264,7 +239,7 @@ func TestShared_ReplayClientJoinsAfterCatchingUp(t *testing.T) {
 	publishRange(t, js, "events.a", 51, 60)
 	assertContiguousIDs(t, replaying.collectIDs(10, 3*time.Second), 51, 60)
 	assertContiguousIDs(t, live.collectIDs(10, 3*time.Second), 51, 60)
-	if got := counterValue(metricsSharedTransitions, sharedTransitionJoined); got < joinedBefore+2 {
+	if got := metricValue(t, metricsSharedTransitions.WithLabelValues(sharedTransitionJoined)); got < joinedBefore+2 {
 		t.Fatalf("shared_transitions_total{joined} = %v, want at least %v", got, joinedBefore+2)
 	}
 }
@@ -279,7 +254,7 @@ func TestShared_SlowClientFallsBackWithoutLoss(t *testing.T) {
 		h.ClientBufferSize = 4
 	})
 	js, _ := nc.JetStream()
-	fellBefore := counterValue(metricsSharedTransitions, sharedTransitionFellBehind)
+	fellBefore := metricValue(t, metricsSharedTransitions.WithLabelValues(sharedTransitionFellBehind))
 
 	fast, cancelFast, doneFast := startSSE(t, h, "/events?topic=a", "")
 	defer stopSSE(t, cancelFast, doneFast)
@@ -316,7 +291,7 @@ func TestShared_SlowClientFallsBackWithoutLoss(t *testing.T) {
 		t.Fatalf("slow client ids = %v, want the connected cursor first", ids)
 	}
 	assertContiguousIDs(t, ids[1:], 1, 30)
-	if got := counterValue(metricsSharedTransitions, sharedTransitionFellBehind); got != fellBefore+1 {
+	if got := metricValue(t, metricsSharedTransitions.WithLabelValues(sharedTransitionFellBehind)); got != fellBefore+1 {
 		t.Fatalf("shared_transitions_total{fell_behind} = %v, want %v", got, fellBefore+1)
 	}
 	cancel()

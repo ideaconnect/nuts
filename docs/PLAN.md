@@ -540,13 +540,23 @@ Several of these are good first issues.
   - [x] Add a quiet window to exact-count steps.
   - [x] Add a contiguous-ids step.
   - [x] Expose a metrics endpoint in the functional stack.
-- [ ] **[#131] Hygiene.** *nit · M*
-  - [ ] Split `nats_test.go` by source file, with a shared `testutil_test.go`.
-  - [ ] Keep one server-start helper and one counter reader.
-  - [ ] Isolate subtests.
-  - [ ] Fix documentation drift in CONTRIBUTING, the AGENTS.md race-test note
-    and the `fuzz_test.go` comment.
-  - [ ] Stop restart tests from reusing a port after releasing it.
+- [x] **[#131] Hygiene.** *nit · M*
+  - [x] Split `nats_test.go` by source file, with a shared `testutil_test.go`.
+    Every test now sits in the file of the source it tests; the move was
+    checked declaration by declaration.
+  - [x] Keep one server-start helper and one counter reader
+    (`startJetStreamServer` with options, `metricValue`), plus
+    `connectHandler` for the connect-and-attach boilerplate. Duplicate
+    tests merged: three Cleanup tests, three oversize-drop tests.
+  - [x] Isolate subtests: a handler per subtest; the replay subtest takes
+    its cursor from the publish ack. Each subtest passes on its own.
+  - [x] Fix documentation drift in CONTRIBUTING, the AGENTS.md race-test note
+    and the `fuzz_test.go` comment. `docs_test.go` now also fails when the
+    AGENTS.md file map or the nightly fuzz matrix misses a file or target
+    (the formatter fuzz target had never run nightly).
+  - [x] Stop restart tests from reusing a port after releasing it: the first
+    server takes a free port itself, and Caddy tests listen on `:0`.
+  - [x] Validator fuzzers check both directions (valid ⇒ accepted too).
 - [x] **[#61] Fuzz properties.** *minor · S*
   - [x] Add property assertions to `FuzzSubjectMatchesFilter` and
     `FuzzSubscriberTopicMatches`. This is needed before [#124].

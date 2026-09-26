@@ -5,13 +5,13 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/standard"
 	_ "github.com/caddyserver/caddy/v2/modules/metrics"
 	"github.com/nats-io/nats.go"
@@ -23,26 +23,36 @@ import (
 // (e.g. `,"write_timeout": 5`). Returns the base URL.
 func loadCaddyWithNUTS(t *testing.T, natsURL, serverExtra, handlerExtra string) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	cfg := fmt.Sprintf(`{
+	return runCaddy(t, fmt.Sprintf(`{
 		"admin": {"disabled": true},
 		"logging": {"logs": {"default": {"level": "ERROR"}}},
 		"apps": {"http": {"servers": {"nuts": {
-			"listen": ["127.0.0.1:%d"],
+			"listen": ["127.0.0.1:0"],
 			%s
 			"routes": [{"handle": [{"handler": "nuts", "nats_url": %q, "stream_name": "EVENTS", "topic_prefix": "events."%s}]}]
 		}}}}
-	}`, port, serverExtra, natsURL, handlerExtra)
+	}`, serverExtra, natsURL, handlerExtra))
+}
+
+// runCaddy loads cfg, whose "nuts" server listens on a free port (":0"),
+// stops Caddy when the test ends, and returns the base URL of the port the
+// server got. Letting the server pick the port leaves no gap in which
+// another process could take it.
+func runCaddy(t *testing.T, cfg string) string {
+	t.Helper()
 	if err := caddy.Load([]byte(cfg), true); err != nil {
 		t.Fatalf("caddy.Load: %v", err)
 	}
 	t.Cleanup(func() { _ = caddy.Stop() })
-	return fmt.Sprintf("http://127.0.0.1:%d", port)
+	app, err := caddy.ActiveContext().App("http")
+	if err != nil {
+		t.Fatalf("http app: %v", err)
+	}
+	listeners := app.(*caddyhttp.App).Servers["nuts"].Listeners()
+	if len(listeners) == 0 {
+		t.Fatal("the nuts server has no listener")
+	}
+	return "http://" + listeners[0].Addr().String()
 }
 
 // readSSEUntil reads lines from an SSE body until one has the given prefix
@@ -71,7 +81,6 @@ func readSSEUntil(t *testing.T, lines <-chan string, prefix string) string {
 // into a 500 "Streaming not supported".
 func TestCaddy_StreamsWithAccessLogsAndHTTPMetrics(t *testing.T) {
 	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
 	nc, err := nats.Connect(ns.ClientURL())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
@@ -128,7 +137,6 @@ func TestCaddy_StreamsWithAccessLogsAndHTTPMetrics(t *testing.T) {
 // routes share the collectors.
 func TestCaddy_MetricsEndpointExposesNUTSMetrics(t *testing.T) {
 	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
 	nc, err := nats.Connect(ns.ClientURL())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
@@ -136,30 +144,19 @@ func TestCaddy_MetricsEndpointExposesNUTSMetrics(t *testing.T) {
 	defer nc.Close()
 	createTestStream(t, nc, "EVENTS", []string{"events.>"})
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
 	nuts := fmt.Sprintf(`{"handler": "nuts", "nats_url": %q, "stream_name": "EVENTS", "topic_prefix": "events."}`, ns.ClientURL())
-	cfg := fmt.Sprintf(`{
+	base := runCaddy(t, fmt.Sprintf(`{
 		"admin": {"disabled": true},
 		"logging": {"logs": {"default": {"level": "ERROR"}}},
 		"apps": {"http": {"servers": {"nuts": {
-			"listen": ["127.0.0.1:%d"],
+			"listen": ["127.0.0.1:0"],
 			"routes": [
 				{"match": [{"path": ["/metrics"]}], "handle": [{"handler": "metrics"}]},
 				{"match": [{"path": ["/a/*"]}], "handle": [{"handler": "rewrite", "strip_path_prefix": "/a"}, %s]},
 				{"handle": [%s]}
 			]
 		}}}}
-	}`, port, nuts, nuts)
-	if err := caddy.Load([]byte(cfg), true); err != nil {
-		t.Fatalf("caddy.Load: %v", err)
-	}
-	t.Cleanup(func() { _ = caddy.Stop() })
-	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	}`, nuts, nuts))
 
 	stream, err := http.Get(base + "/events?topic=alpha")
 	if err != nil {

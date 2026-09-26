@@ -3,8 +3,10 @@ package nuts
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,21 +179,6 @@ func TestClassifyNATSAsyncError_ConsumerNotActive_PrimaryHeartbeatMissPath(t *te
 	}
 }
 
-// TestMetrics_ConsumerInvalidated_RegisteredWithExpectedLabels locks the
-// metric's label set: dashboards and alerts reference reason="recreated" and
-// reason="unrecoverable". Their increments are asserted, as deltas, by the
-// consumer recovery and unrecoverable-consumer tests.
-func TestMetrics_ConsumerInvalidated_RegisteredWithExpectedLabels(t *testing.T) {
-	for _, reason := range []string{"recreated", "unrecoverable"} {
-		if _, err := metricsConsumerInvalidated.GetMetricWithLabelValues(reason); err != nil {
-			t.Fatalf("consumer_invalidated_total{reason=%q}: %v", reason, err)
-		}
-	}
-	if _, err := metricsConsumerInvalidated.GetMetricWithLabelValues("recreated", "extra"); err == nil {
-		t.Fatal("consumer_invalidated_total accepted two labels, want exactly reason")
-	}
-}
-
 // flushErrorOnlyWriter has the shape of caddyhttp's responseRecorder (used when
 // access logs or HTTP metrics are on): it wraps a ResponseWriter and exposes
 // FlushError and Unwrap, but not http.Flusher.
@@ -268,4 +255,144 @@ func TestWriteSSEChunk_FlushesThroughFlushErrorAndReturnsItsError(t *testing.T) 
 			t.Fatalf("writeSSEChunkWithTimeout err = %v, want %v", err, boom)
 		}
 	})
+}
+
+func TestToJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    interface{}
+		expected string
+	}{
+		{
+			name:     "simple map",
+			input:    map[string]string{"key": "value"},
+			expected: `{"key":"value"}`,
+		},
+		{
+			name:     "slice of strings",
+			input:    []string{"a", "b", "c"},
+			expected: `["a","b","c"]`,
+		},
+		{
+			name:     "nested structure",
+			input:    map[string]interface{}{"nested": map[string]int{"count": 42}},
+			expected: `{"nested":{"count":42}}`,
+		},
+		{
+			name:     "marshal error returns empty object",
+			input:    math.Inf(1),
+			expected: `{}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := toJSON(tt.input)
+			if result != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestIsValidTopic(t *testing.T) {
+	tests := []struct {
+		name  string
+		topic string
+		want  bool
+	}{
+		{"simple", "events.test", true},
+		{"with dashes", "my-topic", true},
+		{"with dots", "a.b.c", true},
+		{"empty", "", false},
+		{"double dot", "a..b", false},
+		{"control char", "a\x00b", false},
+		{"newline", "a\nb", false},
+		{"wildcard star", "events.*", false},
+		{"wildcard gt", "events.>", false},
+		{"dollar prefix", "$SYS.test", false},
+		{"dollar JS", "$JS.API", false},
+		{"max length", strings.Repeat("a", 256), true},
+		{"over max length", strings.Repeat("a", 257), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isValidTopic(tt.topic); got != tt.want {
+				t.Errorf("isValidTopic(%q) = %v, want %v", tt.topic, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRedactURL(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"no userinfo", "nats://localhost:4222", "nats://localhost:4222"},
+		{"with token", "nats://secret@localhost:4222", "nats://REDACTED@localhost:4222"},
+		{"with user:pass", "nats://user:pass@localhost:4222", "nats://REDACTED@localhost:4222"},
+		{"invalid url", "://broken", "://broken"},
+		{"credentials in a later server of a list", "nats://a:4222,nats://user:pass@b:4222", "nats://a:4222,nats://REDACTED@b:4222"},
+		{"credentials in every server of a list", "nats://u:p@a:4222, tls://t@b:4222", "nats://REDACTED@a:4222,tls://REDACTED@b:4222"},
+		{"server without a scheme", "user:pass@localhost:4222", "REDACTED@localhost:4222"},
+		{"server without a scheme or credentials", "localhost:4222", "localhost:4222"},
+		{"unparseable with credentials", "nats://user:pa ss@localhost:4222", "nats://REDACTED@localhost:4222"},
+		{"unparseable without credentials", "nats://local host:4222", "nats://local host:4222"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := redactURL(tt.raw); got != tt.want {
+				t.Errorf("redactURL(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+type deadlineFlushRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (r *deadlineFlushRecorder) Flush() {}
+
+func (r *deadlineFlushRecorder) SetWriteDeadline(deadline time.Time) error {
+	r.deadlines = append(r.deadlines, deadline)
+	return nil
+}
+
+// TestWriteSSEChunkWithTimeout_DisabledSetsNoDeadline pins write_timeout -1:
+// a negative timeout writes without touching the connection deadline.
+func TestWriteSSEChunkWithTimeout_DisabledSetsNoDeadline(t *testing.T) {
+	rr := &deadlineFlushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	timeout := time.Duration(writeTimeoutDisabledSentinel) * time.Second
+	if err := writeSSEChunkWithTimeout(rr, http.NewResponseController(rr), "event: ping\n\n", timeout); err != nil {
+		t.Fatalf("writeSSEChunkWithTimeout: %v", err)
+	}
+	if len(rr.deadlines) != 0 {
+		t.Fatalf("deadline calls = %d, want 0 with write_timeout disabled", len(rr.deadlines))
+	}
+	if got := rr.Body.String(); got != "event: ping\n\n" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestWriteSSEChunkWithTimeout_SetsAndClearsDeadline(t *testing.T) {
+	rr := &deadlineFlushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	if err := writeSSEChunkWithTimeout(rr, http.NewResponseController(rr), "event: ping\n\n", time.Second); err != nil {
+		t.Fatalf("writeSSEChunkWithTimeout: %v", err)
+	}
+	if got := rr.Body.String(); got != "event: ping\n\n" {
+		t.Fatalf("body = %q", got)
+	}
+	if len(rr.deadlines) != 2 {
+		t.Fatalf("deadline calls = %d, want 2", len(rr.deadlines))
+	}
+	if rr.deadlines[0].IsZero() {
+		t.Fatal("first deadline should set a non-zero write deadline")
+	}
+	if !rr.deadlines[1].IsZero() {
+		t.Fatalf("second deadline = %v, want zero reset", rr.deadlines[1])
+	}
 }
