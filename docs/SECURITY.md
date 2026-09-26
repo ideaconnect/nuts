@@ -49,8 +49,9 @@ Production deployments should:
   only authenticate NUTS to NATS; they do not authenticate browser subscribers.
 - Set `max_connections` to a value appropriate for the host.
 - Set `max_event_size` to bound memory per event.
-- Set `write_timeout` and `dispatch_timeout` where blocked downstream writes
-  or saturated slow-client signals should be bounded by the handler itself.
+- Keep `write_timeout` enabled (30 s by default) so a client or proxy that
+  stops reading cannot hold a connection, its JetStream consumer and its
+  prefetched messages indefinitely.
 - Set `replay_max_messages` or `replay_window` when a large retained stream
   could make replay too expensive.
 - Restrict `allowed_origins` to your trusted front-ends.

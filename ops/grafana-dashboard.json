@@ -36,7 +36,7 @@
       "id": 3,
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
       "targets": [
-        { "expr": "sum(rate(nuts_messages_dropped_total{job=~\"$job\"}[5m]))", "legendFormat": "dropped/sec", "refId": "A" }
+        { "expr": "sum by (reason) (rate(nuts_messages_dropped_total{job=~\"$job\"}[5m]))", "legendFormat": "{{reason}}", "refId": "A" }
       ],
       "title": "Dropped Messages",
       "type": "timeseries"
@@ -75,15 +75,51 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } },
       "targets": [
         { "expr": "sum(rate(nuts_subscription_errors_total{job=~\"$job\"}[5m]))", "legendFormat": "subscription errors/sec", "refId": "A" },
-        { "expr": "sum(rate(nuts_connections_rejected_total{job=~\"$job\",reason=\"max_connections\"}[5m]))", "legendFormat": "max connection rejections/sec", "refId": "B" }
+        { "expr": "sum by (reason) (rate(nuts_connections_rejected_total{job=~\"$job\"}[5m]))", "legendFormat": "rejected: {{reason}}", "refId": "B" }
       ],
       "title": "Errors And Rejections",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 13 },
+      "id": 9,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "expr": "sum by (reason) (rate(nuts_consumer_invalidated_total{job=~\"$job\"}[5m]))", "legendFormat": "{{reason}}", "refId": "A" }
+      ],
+      "title": "Consumer Recoveries",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 13 },
+      "id": 10,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "expr": "sum by (site) (rate(nuts_write_disconnects_total{job=~\"$job\"}[5m]))", "legendFormat": "{{site}}", "refId": "A" }
+      ],
+      "title": "Write Disconnects By Site",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 13 },
+      "id": 11,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "expr": "sum by (event) (rate(nuts_nats_connection_events_total{job=~\"$job\"}[5m]))", "legendFormat": "{{event}}", "refId": "A" }
+      ],
+      "title": "NATS Connection Events",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": { "defaults": { "mappings": [{ "options": { "0": { "text": "not ready" }, "1": { "text": "ready" } }, "type": "value" }], "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }, "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 13 },
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 20 },
       "id": 7,
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [
@@ -95,7 +131,7 @@
     {
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": { "defaults": { "mappings": [{ "options": { "0": { "text": "down" }, "1": { "text": "up" } }, "type": "value" }], "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }, "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 13 },
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 20 },
       "id": 8,
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [

@@ -27,7 +27,12 @@ Check the effective NATS subject first:
    ```
 
 4. Watch logs for `failed to subscribe` or `subject_label` fields that reveal
-   the subject NUTS actually requested.
+   the subject NUTS actually requested. A topic outside the stream's subjects
+   is refused with `503 Failed to subscribe to requested topics`.
+5. For multi-topic requests (`?topic=a&topic=b`), check the server version:
+   before 2.14.7, a purge or roll-up of one subject can make the stream skip
+   pending messages of the others. NUTS logs a warning at startup on such
+   servers.
 
 ## Browser Reports CORS Errors
 
@@ -60,6 +65,9 @@ Common causes:
 - No `?topic=` and no path shorthand topic after route-prefix stripping.
 - Invalid topic characters or empty topic tokens.
 - Bad `?last-id=` value. Query `last-id` must parse as an unsigned integer.
+  A bad `Last-Event-ID` header is only logged and ignored, since browsers
+  resend it on every reconnect.
+- More distinct topics than `max_topics_per_subscription` (32 by default).
 
 Use a minimal request while debugging:
 
@@ -67,25 +75,36 @@ Use a minimal request while debugging:
 curl -i -N 'http://localhost:8080/events?topic=orders'
 ```
 
-## Requests Return 503
+## Requests Return 503 Or 429
 
 Check the response body and logs:
 
-- `JetStream not available`: the handler is not provisioned or NATS setup
-  failed.
-- `Too many concurrent connections`: `max_connections` has been reached.
-- `Failed to subscribe`: the stream subjects, NATS permissions, or NATS server
-  compatibility need attention.
+- `JetStream not available` (503): NATS is disconnected, or the handler is
+  shutting down.
+- `Too many concurrent connections` (429): `max_connections` has been reached.
+- `Stream consumer limit reached` (503): the stream's `max_consumers` is
+  exhausted; every SSE connection holds one consumer. On nats-server 2.15 the
+  default is 1000 per stream. See the runbook in
+  [OPERATIONS.md](OPERATIONS.md).
+- `Failed to subscribe to requested topics` (503): a topic outside the
+  stream's subjects, missing NATS permissions, or a JetStream API error; the
+  log's `jetstream_error_code` names the server's reason.
 - `/readyz` degraded: NATS is disconnected or the stream is unavailable.
 
+Browsers see none of these as errors: requests sent with
+`Accept: text/event-stream`, as `EventSource` does, get a `200` stream with a
+`retry:` delay for every transient case, and the browser reconnects on its
+own. Only the topic error stays a `503`, since retrying cannot fix it.
+
 Metrics that help narrow this down include
-`nuts_connections_rejected_total{reason="max_connections"}` and
+`nuts_connections_rejected_total{reason}` and
 `nuts_subscription_errors_total`.
 
 ## Replay Re-sends Too Many Events
 
-When `last-id` or `Last-Event-ID` points below JetStream retention, NUTS falls
-back to retained replay. On large streams, set at least one bound:
+When `last-id` or `Last-Event-ID` points below JetStream retention, or ahead
+of the stream after it was recreated, NUTS falls back to retained replay. On
+large streams, set at least one bound:
 
 ```caddyfile
 replay_max_messages 1000
@@ -99,19 +118,29 @@ bounds to the largest recovery burst you are willing to serve.
 
 ## Slow Clients Disconnect
 
-This is intentional backpressure. When a client's queue fills, NUTS disconnects
-the SSE stream instead of silently dropping live messages. The browser should
-reconnect and use `Last-Event-ID` to resume.
+A client that reads slowly is not disconnected: NUTS stops pulling from
+JetStream until it catches up. A client whose writes stop completing is
+disconnected once a write misses `write_timeout` (30 s by default), and
+resumes from its `Last-Event-ID`.
 
 Useful checks:
 
 - `nuts_slow_client_disconnects_total`
 - `disconnect_reason="slow_client"` in logs
-- `client_buffer_size`, `max_event_size`, and the memory formula in
+- `write_timeout`, and whether a proxy between Caddy and the browser buffers
+  or stalls the response (it should honour `X-Accel-Buffering: no`)
+- `client_buffer_size` and the memory formula in
   [PERFORMANCE.md](PERFORMANCE.md)
-- `write_timeout` for blocked downstream writes and `dispatch_timeout` for
-  saturated slow-client signal waits
-- Proxy buffering between Caddy and the browser
+
+## Messages Missing After A NATS Outage
+
+They should not be: each stream's consumer recreates itself from the last
+delivered sequence after a reconnect, and
+`nuts_consumer_invalidated_total{reason="recreated"}` counts each recovery. If
+a stream instead closes with `disconnect_reason=consumer_unrecoverable`, the
+client reconnects with its last event ID. Check that the requested sequence is
+still retained (`replay_fallback_reason` in the logs) and, for multi-topic
+streams, the nats-server version.
 
 ## Docker Image Starts But Config Looks Wrong
 

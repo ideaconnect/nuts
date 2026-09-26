@@ -27,18 +27,22 @@ to replace it.
   `topic_prefix`).
 - Replay via `?last-id=` query or browser-managed `Last-Event-ID` header,
   bounded by `replay_max_messages` and/or `replay_window`.
-- Slow-client backpressure: when a per-connection queue fills, NUTS
-  disconnects the SSE stream rather than dropping queued events; the client
-  reconnects and resumes via `Last-Event-ID`.
+- One ordered pull consumer per SSE connection with end-to-end
+  backpressure: a slow client slows its own consumer and the backlog waits
+  in JetStream. The consumer recreates itself from the last delivered
+  sequence after a NATS reconnect or consumer loss; a client whose writes
+  stop completing is disconnected at `write_timeout` and resumes via
+  `Last-Event-ID`.
 - NATS authentication (credentials file, token, user/password) and TLS / mTLS
   to the NATS server.
 - Optional first-party subscriber JWT auth (`subscriber_jwt_key`,
   `subscriber_jwt_cookie`) with HMAC-signed tokens and a `subscribe` claim
   for per-topic authorisation.
 - Configurable CORS (`allowed_origins`, `allowed_headers`, `allowed_methods`).
-- Connection cap (`max_connections`) with `429` + `Retry-After` rejection.
-- Per-frame write deadlines (`write_timeout`) and slow-client signal bounds
-  (`dispatch_timeout`).
+- Connection cap (`max_connections`) with `429` + `Retry-After` rejection;
+  transient refusals answer EventSource clients with a `retry:` stream.
+- Per-frame write deadlines (`write_timeout`, 30 s by default).
+  `dispatch_timeout` is deprecated and has no effect.
 - Probes: `live_path` (`/livez`), `ready_path` (`/readyz`), and the legacy
   `health_path` (`/healthz`).
 - Hub discovery via `Link: <url>; rel="nuts"` when `hub_url` is set.
@@ -81,6 +85,7 @@ Tests live alongside the source:
 | [delivery_contract_test.go](delivery_contract_test.go) | End-to-end delivery contract over real HTTP: no hole after a NATS link loss, large backlogs on one connection, bursts without disconnects, cursor precedence and replay edge cases, plus the server start-sequence behaviour planning relies on. |
 | [caddy_integration_test.go](caddy_integration_test.go) | Caddy-in-the-loop tests via `caddy.Load` (access logs, HTTP metrics). |
 | [server_compat_test.go](server_compat_test.go) | nats-server behaviour NUTS accommodates, on the embedded server: stream consumer limits, consumer inactive-threshold limits, delete markers and schedules, lame duck mode, the multi-topic purge fix, and teardown. |
+| [docs_test.go](docs_test.go) | Keeps metric names in README, website, docs and ops files in step with `metrics.go`. |
 | [testutil_test.go](testutil_test.go) | Shared test doubles and helpers: fake JetStream messages and iterator, stalled writers, the black-hole TCP proxy, retry-response assertions, custom-stream provisioning. |
 | [functional_test/](functional_test/) | [Godog](https://github.com/cucumber/godog) BDD tests against a real Docker Compose stack. |
 | [features/](features/) | Gherkin `.feature` files driving the Godog suite. |

@@ -389,7 +389,7 @@ nuts {
     nats_tls_ca <path>                  # CA bundle for verifying the server (not with insecure_skip_verify)
     nats_tls_cert <path>                # Client certificate (mTLS)
     nats_tls_key <path>                 # Client key (mTLS)
-    nats_tls_insecure_skip_verify       # Disable server verification (DEV ONLY)
+    nats_tls_insecure_skip_verify [true|false] # Disable server verification (DEV ONLY; bare flag = true)
 }
 ```
 
@@ -410,11 +410,45 @@ route /events* {
 }
 ```
 
+#### `topic_prefix`
+
+`topic_prefix` is prepended to every requested topic, so include the trailing
+dot (`events.`, `tenants.a.`). It is validated at startup, because a mistake
+would silently widen every client's subscription: it may only use
+`[A-Za-z0-9._-]`, may not contain the NATS wildcards `*` or `>`, may not start
+with `.` or `$` (NATS system subjects), may not contain `..`, and is capped at
+256 bytes.
+
+#### Zero and negative values
+
+Numeric directives treat `0` and negative values differently. Values not
+listed as accepted are rejected when the configuration loads.
+
+| Directive | `0` or omitted | Accepted negative value |
+| --- | --- | --- |
+| `max_event_size` | 1 MiB default | Any negative: no limit |
+| `max_topics_per_subscription` | 32 default | `-1`: no limit |
+| `max_reconnects` | Omitted: unlimited; `0`: never reconnect | `-1`: unlimited |
+| `write_timeout` | 30 s default | `-1`: no deadline |
+| `nats_idle_heartbeat` | 10 s default | `-1`: accepted, but the library's 5 s default applies (warning) |
+| `heartbeat_interval`, `reconnect_wait` | 30 s and 2 s defaults | None |
+| `client_buffer_size` | 64 default | None |
+| `max_connections` | No cap | None |
+| `replay_max_messages`, `replay_window` | No limit | None |
+| `dispatch_timeout` | Deprecated, no effect | None |
+
 #### `max_event_size`
 
-Limits the total size (in bytes) of a single SSE event frame — including the `id:`, `event:`, and `data:` lines plus the JSON-encoded payload. Any event that exceeds the limit is silently dropped and a warning is logged. The client never sees it.
+Limits the size (in bytes) of a single SSE event, checked in two stages. The
+raw NATS payload is checked first, before any JSON parsing, and dropped when
+it alone exceeds the limit
+(`nuts_messages_dropped_total{reason="raw_payload"}`). The formatted frame —
+the `id:`, `event:` and `data:` lines plus the JSON envelope — is checked
+next (`reason="formatted_sse_message"`). A dropped event is logged at Warn
+with its topic, stream sequence and size; the client never sees it, and its
+id never appears.
 
-For example, setting `max_event_size 1000` means that if a NATS message produces an SSE frame larger than 1000 bytes once formatted, that frame is discarded. A typical overhead (id, event type, topic, timestamp) is roughly 120-150 bytes, so a 1000-byte limit leaves ~850 bytes for the raw message payload. Set `max_event_size 0` to fall back to the 1 MiB default, or a negative value to disable the limit entirely.
+For example, setting `max_event_size 1000` means that if a NATS message produces an SSE frame larger than 1000 bytes once formatted, that frame is discarded. A typical overhead (id, event type, topic, timestamp) is roughly 120-150 bytes, so a 1000-byte limit leaves ~850 bytes for the raw message payload. Set `max_event_size 0` to fall back to the 1 MiB default, or a negative value to disable the limit entirely. The limit does not bound memory: messages are pulled from JetStream before they are checked (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md)).
 
 #### `max_connections`
 
@@ -607,6 +641,17 @@ topic" meaning as a NUTS-only convenience alias — note that this is more
 permissive than NATS itself, where a bare `*` matches only single-token
 subjects. Missing, expired, badly signed, or unauthorized tokens are rejected
 before subscription.
+
+Only the HMAC algorithms `HS256`, `HS384` and `HS512` are accepted. Tokens
+declaring `none`, RSA, ECDSA or EdDSA are rejected, which rules out the
+`alg=none` and "RSA public key used as HMAC secret" confusion attacks, so
+tokens from an identity provider that signs with RS256 or ES256 need a
+translating layer in front of NUTS. A missing, malformed, expired or badly
+signed token gets `401` with `WWW-Authenticate: Bearer realm="nuts"`; a valid
+token whose `subscribe` claim does not cover a requested topic gets
+`403 Forbidden topic`. Keys shorter than 32 bytes still verify, but log a
+startup warning with `key_length` and `recommended_minimum`, because HS256
+assumes at least a 32-byte secret.
 The `exp` and `nbf` time claims are optional; when present they are enforced.
 NUTS requires integer epoch seconds for `exp` and `nbf` — RFC 7519 §2 permits
 non-integer NumericDate, but a fractional value (for example `1777392000.5`)
@@ -803,12 +848,12 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_wildcard_filter_drops_total` | Counter | Deprecated, always 0: the pre-NATS-2.10 wildcard fallback was removed. |
 | `nuts_slow_client_disconnects_total` | Counter | Clients disconnected because a write missed `write_timeout` (the client stopped reading) |
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
-| `nuts_replay_fallbacks_total` | Counter | Replay streams that started in a fallback mode (requested sequence was purged or older than `replay_window`), counted once the consumer exists |
-| `nuts_subscription_errors_total` | Counter | Failed JetStream subscription attempts |
+| `nuts_replay_fallbacks_total` | Counter | Replay streams that started in a fallback mode (requested sequence below retention, older than `replay_window`, ahead of the stream, or stream info unavailable), counted once the consumer exists |
+| `nuts_subscription_errors_total` | Counter | Stream requests refused because a topic is outside the stream or the JetStream consumer could not be created (consumer-limit refusals are counted in `nuts_connections_rejected_total`) |
 | `nuts_connections_rejected_total{reason}` | Counter (labeled) | SSE connections rejected before streaming started. `reason` is one of `max_connections`, `stream_consumer_limit`, `auth_missing_token`, `auth_invalid_token`, `auth_topic_forbidden`. |
 | `nuts_replay_cap_reached_total` | Counter | Replaying SSE connections closed after `replay_max_messages` was reached |
 | `nuts_dispatch_timeout_total` | Counter | Deprecated, always 0: `dispatch_timeout` has no effect. |
-| `nuts_nats_async_errors_total{kind}` | Counter (labeled) | Asynchronous NATS client errors observed by the registered ErrorHandler. `kind` is one of `slow_consumer`, `timeout`, `connection_state`, `consumer_invalidated`, `other`. Consumer health is now handled by the ordered consumer itself and counted in `nuts_consumer_invalidated_total`. |
+| `nuts_nats_async_errors_total{kind}` | Counter (labeled) | Asynchronous NATS client errors observed by the registered ErrorHandler. `kind` is one of `slow_consumer`, `timeout`, `connection_state`, `consumer_invalidated`, `other`. `consumer_invalidated` only applied to the legacy push subscriptions and stays `0`: consumer health is handled by the ordered consumer itself and counted in `nuts_consumer_invalidated_total`. `slow_consumer` should stay `0` too, since each stream pulls at most `client_buffer_size` messages at a time. |
 | `nuts_consumer_invalidated_total{reason}` | Counter (labeled) | JetStream consumer failures under live streams. `reason` is `recreated` (the consumer recovered after a gap, a NATS reconnect or missed heartbeats; the client noticed nothing) or `unrecoverable` (recreation kept failing and the stream closed with `disconnect_reason=consumer_unrecoverable`). |
 | `nuts_write_disconnects_total{site}` | Counter (labeled) | SSE streams terminated by a response-writer write error (typically the `write_timeout` deadline firing). `site` is one of `connected`, `message`, `heartbeat`. |
 | `nuts_readiness_failures_total{cause}` | Counter (labeled) | `/readyz` probe responses that returned 503 because a dependency was degraded. `cause` is one of `nats_disconnected`, `jetstream_missing`, `stream_info_error`. |
@@ -1053,19 +1098,15 @@ Malformed values are handled asymmetrically on purpose:
   value. The Warn log carries the offending value so an operator can
   diagnose the producer.
 
-The **cursor cap** is `2^64 − 2` (the highest accepted value). NUTS
-adds `1` to the parsed cursor to compute the JetStream `StartSequence`,
-so `2^64 − 1` is reserved as a "no sequence" sentinel and the value one
-below it is rejected to avoid wrapping into that sentinel. In practice
-no realistic stream is anywhere near this threshold, but a numerically
-explicit cap matters for fuzz tests and for clients that synthesize
-cursors. Inputs longer than 20 ASCII digits (`uint64` max is 20
-digits) are rejected on length before any `strconv.ParseUint` allocation
-— surfaced as `"Invalid last-id value: too long"` (400) for `?last-id=`
-and as the `"ignoring oversized Last-Event-ID header"` Warn for the
-header. The 20-digit precheck is a DoS guard against multi-megabyte
-numeric strings, not a semantic class distinct from "above the cap"; a
-value with 21+ digits is by definition outside the `uint64` range.
+The highest accepted cursor is `2^64 − 3`. NUTS adds `1` to the cursor to
+get the JetStream start sequence, and `2^64 − 1` is reserved as a "no
+sequence" sentinel, so `2^64 − 2` is rejected too: its start sequence would
+land on the sentinel. No real stream comes near these values, but an explicit
+cap matters for fuzz tests and for clients that synthesize cursors. Inputs
+longer than 20 digits (the length of the largest `uint64`) are rejected
+before parsing, as a guard against multi-megabyte numeric strings: they are
+answered with `"Invalid last-id value: too long"` (400) for `?last-id=` and
+logged as `"ignoring oversized Last-Event-ID header"` for the header.
 
 ### Message Format
 
@@ -1092,6 +1133,21 @@ last sequence for a request without a cursor, or the requested cursor for a
 replay. Treat it like any other event ID. It is omitted when the stream
 starts in a fallback replay mode, in which case the client keeps its previous
 cursor.
+
+#### Response headers
+
+Every stream response carries these headers; proxies in between must keep
+them:
+
+| Header | Why |
+| --- | --- |
+| `Content-Type: text/event-stream` | Makes browsers parse the response as SSE. Without it `EventSource` fails the connection. |
+| `Cache-Control: no-cache` | Stops browsers and shared caches from caching the stream. |
+| `Connection: keep-alive` | Keeps HTTP/1.1 proxies from closing the connection between events. |
+| `X-Accel-Buffering: no` | Tells nginx, and proxies that honour it, not to buffer the response. A proxy that buffers delays events until its buffer fills. |
+
+`hub_url` adds `Link: <url>; rel="nuts"`, and allow-listed origins get the
+CORS headers described above.
 
 #### Server control messages
 

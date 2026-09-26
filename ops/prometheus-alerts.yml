@@ -8,7 +8,7 @@ groups:
           severity: warning
         annotations:
           summary: NUTS is disconnecting slow SSE clients
-          description: "Slow-client disconnects are above 1/sec for {{ $labels.job }}. Check client processing speed, proxy buffering, and client_buffer_size."
+          description: "Writes to SSE clients are missing write_timeout more than once per second for {{ $labels.job }}. Clients that read slowly are throttled, not disconnected, so look for proxies that buffer or stall responses and for clients that vanish without closing."
 
       - alert: NutsSubscriptionErrorsHigh
         expr: increase(nuts_subscription_errors_total[5m]) > 0
@@ -16,8 +16,8 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: NUTS JetStream subscription errors detected
-          description: "NUTS failed to create JetStream subscriptions for {{ $labels.job }}. Check stream availability, subject filters, NATS credentials, and NATS server health."
+          summary: NUTS stream requests are failing
+          description: "NUTS refused stream requests for {{ $labels.job }} because a topic is outside the stream or the JetStream consumer could not be created. The logs' jetstream_error_code names the server's reason; check stream subjects, NATS permissions and server health."
 
       - alert: NutsReplayFallbackSpike
         expr: rate(nuts_replay_fallbacks_total[5m]) > 0.2
@@ -72,3 +72,66 @@ groups:
         annotations:
           summary: NUTS subscriber JWT rejections are elevated
           description: "Auth rejection rate above 0.5/sec for {{ $labels.job }} (reason={{ $labels.reason }}). Likely a credential probe or a misconfigured client; review access logs and rotate keys if compromise is suspected."
+
+      - alert: NutsStreamConsumerLimitReached
+        expr: increase(nuts_connections_rejected_total{reason="stream_consumer_limit"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: The stream's consumer limit is refusing SSE clients
+          description: "NUTS needs one JetStream consumer per SSE connection and the stream refuses more for {{ $labels.job }}. Raise the stream's max_consumers for peak connections across all NUTS instances (nats-server 2.15 defaults to 1000)."
+
+      - alert: NutsConsumerUnrecoverable
+        expr: increase(nuts_consumer_invalidated_total{reason="unrecoverable"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS streams closed because their consumer could not be recreated
+          description: "Streams on {{ $labels.job }} lost their JetStream consumer and could not recreate it; clients reconnect from their last event ID. Check JetStream availability and the stream's consumer limit."
+
+      - alert: NutsConsumerRecreationsSustained
+        expr: rate(nuts_consumer_invalidated_total{reason="recreated"}[10m]) > 0.5 and rate(nuts_nats_connection_events_total{event="reconnect"}[10m]) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS consumers keep being recreated without NATS reconnects
+          description: "Consumers of live streams on {{ $labels.job }} are lost and recreated repeatedly without a NATS reconnect. Look for tools deleting nuts_* consumers or a stream consumer_limits.inactive_threshold reaping stalled streams."
+
+      - alert: NutsOversizedMessagesDropped
+        expr: sum by (job, reason) (increase(nuts_messages_dropped_total{reason=~"raw_payload|formatted_sse_message"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS drops messages larger than max_event_size
+          description: "Messages over max_event_size are being dropped for {{ $labels.job }} ({{ $labels.reason }}). raw_payload points at the producer; formatted_sse_message at envelope overhead. Clients never see these events."
+
+      - alert: NutsConnectedWriteFailures
+        expr: rate(nuts_write_disconnects_total{site="connected"}[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS cannot write the first SSE event
+          description: "Streams on {{ $labels.job }} fail before their first event reaches the client. Check TLS, the Caddy route and proxies in front of it. Failures at the message site are usually clients closing tabs and are not alerted on."
+
+      - alert: NutsNATSSlowConsumer
+        expr: increase(nuts_nats_async_errors_total{kind="slow_consumer"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: The NATS client is dropping messages
+          description: "A nats.go subscription buffer overflowed on {{ $labels.job }}. Streams pull at most client_buffer_size messages at a time, so this points at the NATS connection itself: CPU starvation or a saturated link."
+
+      - alert: NutsNATSLameDuck
+        expr: increase(nuts_nats_connection_events_total{event="lame_duck"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: A NATS server used by NUTS is shutting down
+          description: "The NATS server {{ $labels.job }} is connected to entered lame duck mode; NUTS will reconnect to another server and its streams recreate their consumers."

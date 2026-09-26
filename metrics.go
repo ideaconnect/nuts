@@ -27,13 +27,14 @@ var (
 		Help:      "Total number of SSE message events delivered to clients.",
 	})
 
-	// nuts_messages_dropped_total counts messages that were dropped during
-	// SSE formatting. Labelled by reason so operators can distinguish a
-	// pure-NATS oversize (the inbound JetStream payload exceeded
-	// max_event_size) from a post-envelope oversize (the SSE frame after
-	// JSON wrap exceeded max_event_size). The two are tuned differently:
-	// raw_payload usually points at producer-side issues, formatted_sse_message
-	// at SSE envelope overhead on small but pathological payloads.
+	// nuts_messages_dropped_total counts messages that were not delivered,
+	// by reason: raw_payload (the inbound JetStream payload exceeded
+	// max_event_size) and formatted_sse_message (the SSE frame after the JSON
+	// wrap did) are tuned differently — the first usually points at the
+	// producer, the second at envelope overhead on small but pathological
+	// payloads. replay_window counts replayed messages older than the window,
+	// control_message the server's subject delete markers and schedule
+	// definitions.
 	metricsMessagesDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "messages_dropped_total",
@@ -68,25 +69,25 @@ var (
 		Help:      "Total number of SSE connections requesting message replay.",
 	})
 
-	// nuts_replay_fallbacks_total counts how many times NUTS used a fallback
-	// replay strategy: either because the requested sequence was purged
-	// (below retention) or because it was older than the configured
-	// replay_window.
+	// nuts_replay_fallbacks_total counts replay requests served from a
+	// fallback start position, once their consumer exists.
 	metricsReplayFallbacks = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "replay_fallbacks_total",
-		Help:      "Total number of replay requests that used fallback replay (purged sequence or older than replay_window).",
+		Help:      "Total number of replay requests served from a fallback start position (sequence below retention, outside replay_window, ahead of the stream, or stream info unavailable), counted once the consumer exists.",
 	})
 
-	// nuts_subscription_errors_total counts failed JetStream subscribe attempts.
+	// nuts_subscription_errors_total counts requests refused because their
+	// topics are outside the stream or their consumer could not be created.
+	// Consumer-limit refusals are counted in connections_rejected_total.
 	metricsSubscriptionErrors = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "subscription_errors_total",
-		Help:      "Total number of failed JetStream subscription attempts.",
+		Help:      "Total number of stream requests refused because a topic is outside the stream or the JetStream consumer could not be created.",
 	})
 
 	// nuts_connections_rejected_total counts SSE connections rejected before
-	// streaming started, labelled by reason (e.g. "max_connections").
+	// streaming started, labelled by reason.
 	metricsConnectionsRejected = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "connections_rejected_total",
@@ -111,35 +112,28 @@ var (
 	})
 
 	// nuts_nats_async_errors_total counts asynchronous errors reported by
-	// the NATS client. Labelled by kind so operators can distinguish
-	// slow-consumer drops at the library layer from connection-state
-	// transitions and from JetStream consumer-invalidation events.
+	// the NATS client's ErrorHandler.
 	//
 	// Bounded label set (kept in lockstep with classifyNATSAsyncError —
 	// helpers.go is the source of truth and pins the mapping in
 	// regression tests):
 	//
-	//   - slow_consumer:        nats.ErrSlowConsumer (nats.go's per-
-	//                           subscription internal buffer overflowed
-	//                           and messages were silently dropped at
-	//                           the library layer — upstream of NUTS'
-	//                           bounded msgChan).
+	//   - slow_consumer:        nats.ErrSlowConsumer (a nats.go subscription
+	//                           buffer overflowed, upstream of NUTS). Each
+	//                           stream pulls at most client_buffer_size
+	//                           messages at a time, so this should stay 0.
 	//   - timeout:              nats.ErrTimeout.
 	//   - connection_state:     nats.ErrConnectionClosed,
 	//                           nats.ErrConnectionDraining.
-	//   - consumer_invalidated: nats.ErrConsumerNotActive (primary
-	//                           heartbeat-miss path; raised by
-	//                           activityCheck on IdleHeartbeat timeout),
-	//                           nats.ErrConsumerDeleted (kept as
-	//                           forward-compat — see helpers.go),
-	//                           *nats.ErrConsumerSequenceMismatch
-	//                           (sequence drift while heartbeats are
-	//                           still arriving).
+	//   - consumer_invalidated: heartbeat and sequence errors of legacy
+	//                           push subscriptions. The ordered pull
+	//                           consumers handle these themselves (see
+	//                           consumer_invalidated_total), so it stays 0.
 	//   - other:                everything else.
 	metricsNATSAsyncErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "nats_async_errors_total",
-		Help:      "Total number of asynchronous NATS client errors observed by the registered ErrorHandler. Labelled by kind: slow_consumer, timeout, connection_state, consumer_invalidated, other.",
+		Help:      "Total number of asynchronous NATS client errors observed by the registered ErrorHandler, labelled by kind (slow_consumer, timeout, connection_state, consumer_invalidated, other). consumer_invalidated only applies to legacy push subscriptions and stays 0.",
 	}, []string{"kind"})
 
 	// nuts_consumer_invalidated_total counts JetStream consumer failures
@@ -167,7 +161,7 @@ var (
 	metricsWriteDisconnects = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "write_disconnects_total",
-		Help:      "Total number of SSE streams terminated by a response-writer write error.",
+		Help:      "Total number of SSE streams terminated by a failed write, labelled by site (connected, message, heartbeat).",
 	}, []string{"site"})
 
 	// nuts_readiness_failures_total counts /readyz probe responses that
@@ -177,12 +171,13 @@ var (
 	metricsReadinessFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "readiness_failures_total",
-		Help:      "Total number of /readyz probe responses returning 503, labelled by cause.",
+		Help:      "Total number of /readyz probe responses returning 503, labelled by cause (nats_disconnected, jetstream_missing, stream_info_error).",
 	}, []string{"cause"})
 
 	// nuts_nats_connection_events_total counts NATS connection-state
-	// transitions reported by the registered Disconnect/Reconnect/Closed
-	// handlers. A flapping broker is invisible to nuts_nats_async_errors_total
+	// transitions reported by the registered Disconnect/Reconnect/Closed/
+	// LameDuckMode handlers. Closing the connection on Cleanup reports
+	// nothing (NoCallbacksAfterClientClose). A flapping broker is invisible to nuts_nats_async_errors_total
 	// when the in-flight client surface is quiet, so this counter is the
 	// canonical signal for clean disconnect+reconnect cycles. Alert on
 	// e.g. increase(...{event="reconnect"}[10m]) > 3 for flap detection.

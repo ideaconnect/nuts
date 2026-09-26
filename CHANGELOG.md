@@ -115,6 +115,14 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
 - The test matrix covers nats-server 2.10, 2.12, 2.14 and 2.15, and the
   Docker Compose files, CI and examples default to `nats:2.15-alpine` (#109).
   The `nats stream add` examples set `--max-consumers`.
+- Metric Help strings list their label values, and the documentation
+  describes the pull pipeline throughout: architecture, configuration,
+  operations runbooks, troubleshooting, performance budgets and the memory
+  formula (#70, #71). A test keeps every metric name in the docs and ops
+  files in step with the registered metrics.
+- The example alert rules and Grafana dashboard cover the stream consumer
+  limit, consumer recoveries, oversized drops by reason, write failures by
+  site, NATS slow consumers and lame duck mode (#86).
 - `nuts_nats_connection_events_total{event="closed"}` no longer counts the
   connection NUTS closes itself on shutdown or reload (#73).
 - `nats_idle_heartbeat` now sets the heartbeat of every pull request. When

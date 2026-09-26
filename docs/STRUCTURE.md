@@ -7,7 +7,7 @@
 Module registration and type definitions. Contains:
 
 - `init()` — registers the Caddy module and the `nuts` Caddyfile directive.
-- `Handler` struct — all configuration fields (NATS URL, NATS auth, optional subscriber JWT auth, topics, tuning, TLS, CORS, connection caps, health/liveness/readiness paths, client buffer size, dispatch/write timeouts, replay caps `replay_max_messages` / `replay_window`, optional `hub_url`) plus runtime state (connection, JetStream context, logger, mutex, live-connection counter, and a `shutdown` channel that `Cleanup()` closes to wake in-flight SSE handlers).
+- `Handler` struct — all configuration fields (NATS URL, NATS auth, optional subscriber JWT auth, topics, tuning, TLS, CORS, connection caps, health/liveness/readiness paths, client buffer size, write timeout, the deprecated dispatch timeout, replay caps `replay_max_messages` / `replay_window`, optional `hub_url`) plus runtime state (connection, JetStream context, logger, mutex, live-connection counter, a `shutdown` channel that `Cleanup()` closes to wake in-flight SSE handlers, and the stream counter `Cleanup()` waits on).
 - `messageEventPayload` struct — the JSON shape sent to SSE clients (`topic`, `payload`, `time`).
 - `CaddyModule()` — returns the module ID `http.handlers.nuts`.
 - Interface guards ensuring `Handler` satisfies `caddy.Module`, `caddy.Provisioner`, `caddy.Validator`, `caddy.CleanerUpper`, `caddyhttp.MiddlewareHandler`, and `caddyfile.Unmarshaler`.
@@ -17,10 +17,10 @@ Module registration and type definitions. Contains:
 Caddy lifecycle management — connecting to NATS and tearing down on shutdown. Contains:
 
 - `validateRequiredFields()` — fast pre-flight check run at the top of `Provision()` so bad config never opens a socket.
-- `Provision()` — applies defaults (heartbeat, reconnect, max-event-size, client buffer, health/liveness/readiness paths, allowed headers/methods; `dispatch_timeout`, `write_timeout`, `replay_max_messages`, and `replay_window` stay at `0` meaning "off"), creates the `shutdown` channel, calls `connectNATS()`, creates a JetStream context, verifies the configured stream exists, and rolls back on failure.
-- `connectNATS()` — builds NATS connection options (reconnect, auth, TLS, lifecycle callbacks) and dials the server.
+- `Provision()` — validates the config and logs the transport-security warnings before dialling, applies defaults (heartbeat, reconnect, max-event-size, client buffer, `write_timeout` 30 s, probe paths, allowed headers/methods), creates the `shutdown` channel, calls `connectNATS()`, warns about servers older than 2.14.7, creates a JetStream context with a default API timeout, verifies the configured stream exists within 2 s and logs its limiting settings, and rolls back on failure.
+- `connectNATS()` — builds NATS connection options (reconnect, auth, TLS, lifecycle and lame-duck callbacks, no callbacks after Cleanup closes the connection) and dials the server.
 - `buildTLSConfig()` — assembles a `*tls.Config` (TLS 1.2 minimum) from `nats_tls_ca`, `nats_tls_cert`, `nats_tls_key`, `nats_tls_insecure_skip_verify`.
-- `Cleanup()` — mutex-protected teardown: closes the `shutdown` channel (waking any in-flight SSE handlers), closes the NATS connection and nils cached state. Idempotent.
+- `Cleanup()` — teardown: closes the `shutdown` channel (waking any in-flight SSE handlers), refuses new streams, waits up to 3 s for ended streams to delete their consumers, then closes the NATS connection. Idempotent.
 - `Validate()` — re-runs the checks Provision applies before dialling (required fields, one auth mode, numeric ranges and sentinels, `nats_url` schemes, `allowed_origins` format, `nats_tls_ca` without `nats_tls_insecure_skip_verify`, subscriber JWT cookie config), and warns about wildcard CORS, the deprecated `dispatch_timeout`, `nats_idle_heartbeat -1` and short JWT keys. The transport warnings (credentials sent unencrypted, `insecure_skip_verify`) come from Provision before it connects.
 
 ### auth.go
@@ -35,10 +35,20 @@ Subscriber JWT authorization helpers. Contains:
 
 HTTP/SSE request handling — the core streaming loop. Contains:
 
-- `ServeHTTP()` — handles the configurable liveness (`live_path`, default `/livez`), readiness (`ready_path`, default `/readyz`), and legacy health (`health_path`, default `/healthz`) endpoints, OPTIONS (CORS preflight), non-GET passthrough, topic extraction and validation, subscriber JWT authorization, path-shorthand (`/a/b` → topic `a.b`), `Last-Event-ID` / `last-id` replay parsing (a valid header wins over the query; a bad header is logged and ignored; a bad `?last-id=` returns 400), the global `max_connections` slot reservation with `Retry-After` rejection, JetStream subscription creation with sequence/window fallback, dispatch/write timeout enforcement, the SSE streaming `select` loop (message delivery, slow-client disconnect, heartbeat, context cancellation), and oversized-event guards that drop before JSON parse.
+- `ServeHTTP()` — handles the configurable liveness (`live_path`, default `/livez`), readiness (`ready_path`, default `/readyz`), and legacy health (`health_path`, default `/healthz`) endpoints (one trailing slash ignored), OPTIONS (CORS preflight), non-GET passthrough, topic extraction and validation, subscriber JWT authorization, path-shorthand (`/a/b` → topic `a.b`), `Last-Event-ID` / `last-id` replay parsing (a valid header wins over the query; a bad header is logged and ignored; a bad `?last-id=` returns 400), retryable rejections (`rejectTransient`: a `retry:` stream for EventSource, `503`/`429` with `Retry-After` otherwise) for NATS outages, `max_connections` and consumer failures, stream-info planning (start position, replay fallbacks, topic checks), and then hands off to `openConsumerStream()` and `serveStream()`.
+- `serveStream()` — the SSE writer loop: the `connected` event, message frames with replay caps and the history-only `replay_window` filter, heartbeats, write deadlines, and every termination path with its `disconnect_reason`.
+- `formatMessageEvent()` — renders one SSE frame, dropping control messages and oversized payloads or frames first.
 - `reserveConnSlot()` / `releaseConnSlot()` — atomic counter used to enforce `max_connections`.
 - `matchesHealthPath()` / `matchesLivePath()` / `matchesReadyPath()` — exact-or-suffix match against the configured probe paths.
 - `setCORSHeaders()` — matches the request `Origin` against `AllowedOrigins` and echoes it back, along with `allowed_headers` and `allowed_methods`.
+
+### consumer.go
+
+The JetStream side of one SSE stream. Contains:
+
+- `openConsumerStream()` — creates the request's ordered pull consumer (`orderedConsumerConfig()`: filters, explicit start position, inactive threshold capped by the stream's consumer limit) and starts pulling with `pullOptions()` (`client_buffer_size` prefetch, `nats_idle_heartbeat`).
+- `startStreamFeed()` — the feed goroutine: pulls one message at a time, formats it, drops what cannot be sent, and hands frames to the writer; the hand-off blocks while the writer is busy, which is what stops pulling.
+- `consumerStream.close()` / `deleteConsumer()` — stops the feed and deletes the consumer in the background, logging failures and telling `Cleanup()` when it is gone.
 
 ### caddyfile.go
 
@@ -64,7 +74,7 @@ Build entry point. Imports the standard Caddy modules plus this module (`github.
 
 ### metrics.go
 
-Prometheus counters and gauges registered via `promauto`. Exposes `nuts_active_connections`, `nuts_messages_delivered_total`, `nuts_messages_dropped_total{reason}` (labelled `raw_payload`, `formatted_sse_message` or `replay_window`), `nuts_wildcard_filter_drops_total` (multi-topic wildcard fallback client-side filter), `nuts_slow_client_disconnects_total`, `nuts_replay_requests_total`, `nuts_replay_fallbacks_total`, `nuts_subscription_errors_total`, `nuts_connections_rejected_total{reason}` (incremented when `max_connections` rejects a request), `nuts_replay_cap_reached_total` (incremented when retained replay is cut short by `replay_max_messages`), `nuts_dispatch_timeout_total`, `nuts_nats_async_errors_total{kind}` (incremented by the registered `nats.ErrorHandler` on slow-consumer drops and other async failures), and `nuts_write_disconnects_total{site}` (incremented when an SSE write fails at the `connected`, `message`, or `heartbeat` site).
+Prometheus counters and gauges registered via `promauto`. The README metrics table describes each one; `docs_test.go` fails when a document or the ops files name a metric that is not registered here, or when the README or website leave one out.
 
 ### nats_test.go
 
@@ -72,7 +82,7 @@ Core unit and integration tests. Uses an embedded NATS server with JetStream to 
 
 ### hardening_test.go
 
-Focused tests for security hardening and related correctness items: configurable CORS headers/methods, subscriber JWT authorization, oversized-raw-payload drop, `max_connections` rejection + metric increment, dispatch/write timeout behavior, cleartext-auth and insecure-TLS warnings, TLS cert/key pairing, `MaxReconnects=0` vs default, integer-directive junk-suffix rejection, custom `health_path`, distinct `live_path` / `ready_path` probe behavior, negative `MaxEventSize` disabling the limit, `replay_max_messages` capping retained replay, `replay_window` switching old cursors to `StartTime`, pre-flight config rejection, and `Cleanup()` waking in-flight SSE handlers.
+Focused tests for security hardening and related correctness items: configurable CORS headers/methods, subscriber JWT authorization, oversized-raw-payload drop, `max_connections` rejection + metric increment, write timeout behavior, config validation (URL schemes, origins, sentinels), cleartext-auth and insecure-TLS warnings, TLS cert/key pairing, `MaxReconnects=0` vs default, integer-directive junk-suffix rejection, custom `health_path`, distinct `live_path` / `ready_path` probe behavior, negative `MaxEventSize` disabling the limit, `replay_max_messages` capping retained replay, `replay_window` switching old cursors to `StartTime`, pre-flight config rejection, and `Cleanup()` waking in-flight SSE handlers.
 
 ### handler_integration_test.go
 
@@ -131,11 +141,12 @@ Step by step:
 
 1. **Browser connects** — opens an `EventSource` to e.g. `GET /events?topic=orders.new`.
 2. **Topic validation** — `serve.go` validates the topic via `isValidTopic()`, prepends `TopicPrefix`, and checks for a `Last-Event-ID` header or `last-id` query parameter. If the query is absent the request path is used as a shorthand (`/a/b` → `a.b`).
-3. **JetStream subscription** — `serve.go` creates an ephemeral JetStream consumer bound to the configured stream. New clients get `DeliverNew()`; reconnecting clients get `StartSequence(lastID+1)`. If the requested sequence has been purged, NUTS falls back to `DeliverAll()` or `StartTime(now - replay_window)`. If the requested sequence is retained but older than `replay_window`, NUTS starts at that time window instead. `replay_max_messages` closes retained replay after the configured historical event count.
-4. **SSE streaming loop** — a single `select` in `serve.go` multiplexes:
-   - **`msgChan`** — incoming NATS messages are JSON-wrapped into `messageEventPayload`, tagged with the JetStream sequence as the SSE `id:` field, checked against `MaxEventSize`, and flushed to the client via `writeSSEChunkWithTimeout()` when `write_timeout` is configured.
-   - **`slowClient`** — if `msgChan` is full (configurable via `client_buffer_size`, default 64), the next message triggers an immediate disconnect to protect the server. `dispatch_timeout` bounds how long the NATS callback waits when that slow-client signal is already blocked.
+3. **JetStream consumer** — `serve.go` reads the stream's info and plans the start position; `consumer.go` creates an ordered pull consumer bound to the configured stream. New clients start at the stream's `LastSeq + 1`; reconnecting clients at `lastID + 1`. If the requested sequence has been purged, is ahead of the stream, or is older than `replay_window`, NUTS falls back to `DeliverAll()` or `StartTime(now - replay_window)`. `replay_max_messages` closes retained replay after the configured historical event count.
+4. **Feed** — a goroutine in `consumer.go` pulls up to `client_buffer_size` messages ahead, formats each one (JetStream sequence as the SSE `id:`, `max_event_size` checks, control messages skipped) and hands frames to the writer one at a time. While the writer is busy, pulling stops.
+5. **SSE writer loop** — a single `select` in `serve.go` multiplexes:
+   - **`feed.frames`** — formatted frames, written and flushed with a `write_timeout` deadline; a missed deadline disconnects the client as slow.
+   - **`feed.errs`** — the consumer could not be recreated; the stream closes so the client resumes elsewhere.
    - **`heartbeat.C`** — periodic SSE comment (`: heartbeat <timestamp>`) keeps the connection alive through proxies/load balancers.
-   - **`ctx.Done()`** — client disconnect; subscriptions are cleaned up.
+   - **`ctx.Done()`** — client disconnect; the consumer is deleted in the background.
    - **`shutdown`** — `Cleanup()` closes this channel on module teardown so in-flight handlers return promptly instead of waiting for the next heartbeat or NATS-side error.
-5. **Client reconnect** — the browser's `EventSource` automatically reconnects and sends the last received `id:` as `Last-Event-ID`, resuming from where it left off.
+6. **Client reconnect** — the browser's `EventSource` automatically reconnects and sends the last received `id:` as `Last-Event-ID`, resuming from where it left off.

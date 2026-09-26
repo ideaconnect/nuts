@@ -62,6 +62,16 @@ filters when correlating logs with alerts.
 - Blackbox readiness panel drops to `0` while `/livez` remains `200`.
 - Logs contain `disconnected from NATS`; later recovery logs contain
   `reconnected to NATS`.
+- New stream requests are refused at once with
+  `disconnect_reason=jetstream_unavailable`: plain clients get `503` with
+  `Retry-After`, browsers a `retry:` stream, so `EventSource` keeps
+  reconnecting.
+- Open streams stay open. After the reconnect their consumers recreate
+  themselves from the last delivered sequence
+  (`nuts_consumer_invalidated_total{reason="recreated"}`); streams whose
+  consumer cannot be recreated close with
+  `disconnect_reason=consumer_unrecoverable` and resume from the client's
+  last event ID.
 
 **Actions**
 
@@ -118,8 +128,10 @@ filters when correlating logs with alerts.
 - `nuts_replay_fallbacks_total` spikes.
 - `nuts_replay_cap_reached_total` rises if `replay_max_messages` is configured.
 - Logs may show `replay_mode` as `start_sequence`, `fallback_deliver_all`, or
-   `fallback_start_time`; fallback logs include `replay_fallback_reason` such as
-   `sequence below retention` or `sequence outside replay window`.
+   `fallback_start_time`; fallback logs include `replay_fallback_reason`:
+   `sequence below retention`, `sequence outside replay window`,
+   `cursor ahead of stream` (a recreated or restored stream) or
+   `stream info unavailable`.
 
 **Actions**
 
@@ -131,93 +143,62 @@ filters when correlating logs with alerts.
 3. Review JetStream retention. A short retention window increases fallback
    frequency; a very long retained backlog makes each fallback more expensive.
 
-## Incident: Slow Consumers
+## Incident: Slow clients
 
 **Signals**
 
-- `nuts_slow_client_disconnects_total` increases quickly.
-- `nuts_nats_async_errors_total{kind="slow_consumer"}` also increases —
-  this counts drops at the nats.go-internal per-subscription buffer
-  layer (500k msg / 64 MB default), which fire BEFORE NUTS sees the
-  message at all. A non-zero rate here means NATS is shedding traffic
-  upstream of NUTS, not just slow SSE clients.
-- Logs show `disconnect_reason="slow_client"`, `slow_subject`, and
-  `buffer_size`.
-- Delivered-message rate may remain high while client reconnect churn rises.
+- `nuts_slow_client_disconnects_total` increases.
+- Logs show `disconnect_reason="slow_client"`: a write to the client missed
+  `write_timeout`.
+
+**Cause**
+
+A client that reads slowly is never disconnected for it: NUTS pulls from
+JetStream only as fast as the client reads, and the backlog waits in the
+stream. A slow-client disconnect means writes stopped completing altogether
+for `write_timeout` (30 s by default), usually a client that went away without
+closing the connection, or a proxy that stopped forwarding.
 
 **Actions**
 
 1. Identify affected `subject_label` values and client cohorts.
-2. Lower `client_buffer_size` to disconnect slow clients sooner, or raise it
-   only after checking the memory budget in [PERFORMANCE.md](PERFORMANCE.md).
-3. Set `write_timeout` to bound blocked SSE writes and `dispatch_timeout` to
-   bound NATS callback waits when a slow-client signal is already pending.
-4. Inspect downstream proxy buffering and browser/client processing speed.
-5. Confirm clients resume with `Last-Event-ID`; slow disconnects are designed
-   to trigger replay rather than silently drop messages.
-6. If `nuts_nats_async_errors_total{kind="slow_consumer"}` dominates,
-   the bottleneck is between NATS and the NUTS subscription, not
-   between NUTS and SSE clients — tune the producer-side rate or scale
-   NUTS horizontally.
+2. Inspect proxies between Caddy and the browser for response buffering; they
+   should honour `X-Accel-Buffering: no`.
+3. Confirm clients resume with `Last-Event-ID`; the disconnect is designed to
+   end in a resume, not a loss.
+4. Shorten `write_timeout` to free stalled connections, and their consumers,
+   sooner.
+5. `nuts_nats_async_errors_total{kind="slow_consumer"}` counts overflow in
+   nats.go's own subscription buffers, before NUTS sees a message. It should
+   stay at zero, because each stream pulls at most `client_buffer_size`
+   messages at a time; a rising rate points at the NATS connection itself
+   (CPU starvation or a saturated link).
 
-## Incident: Consumer invalidated mid-stream
+## Incident: Consumer recreated or unrecoverable
 
 **Signals**
 
-- `nuts_nats_async_errors_total{kind="consumer_invalidated"}` ticks
-  up. The label covers three nats.go signals that all mean the
-  JetStream push consumer is unusable:
-  - `nats.ErrConsumerNotActive` — the primary case. nats.go's
-    `activityCheck` fires when no `IdleHeartbeat` has arrived within
-    the configured tolerance (typically the JetStream server reaped
-    the ephemeral via `InactiveThreshold` during a network blip, or
-    a leafnode route failover dropped the inbox subscription).
-  - `nats.ErrConsumerDeleted` — the consumer was administratively
-    deleted while NUTS held the subscription.
-  - `*nats.ErrConsumerSequenceMismatch` — heartbeats DID arrive but
-    the delivered consumer sequence drifted from what nats.go
-    expected (interrupts ordered replay; rarer than the other two).
-- After M9 Batch B ships, `nuts_consumer_invalidated_total{reason="heartbeat_missed"}`
-  also ticks once per invalidation and the affected SSE handler emits
-  `disconnect_reason="consumer_invalidated"`. During the Batch A window,
-  only the async-errors counter increments — the affected SSE handler
-  stays attached to its zombie consumer until the client reconnects for
-  other reasons.
+- `nuts_consumer_invalidated_total{reason="recreated"}` increases: a stream's
+  consumer was lost (a NATS reconnect, missed pull heartbeats, a consumer
+  deleted or reaped on the server) and recreated itself from the last
+  delivered sequence. The client noticed nothing, and the log line
+  `JetStream consumer recreated` names the previous consumer.
+- `nuts_consumer_invalidated_total{reason="unrecoverable"}` increases and
+  streams close with `disconnect_reason="consumer_unrecoverable"`:
+  recreation kept failing for about 75 seconds (10 attempts), so the stream
+  ended and the client reconnects with its last event ID.
 
 **Actions**
 
-1. **Cross-reference `nuts_nats_connection_events_total{event="disconnect"}`
-   FIRST.** A NATS-side connection blip longer than `2 × nats_idle_heartbeat`
-   (default 20s with the 10s heartbeat) trips `nats.go`'s `activityCheck`
-   on every active push subscription — each one fires
-   `ErrConsumerNotActive` and increments `consumer_invalidated` once
-   per concurrent SSE client. With N active clients you will see N
-   `consumer_invalidated` ticks for what was operationally one
-   disconnect, plus the matching `connection_events{event="disconnect"}`
-   tick. If the `disconnect` tick correlates in time, treat this
-   incident as a connection blip — not a server-side consumer reap —
-   and move to the network/cluster troubleshooting flow rather than
-   continuing with the steps below.
-2. Check the NATS server's effective `InactiveThreshold` against NUTS'
-   `nats_idle_heartbeat` setting. Two missed heartbeats must be
-   detectable before the server reaps; NUTS' `Validate` enforces
-   `nats_idle_heartbeat < InactiveThreshold/2` against its in-process
-   constant (`defaultConsumerInactiveThreshold = 30s`), but a server-side
-   override or a leafnode/cluster configuration can change the effective
-   reap interval. If the server reaps faster than NUTS detects, the
-   heartbeat path is silently undermined.
-3. Inspect NATS server logs for ephemeral consumer creation/deletion
-   churn. Leafnode route flaps and replica failovers are common upstream
-   causes.
-4. After Batch B is deployed, confirm clients reconnect with
-   `Last-Event-ID` and resume cleanly; the disconnect is by design and
-   the client-side retry is the recovery contract.
-5. If the counter ticks during periods of healthy delivery (no
-   coincident `connection_events{disconnect}` tick, no server-side
-   consumer churn), a real delivery gap (publisher-side issue, stream
-   replication divergence) may be present — cross-reference
-   `nuts_replay_fallbacks_total` and the NATS server's
-   `nats stream report`.
+1. Cross-reference `nuts_nats_connection_events_total{event="disconnect"}`
+   first. A reconnect recreates every open stream's consumer, so one blip
+   shows up once per open stream.
+2. Without a matching disconnect, look for consumers deleted on the server:
+   an operator or tool deleting `nuts_*` consumers, or a stream's
+   `consumer_limits.inactive_threshold` reaping consumers of stalled
+   streams.
+3. For `unrecoverable`, check JetStream availability and the stream's
+   consumer limit (see below): recreation needs to create a consumer.
 
 ## Incident: Stalled writes
 
@@ -242,29 +223,28 @@ filters when correlating logs with alerts.
 1. Cross-reference the failing `site` with downstream proxy / load-
    balancer error logs. Heartbeat-site failures are usually idle
    connections being closed by a transparent proxy.
-2. Verify `write_timeout` is set to something reasonable for the
-   network path (`0` leaves it to Caddy and the underlying HTTP stack).
+2. Check `write_timeout` for the network path (30 s by default; `-1`
+   leaves it to Caddy and the underlying HTTP stack).
 3. For chronic `message`-site failures, inspect client behaviour —
    browsers under heavy main-thread load can stall their event loop
    long enough to trip `write_timeout`.
 
-## Incident: Wildcard-fallback overhead on pre-2.10 NATS
+## Incident: Multi-topic streams skip messages
 
 **Signals**
 
-- `nuts_wildcard_filter_drops_total` increases steadily.
-- Connected NATS server reports version `< 2.10` (visible in
-  `nats-server -DV` output or the `INFO` line on connect).
+- Clients subscribed to several topics (`?topic=a&topic=b`) miss messages on
+  one topic, typically after a subject purge, a `Nats-Rollup: sub` publish,
+  per-message TTL delete markers or a message schedule firing on another.
+- At startup, NUTS logged a warning that the server can skip messages on
+  multi-topic subscriptions.
 
 **Actions**
 
-1. The wildcard fallback subscribes to the smallest common parent
-   subject and filters client-side; every dropped message wasted a
-   network round-trip and CPU cycle. The metric measures that waste.
-2. Upgrading NATS to ≥ 2.10 enables native multi-filter consumers
-   (`ConsumerFilterSubjects`) and removes the fallback entirely.
-3. Until you can upgrade, narrow the wildcard by ensuring all topics in
-   a single subscription share a deeper common prefix.
+1. Upgrade nats-server to 2.14.7 or newer (2.15 recommended). Older releases,
+   including every 2.10.x and 2.12.x, move a multi-filter consumer past
+   pending messages when one of its subjects is purged (nats-server#8572).
+2. Until then, subscribe to one topic per connection on affected routes.
 
 ## Incident: Stream consumer limit reached
 
@@ -293,6 +273,21 @@ lift it. All NUTS instances and other applications on the stream share it.
    `default_max_consumers: -1` in the server's JetStream limits.
 3. Keep `max_connections` × instances at or below the limit, so clients get
    the cheaper `max_connections` rejection first.
+
+## Incident: Streams answer 500 "Streaming not supported"
+
+**Cause**
+
+The response writer NUTS received cannot flush. Before v0.4.3 this happened
+whenever Caddy's `log` directive or HTTP request metrics were enabled, because
+Caddy wraps the writer in a recorder without `http.Flusher`. NUTS now flushes
+through `http.ResponseController`, which follows `Unwrap`.
+
+**Actions**
+
+1. Upgrade to v0.4.3 or newer.
+2. If it persists, look for a third-party handler in the route that wraps the
+   response writer without `Flush` or `Unwrap` methods.
 
 ## Incident: CORS Misconfiguration
 

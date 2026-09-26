@@ -30,6 +30,12 @@ The `latest` tag may move on every default-branch push.
 NUTS expects an existing NATS JetStream stream. It does not create streams and
 does not publish messages.
 
+- nats-server 2.10 or newer is required; multi-topic subscriptions need
+  2.14.7 or newer (2.15 recommended).
+- Each SSE connection holds one JetStream consumer. From nats-server 2.15 a
+  stream allows 1000 consumers unless `max_consumers` is set, so size it for
+  peak connections across all NUTS instances.
+
 Example stream setup with the NATS CLI:
 
 ```bash

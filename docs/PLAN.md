@@ -387,63 +387,63 @@ the pull prefetch bound.
 Goal: correct behaviour on current servers, and clear, retryable errors when a
 server-side limit is hit.
 
-- [ ] **[#109] Test matrix.** *minor · S* (D3)
-  - [ ] Add `nats:2.15-alpine`.
-  - [ ] Move the CI and `docker-compose.yml` defaults off `nats:2.12-alpine`.
-  - [ ] Keep or drop 2.9 per D3. Update README "Compatibility" and the
+- [x] **[#109] Test matrix.** *minor · S* (D3)
+  - [x] Add `nats:2.15-alpine`.
+  - [x] Move the CI and `docker-compose.yml` defaults off `nats:2.12-alpine`.
+  - [x] Keep or drop 2.9 per D3. Update README "Compatibility" and the
     Makefile comment.
-- [ ] **[#111] Minimum server for multi-topic.** *major · S*
-  - [ ] Document ≥ 2.14.7 (2.15 recommended) for multi-topic subscriptions.
-  - [ ] Optionally warn, or fall back to the wildcard path, on older servers.
-  - [ ] Regression scenario: purge one subject while the other has messages
+- [x] **[#111] Minimum server for multi-topic.** *major · S* A startup warning below 2.14.7; the regression test fails against nats:2.12 and passes on 2.15.
+  - [x] Document ≥ 2.14.7 (2.15 recommended) for multi-topic subscriptions.
+  - [x] Optionally warn, or fall back to the wildcard path, on older servers.
+  - [x] Regression scenario: purge one subject while the other has messages
     pending.
-- [ ] **[#110] 2.15's 1000-consumer default.** *major · M*
-  - [ ] Document the requirement in README, DEPLOYMENT and OPERATIONS:
+- [x] **[#110] 2.15's 1000-consumer default.** *major · M*
+  - [x] Document the requirement in README, DEPLOYMENT and OPERATIONS:
     - a positive `max_consumers` on the stream or account, or the server-wide
       `default_max_consumers: -1`;
     - `--max-consumers` in the `nats stream add` examples.
-  - [ ] Detect error 10026 (`JSErrCodeMaximumConsumersLimit`) and handle it with:
+  - [x] Detect error 10026 (`JSErrCodeMaximumConsumersLimit`) and handle it with:
     - its own `disconnect_reason`;
     - `nuts_connections_rejected_total{reason="stream_consumer_limit"}`;
     - the retryable response from [#105].
-  - [ ] A 2.15 scenario with a small `max_consumers`. [#119] removes this
+  - [x] A 2.15 scenario with a small `max_consumers`. [#119] removes this
     limit structurally.
-- [ ] **[#112] Server control messages.** *minor · S* (D4d)
-  - [ ] Skip messages carrying `Nats-Marker-Reason` or `Nats-Schedule*`, and
+- [x] **[#112] Server control messages.** *minor · S* (D4d)
+  - [x] Skip messages carrying `Nats-Marker-Reason` or `Nats-Schedule*`, and
     count them as `reason="control_message"`.
-  - [ ] Optionally forward markers as an opt-in `event: deleted`.
-  - [ ] Test with `AllowMsgTTL` + `SubjectDeleteMarkerTTL`.
-- [ ] **[#113] `InactiveThreshold` vs stream consumer limits.** *minor · S*
-  - [ ] Read `ConsumerLimits.InactiveThreshold` in Provision.
-  - [ ] Clamp (and re-validate `nats_idle_heartbeat`), or fail with an
+  - [x] Optionally forward markers as an opt-in `event: deleted`.
+  - [x] Test with `AllowMsgTTL` + `SubjectDeleteMarkerTTL`.
+- [x] **[#113] `InactiveThreshold` vs stream consumer limits.** *minor · S* Capped per request from the stream info, so a limit changed after startup is honoured too; the heartbeat bound is tied to the pull expiry, not the threshold.
+  - [x] Read `ConsumerLimits.InactiveThreshold` in Provision.
+  - [x] Clamp (and re-validate `nats_idle_heartbeat`), or fail with an
     actionable error.
-  - [ ] Map error 10153.
-- [ ] **[#117] Capability detection.** *minor · S* (D3)
-  - [ ] Retry through the wildcard path on
+  - [x] Map error 10153.
+- [x] **[#117] Capability detection.** *minor · S* (D3) The wildcard path was deleted with the pull migration.
+  - [x] Retry through the wildcard path on
     `ErrConsumerMultipleFilterSubjectsNotSupported`, or delete the wildcard
     path if 2.9 is dropped.
-- [ ] **[#105] Retryable responses for EventSource.** *minor · M* (D4c)
-  - [ ] For requests with `Accept: text/event-stream`, answer `200` +
+- [x] **[#105] Retryable responses for EventSource.** *minor · M* (D4c) Also answers at once while NATS is reconnecting.
+  - [x] For requests with `Accept: text/event-stream`, answer `200` +
     `retry: <ms>` (jittered), then close. This applies to transient failures:
     JetStream unavailable, subscribe failure, `max_connections`, and the
     consumer limit.
-  - [ ] Other clients keep 503/429.
-  - [ ] Update `example/index.html` and the README.
-- [ ] **[#73] NATS callback hygiene.** *minor · S*
-  - [ ] Add `nats.NoCallbacksAfterClientClose()`.
-  - [ ] Add a `LameDuckModeHandler` that logs and counts
+  - [x] Other clients keep 503/429.
+  - [x] Update `example/index.html` and the README.
+- [x] **[#73] NATS callback hygiene.** *minor · S*
+  - [x] Add `nats.NoCallbacksAfterClientClose()`.
+  - [x] Add a `LameDuckModeHandler` that logs and counts
     `event="lame_duck"`.
-- [ ] **[#75] Drain on Cleanup.** *nit · S*
-  - [ ] `Cleanup` drains with a bounded `DrainTimeout`, so per-request consumer
+- [x] **[#75] Drain on Cleanup.** *nit · S* Implemented as a bounded wait for the streams' consumer deletes rather than `Drain`.
+  - [x] `Cleanup` drains with a bounded `DrainTimeout`, so per-request consumer
     deletes happen.
-  - [ ] Test that no consumers linger.
-- [ ] **[#72] Bounded waits.** *minor · S*
-  - [ ] Add `MaxWait` to the Provision-time `StreamInfo` and to the JetStream
+  - [x] Test that no consumers linger.
+- [x] **[#72] Bounded waits.** *minor · S*
+  - [x] Add `MaxWait` to the Provision-time `StreamInfo` and to the JetStream
     context (shared with [#123]).
-- [ ] **[#74] `nats_idle_heartbeat -1` warning.** *minor · S*
-  - [ ] Log a Warn when set, and add a README operability note.
-- [ ] **Release v0.6.0** (Phases 4–5). *S*
-  - [ ] The CHANGELOG marks as **Breaking**:
+- [x] **[#74] `nats_idle_heartbeat -1` warning.** *minor · S*
+  - [x] Log a Warn when set, and add a README operability note.
+- [x] **Release v0.6.0** (Phases 4–5). *S* Folded into the MAJOR release; the Breaking entries are in the CHANGELOG.
+  - [x] The CHANGELOG marks as **Breaking**:
     - the new defaults (D5);
     - the response shapes ([#105]);
     - control-message filtering ([#112]).
@@ -491,27 +491,27 @@ documented budgets that hold.
 
 Several of these are good first issues.
 
-- [ ] **[#78] Reject CA pinning with insecure-skip-verify.** *major · S*
-  - [ ] Reject `nats_tls_ca` combined with `nats_tls_insecure_skip_verify` in
+- [x] **[#78] Reject CA pinning with insecure-skip-verify.** *major · S*
+  - [x] Reject `nats_tls_ca` combined with `nats_tls_insecure_skip_verify` in
     `validateConfigValues`, which runs inside Provision before dialling. Mark
     the CHANGELOG entry **Breaking**.
-- [ ] **[#82] Earlier insecure-TLS warning.** *minor · S*
-  - [ ] Emit the warning from Provision, before `connectNATS`.
-- [ ] **[#77] `nats_url` scheme allowlist.** *minor · S*
-  - [ ] Allow `nats`, `tls`, `ws` and `wss`, including comma-separated lists.
-  - [ ] Warn about plaintext credentials for `nats://`, `ws://` and URLs with no
+- [x] **[#82] Earlier insecure-TLS warning.** *minor · S*
+  - [x] Emit the warning from Provision, before `connectNATS`.
+- [x] **[#77] `nats_url` scheme allowlist.** *minor · S*
+  - [x] Allow `nats`, `tls`, `ws` and `wss`, including comma-separated lists.
+  - [x] Warn about plaintext credentials for `nats://`, `ws://` and URLs with no
     scheme.
-- [ ] **[#79] Validate `allowed_origins`.** *minor · S*
-  - [ ] Accept only `*` or `scheme://host[:port]`: no empty entries,
+- [x] **[#79] Validate `allowed_origins`.** *minor · S*
+  - [x] Accept only `*` or `scheme://host[:port]`: no empty entries,
     whitespace, control characters or commas.
-- [ ] **[#80] Parse-time negative checks.** *nit · S*
-  - [ ] Reject negative `heartbeat_interval` and `reconnect_wait` at parse time.
-- [ ] **[#81] Tighten the topic-cap sentinel.** *nit · S*
-  - [ ] Only `-1` disables `max_topics_per_subscription`. Mark the CHANGELOG
+- [x] **[#80] Parse-time negative checks.** *nit · S*
+  - [x] Reject negative `heartbeat_interval` and `reconnect_wait` at parse time.
+- [x] **[#81] Tighten the topic-cap sentinel.** *nit · S*
+  - [x] Only `-1` disables `max_topics_per_subscription`. Mark the CHANGELOG
     entry **Breaking**.
-- [ ] **[#84] Better cleanup logging.** *nit · S*
-  - [ ] `cleanupStream` logs the request's topics and subjects instead of
-    `sub.Subject`.
+- [x] **[#84] Better cleanup logging.** *nit · S* `cleanupStream` is gone; failed consumer deletes are logged with the topics instead.
+  - [x] ~~`cleanupStream` logs the request's topics and subjects instead of
+    `sub.Subject`.~~
 
 ## Phase 8: Test-suite hardening and hygiene (parallelisable)
 
@@ -557,25 +557,29 @@ Several of these are good first issues.
 
 ## Phase 9: Documentation, metrics and operations (due before each release)
 
-- [ ] **[#70] README sweep.** *minor · M*
-  - [ ] Cover items A–M from the issue, plus N (consumer retention wording).
-  - [ ] Sync `website/docs`.
-- [ ] **[#71] Metric Help strings.** *nit · S*
-  - [ ] Enumerate label values in the Help strings.
-  - [ ] Split nil-error closes out of `event="disconnect"`.
-  - [ ] Fix the `nuts_replay_fallbacks_total` Help text.
-- [ ] **[#86] Alert rules and dashboard.** *nit · S*
-  - [ ] Add alerts for:
-    - `consumer_invalidated`, `slow_consumer`, `dispatch_timeout`;
-    - `write_disconnects`, `messages_dropped`, `wildcard_filter_drops`;
-    - the new Phase 3–5 metrics: delivery gaps, control messages, the consumer
-      limit.
-  - [ ] Add matching Grafana panels.
-- [ ] **`docs/OPERATIONS.md` runbooks.**
-  - [ ] Cover NATS link loss and delivery gaps, the 2.15 consumer limit,
+- [x] **[#70] README sweep.** *minor · M*
+  - [x] Cover items A–M from the issue, plus N (consumer retention wording).
+    Item I no longer applies: #98 keeps the cap without a snapshot.
+  - [x] Sync `website/docs`.
+- [x] **[#71] Metric Help strings.** *nit · S*
+  - [x] Enumerate label values in the Help strings.
+  - [x] Split nil-error closes out of `event="disconnect"`. Resolved by #73:
+    NUTS's own close no longer reports a disconnect.
+  - [x] Fix the `nuts_replay_fallbacks_total` Help text.
+- [x] **[#86] Alert rules and dashboard.** *nit · S*
+  - [x] Add alerts for:
+    - `consumer_invalidated`, `slow_consumer` (`dispatch_timeout` is gone);
+    - `write_disconnects`, `messages_dropped` (`wildcard_filter_drops` is
+      always 0);
+    - the new Phase 3–5 metrics: consumer recoveries, the consumer limit,
+      lame duck mode. Control messages are routine and only on the
+      dashboard.
+  - [x] Add matching Grafana panels.
+- [x] **`docs/OPERATIONS.md` runbooks.**
+  - [x] Cover NATS link loss and delivery gaps, the 2.15 consumer limit,
     replay storms, and running behind access logs.
-- [ ] **`docs/CONFIGURATION.md`.**
-  - [ ] Document every new or changed directive and default.
+- [x] **`docs/CONFIGURATION.md`.**
+  - [x] Document every new or changed directive and default.
 
 ## Backlog
 
