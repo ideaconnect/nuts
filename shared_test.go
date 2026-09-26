@@ -293,9 +293,16 @@ func TestShared_SlowClientFallsBackWithoutLoss(t *testing.T) {
 		t.Fatalf("slow client never connected; body=%q", slow.Body())
 	}
 
-	publishRange(t, js, "events.a", 1, 30)
-	if !waitForSSEBody(fast, `{"n":30}`, 3*time.Second) {
-		t.Fatalf("the fast client was held up by the slow one; body=%q", fast.Body())
+	// Two messages at a time, each pair drained by the fast client before the
+	// next: its queue never holds more than 2 of its 4 frames, so only the
+	// gated client can fall behind. A 30-message burst could also overflow
+	// the fast client's queue before its writer runs, a legitimate second
+	// fall-behind that would make the count below flaky.
+	for n := 1; n <= 30; n += 2 {
+		publishRange(t, js, "events.a", n, n+1)
+		if !waitForSSEBody(fast, `{"n":`+strconv.Itoa(n+1)+`}`, 3*time.Second) {
+			t.Fatalf("the fast client was held up by the slow one; body=%q", fast.Body())
+		}
 	}
 	if got := parseSSEIDs(t, fast.Body()); len(got) != 31 {
 		t.Fatalf("fast client ids = %v, want the cursor and 1..30", got)
