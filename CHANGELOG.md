@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-09-26
+
+Bug-fix and security release. Upgrade urgency: **high** if Caddy runs with
+access logging (`log`) or HTTP request metrics, where every SSE request
+failed; **medium** otherwise, for the Go standard-library fixes. No directive,
+JSON field, metric or response-format changes. This release also ships the
+Docker image that v0.4.2 never got.
+
 ### Fixed
 - **SSE streams returned `500 Streaming not supported` whenever Caddy access
   logging or HTTP request metrics were enabled** (#114). With the `log`
