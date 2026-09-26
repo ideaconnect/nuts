@@ -140,6 +140,12 @@ Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
   per frame (#121). To let batches form, each connection's feed hands up to
   16 formatted frames ahead to its writer. Catching up on a 3000-message
   backlog now takes about half as long.
+- Concurrent stream requests share stream-info reads (#123). After a reload
+  or an outage every client reconnects at once, and each request used to
+  read the stream's info separately. A request now waits for the next read
+  that starts after it arrived, so its start position is never planned from
+  older information. `replay_window` lookups use Direct Get on streams with
+  `allow_direct`, which the documentation now recommends.
 - Subject matching no longer allocates (#124). Authorizing 32 topics against
   a JWT claim of 128 filters took 0.46 ms and 8,192 allocations per request,
   before the `max_connections` check; it now takes about 55 µs and none. The

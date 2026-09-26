@@ -28,6 +28,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -663,7 +664,11 @@ func (h *Handler) currentStreamRuntime() streamRuntime {
 func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan streamPlan) streamInfoSnapshot {
 	readCtx, cancel := context.WithTimeout(ctx, defaultMetadataReadTimeout)
 	defer cancel()
-	stream, err := js.Stream(readCtx, h.StreamName)
+	stream, err := h.streamReads.read(readCtx, func() (jetstream.Stream, error) {
+		fetchCtx, cancel := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
+		defer cancel()
+		return js.Stream(fetchCtx, h.StreamName)
+	})
 	if err != nil {
 		h.log().Warn("failed to read JetStream stream info for request planning",
 			appendStreamLogFields(plan, zap.Error(err))...,
@@ -697,6 +702,64 @@ func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan 
 		}
 	}
 	return snapshot
+}
+
+// streamReads coalesces stream-info reads (#123). After a reload or an
+// outage every client reconnects at once, and each request would ask
+// JetStream for the same stream info. A caller only ever shares a read that
+// started after it arrived: its snapshot is never older than the request, so
+// a client resuming from the newest message cannot look ahead of the stream.
+// While a read runs, arriving callers wait for the next one, so a storm
+// costs one read per read's duration instead of one per request.
+type streamReads struct {
+	mu      sync.Mutex
+	running *streamRead
+	next    *streamRead
+}
+
+// streamRead is one read and the callers waiting for it.
+type streamRead struct {
+	done   chan struct{}
+	fetch  func() (jetstream.Stream, error)
+	stream jetstream.Stream
+	err    error
+}
+
+// read returns the result of a read that starts after this call. fetch is
+// used if this caller is the one that starts the read.
+func (r *streamReads) read(ctx context.Context, fetch func() (jetstream.Stream, error)) (jetstream.Stream, error) {
+	r.mu.Lock()
+	var call *streamRead
+	if r.running == nil {
+		call = &streamRead{done: make(chan struct{}), fetch: fetch}
+		r.running = call
+		go r.run(call)
+	} else {
+		if r.next == nil {
+			r.next = &streamRead{done: make(chan struct{}), fetch: fetch}
+		}
+		call = r.next
+	}
+	r.mu.Unlock()
+	select {
+	case <-call.done:
+		return call.stream, call.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// run performs a read, then the one its latecomers are waiting for, until
+// no one is waiting.
+func (r *streamReads) run(call *streamRead) {
+	for call != nil {
+		call.stream, call.err = call.fetch()
+		close(call.done)
+		r.mu.Lock()
+		r.running, r.next = r.next, nil
+		call = r.running
+		r.mu.Unlock()
+	}
 }
 
 // planSubscription finalises the streamPlan in the light of the JetStream

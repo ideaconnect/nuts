@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1475,5 +1476,102 @@ func TestServeStream_ReplayCapEndsTheBatch(t *testing.T) {
 	}
 	if got := counterVal(t, metricsReplayCapReached); got != capBefore+1 {
 		t.Fatalf("replay_cap_reached_total = %v, want %v", got, capBefore+1)
+	}
+}
+
+// TestStreamReads_LatecomersShareTheNextRead covers #123: callers arriving
+// while a read runs share one later read, and nobody gets a read that
+// started before it arrived.
+func TestStreamReads_LatecomersShareTheNextRead(t *testing.T) {
+	var reads streamReads
+	var mu sync.Mutex
+	var starts []time.Time
+	release := make(chan struct{})
+	fetch := func() (jetstream.Stream, error) {
+		mu.Lock()
+		starts = append(starts, time.Now())
+		first := len(starts) == 1
+		mu.Unlock()
+		if first {
+			<-release
+		}
+		return fakeStream{}, nil
+	}
+
+	firstDone := make(chan struct{})
+	go func() {
+		_, _ = reads.read(context.Background(), fetch)
+		close(firstDone)
+	}()
+	for {
+		mu.Lock()
+		started := len(starts) == 1
+		mu.Unlock()
+		if started {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	var wg sync.WaitGroup
+	arrivals := make([]time.Time, 10)
+	for i := range arrivals {
+		wg.Add(1)
+		arrivals[i] = time.Now()
+		go func() {
+			defer wg.Done()
+			if _, err := reads.read(context.Background(), fetch); err != nil {
+				t.Errorf("read: %v", err)
+			}
+		}()
+	}
+	time.Sleep(20 * time.Millisecond) // let the latecomers queue up
+	close(release)
+	<-firstDone
+	wg.Wait()
+
+	if len(starts) != 2 {
+		t.Fatalf("reads = %d, want 2: the first and one shared by the 10 latecomers", len(starts))
+	}
+	for i, arrived := range arrivals {
+		if starts[1].Before(arrived) {
+			t.Fatalf("latecomer %d arrived at %v but got a read started at %v", i, arrived, starts[1])
+		}
+	}
+
+	if _, err := reads.read(context.Background(), fetch); err != nil || len(starts) != 3 {
+		t.Fatalf("a caller after the storm got reads=%d err=%v, want its own fresh read", len(starts), err)
+	}
+}
+
+func TestStreamReads_ErrorsAndCancellation(t *testing.T) {
+	var reads streamReads
+	boom := errors.New("boom")
+	if _, err := reads.read(context.Background(), func() (jetstream.Stream, error) { return nil, boom }); !errors.Is(err, boom) {
+		t.Fatalf("read error = %v, want %v", err, boom)
+	}
+
+	release := make(chan struct{})
+	defer close(release)
+	go func() {
+		_, _ = reads.read(context.Background(), func() (jetstream.Stream, error) { <-release; return fakeStream{}, nil })
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	for {
+		reads.mu.Lock()
+		running := reads.running != nil
+		reads.mu.Unlock()
+		if running {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := reads.read(ctx, func() (jetstream.Stream, error) { return fakeStream{}, nil }); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiting caller whose request ended got %v, want its context error", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("a cancelled caller kept waiting for the read")
 	}
 }

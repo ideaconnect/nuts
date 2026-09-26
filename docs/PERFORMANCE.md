@@ -93,6 +93,12 @@ Use these as release gates before increasing traffic or connection limits:
   `replay_window` for public or multi-tenant routes. A long replay no longer
   disconnects the client, but it keeps a consumer and a connection busy for
   as long as the backlog takes to deliver.
+- **Reconnect storms:** each stream request reads the stream's info once.
+  Requests that arrive while such a read is running share the next one, so a
+  storm costs one read per read's duration rather than one per client, and
+  no request plans from information older than itself. Consumer creation is
+  still one API call per connection, except for connections that join a
+  shared subscription.
 - **Downstream stalls:** `write_timeout` (30 s by default) frees the
   connection, its consumer and its memory when a client or proxy stops
   reading. Shorten it on public routes where stalled connections are common.

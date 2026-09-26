@@ -591,7 +591,10 @@ this can be tens of thousands of events.
   replay also starts at `now - window`. Replayed messages older than the
   window are dropped and counted as
   `nuts_messages_dropped_total{reason="replay_window"}`; live messages are
-  never filtered.
+  never filtered. To date the resume point, NUTS reads that one message; on
+  a stream with `allow_direct` (`nats stream add --allow-direct`) this uses
+  Direct Get instead of the JetStream API, which returns the whole message
+  base64-encoded.
 
 Both default to `0` (unlimited / all retained) to preserve the original
 behaviour. They can be combined: `replay_window` bounds the time range,

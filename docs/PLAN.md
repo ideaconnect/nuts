@@ -474,12 +474,17 @@ documented budgets that hold.
     by hand, and call `w.Write`.
   - [x] Golden tests pin byte-identical output: HTML escaping, U+2028/9,
     non-JSON input, empty payload.
-- [ ] **[#123] Per-connection JetStream cost.** *minor · M*
-  - [ ] Cache the stream subjects at Provision, and deduplicate concurrent
-    `StreamInfo` calls with `singleflight`.
-  - [ ] Avoid `GetMsg` for the window check (use `DirectGet`, or subscribe
-    first and check the first message).
-  - [ ] Release the connection slot before the consumer delete, and delete
+- [x] **[#123] Per-connection JetStream cost.** *minor · M*
+  - [x] Cache the stream subjects at Provision, and deduplicate concurrent
+    `StreamInfo` calls with `singleflight`. Done as coalescing onto the next
+    read that starts after a request arrives: `singleflight` could hand a
+    request information older than itself, making a fresh cursor look ahead
+    of the stream. Subjects are not cached: each read also yields the start
+    position.
+  - [x] Avoid `GetMsg` for the window check (use `DirectGet`, or subscribe
+    first and check the first message). nats.go uses Direct Get whenever the
+    stream allows it; the docs recommend `allow_direct`.
+  - [x] Release the connection slot before the consumer delete, and delete
     asynchronously.
 - [x] **[#124] Allocation-free subject matcher.** *minor · S*
   - [x] Walk the tokens without `strings.Split`.

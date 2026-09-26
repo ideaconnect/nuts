@@ -206,6 +206,9 @@ type Handler struct {
 	// shared holds the shared subscriptions when SharedSubscriptions is on.
 	shared *sharedRegistry
 
+	// streamReads coalesces the stream-info reads of concurrent requests.
+	streamReads streamReads
+
 	// mu protects conn, js, shutdown and closing.
 	mu sync.RWMutex
 
