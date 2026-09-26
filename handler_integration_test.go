@@ -335,14 +335,11 @@ func TestMetrics_ReplayRequests_Increments(t *testing.T) {
 
 	// Client with an explicit last-id is a replay request, regardless of
 	// whether any messages exist yet.
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	req := httptest.NewRequest(http.MethodGet, "/events?topic=replay&last-id=0", nil).WithContext(ctx)
-	rr := newSafeRecorder()
-	_ = h.ServeHTTP(rr, req, nil)
+	_, cancel, done := startSSE(t, h, "/events?topic=replay&last-id=0", "")
+	stopSSE(t, cancel, done)
 
-	if got := counterVal(t, metricsReplayRequests); got <= before {
-		t.Errorf("replay_requests_total did not increment: before=%v got=%v", before, got)
+	if got := counterVal(t, metricsReplayRequests); got != before+1 {
+		t.Errorf("replay_requests_total = %v, want %v", got, before+1)
 	}
 }
 
@@ -368,16 +365,14 @@ func TestMetrics_ReplayFallbacks_Increments(t *testing.T) {
 
 	before := counterVal(t, metricsReplayFallbacks)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	req := httptest.NewRequest(http.MethodGet, "/events?topic=fallback&last-id=1", nil).WithContext(ctx)
-	rr := newSafeRecorder()
-	done := make(chan error, 1)
-	go func() { done <- h.ServeHTTP(rr, req, nil) }()
-	<-done
+	rr, cancel, done := startSSE(t, h, "/events?topic=fallback&last-id=1", "")
+	if !waitForSSEBody(rr, `{"i":4}`, 3*time.Second) {
+		t.Fatalf("fallback replay not delivered; body=%q", rr.Body())
+	}
+	stopSSE(t, cancel, done)
 
-	if got := counterVal(t, metricsReplayFallbacks); got <= before {
-		t.Errorf("replay_fallbacks_total did not increment: before=%v got=%v", before, got)
+	if got := counterVal(t, metricsReplayFallbacks); got != before+1 {
+		t.Errorf("replay_fallbacks_total = %v, want %v", got, before+1)
 	}
 }
 

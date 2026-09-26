@@ -917,6 +917,10 @@ func TestHandler_PlanSubscriptionReplayFallbacks(t *testing.T) {
 		wantReason string
 	}{
 		{name: "caught-up cursor resumes normally", plan: cursor(11), snapshot: streamInfoSnapshot{HasSnapshot: true, FirstSeq: 1, LastSeq: 10}, wantMode: replayModeStartSequence},
+		// The caught-up check must run before the "start time unknown"
+		// fallback: the next sequence does not exist yet, so its time can
+		// never be read, and a caught-up client would replay the window.
+		{name: "caught-up cursor under a window resumes normally", window: 60, plan: cursor(11), snapshot: streamInfoSnapshot{HasSnapshot: true, FirstSeq: 1, LastSeq: 10}, wantMode: replayModeStartSequence},
 		{name: "cursor ahead of the stream falls back", plan: cursor(12), snapshot: streamInfoSnapshot{HasSnapshot: true, FirstSeq: 1, LastSeq: 10}, wantMode: replayModeFallbackDeliverAll, wantReason: "cursor ahead of stream"},
 		{name: "cursor ahead of an empty recreated stream falls back", plan: cursor(51), snapshot: streamInfoSnapshot{HasSnapshot: true}, wantMode: replayModeFallbackDeliverAll, wantReason: "cursor ahead of stream"},
 		{name: "cursor ahead with a window uses the window", window: 60, plan: cursor(12), snapshot: streamInfoSnapshot{HasSnapshot: true, FirstSeq: 1, LastSeq: 10}, wantMode: replayModeFallbackStartTime, wantReason: "cursor ahead of stream"},
@@ -1573,5 +1577,33 @@ func TestStreamReads_ErrorsAndCancellation(t *testing.T) {
 	}
 	if time.Since(start) > time.Second {
 		t.Fatal("a cancelled caller kept waiting for the read")
+	}
+}
+
+// TestHandler_SetSSEHeaders pins the response headers every stream needs:
+// without X-Accel-Buffering nginx buffers events, without Cache-Control
+// caches may store the stream, and without Connection HTTP/1.1 proxies may
+// close it between events.
+func TestHandler_SetSSEHeaders(t *testing.T) {
+	for _, hub := range []string{"", "https://example.com/events"} {
+		rr := httptest.NewRecorder()
+		(&Handler{HubURL: hub}).setSSEHeaders(rr)
+		want := map[string]string{
+			"Content-Type":      "text/event-stream",
+			"Cache-Control":     "no-cache",
+			"Connection":        "keep-alive",
+			"X-Accel-Buffering": "no",
+		}
+		if hub != "" {
+			want["Link"] = `<https://example.com/events>; rel="nuts"`
+		}
+		if len(rr.Header()) != len(want) {
+			t.Fatalf("headers = %v, want exactly %v", rr.Header(), want)
+		}
+		for name, value := range want {
+			if got := rr.Header().Get(name); got != value {
+				t.Fatalf("%s = %q, want %q", name, got, value)
+			}
+		}
 	}
 }

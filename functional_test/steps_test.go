@@ -1097,6 +1097,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^I should receive HTTP status (\d+)$`, iShouldReceiveHTTPStatus)
 	ctx.Step(`^the response should contain "([^"]*)"$`, theResponseShouldContain)
 	ctx.Step(`^the response header "([^"]*)" should be "([^"]*)"$`, theResponseHeaderShouldBe)
+	ctx.Step(`^the SSE response header "([^"]*)" should be "([^"]*)"$`, theSSEResponseHeaderShouldBe)
 	ctx.Step(`^I should receive a heartbeat comment$`, iShouldReceiveAHeartbeatComment)
 	ctx.Step(`^the stream "([^"]*)" should have an active consumer using expected multi-topic filters for subjects "([^"]*)"$`, streamShouldHaveActiveConsumerUsingExpectedMultiTopicFilters)
 
@@ -1130,4 +1131,16 @@ func theStreamShouldHaveConsumers(streamName string, want int) error {
 		}
 		return false, fmt.Sprintf("stream %s has %d consumers, want %d", streamName, info.State.Consumers, want)
 	})
+}
+
+// theSSEResponseHeaderShouldBe checks a header of the scenario's open SSE
+// stream.
+func theSSEResponseHeaderShouldBe(name, want string) error {
+	if tc.sseResponse == nil {
+		return fmt.Errorf("no SSE stream is open")
+	}
+	if got := tc.sseResponse.Header.Get(name); got != want {
+		return fmt.Errorf("SSE response header %s = %q, want %q", name, got, want)
+	}
+	return nil
 }

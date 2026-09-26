@@ -58,6 +58,12 @@ Feature: SSE Streaming with JetStream
     When I publish message '{"path": "based"}' to subject "events.mypath"
     Then I should receive an SSE event with topic "mypath"
 
+  Scenario: Stream responses carry the SSE headers proxies rely on
+    When I connect to SSE endpoint "/events?topic=headers"
+    Then the SSE response header "Content-Type" should be "text/event-stream"
+    And the SSE response header "Cache-Control" should be "no-cache"
+    And the SSE response header "X-Accel-Buffering" should be "no"
+
   Scenario: Receive connected event on connection
     When I connect to SSE endpoint "/events?topic=test"
     Then I should receive a "connected" event

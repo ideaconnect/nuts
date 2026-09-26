@@ -185,14 +185,15 @@ delivery contract. Phases 3–6 rely on this kit.
   - [x] **[#58]** Delete `TestHandler_IdleHeartbeat_DefaultOnAfterProvision`
     (`_PropagatesThroughProvisionDefault` already covers it), or rewrite it on
     the new helper. *minor · S*
-- [ ] **[#127] Test timing.** *major · M*
-  - [ ] Replace sleep-as-sync with waiting for `event: connected` or with
+- [x] **[#127] Test timing.** *major · M* The unit package runs in about
+  20 s (was 41–48 s).
+  - [x] Replace sleep-as-sync with waiting for `event: connected` or with
     `waitForConsumerCount`. Drop sleeps that follow an already-acknowledged
     publish.
-  - [ ] Poll, then cancel, instead of waiting out context deadlines. Merge the
+  - [x] Poll, then cancel, instead of waiting out context deadlines. Merge the
     duplicate dispatch-timeout tests. Target: 20 s or less for the unit
     package.
-  - [ ] Give every streaming `ServeHTTP` call in tests a context deadline, so a
+  - [x] Give every streaming `ServeHTTP` call in tests a context deadline, so a
     guard regression fails its test instead of hanging the package.
 - [x] **[#126] Slow-client release path.** *major · M* The pull migration
   removed `signalSlowClient` and the enqueue path, so two items became
@@ -215,16 +216,16 @@ delivery contract. Phases 3–6 rely on this kit.
     connections.
   - [x] A `caddy.Load` helper for Caddy-in-the-loop tests (logs, metrics,
     routes).
-- [ ] **[#128] Pin the unpinned contracts.** *minor · M*
-  - [ ] Assert all four SSE response headers, in a unit test and one Godog
+- [x] **[#128] Pin the unpinned contracts.** *minor · M*
+  - [x] Assert all four SSE response headers, in a unit test and one Godog
     step. This kills mE.
-  - [ ] Replay-window "caught-up" guard: add a unit case where
+  - [x] Replay-window "caught-up" guard: add a unit case where
     `StartSequence = LastSeq + 1` must not fall back, plus an integration case.
     This kills mW.
-  - [ ] Replace the `len(opts) < 3` check with an `OptStartTime` assertion.
+  - [x] Replace the `len(opts) < 3` check with an `OptStartTime` assertion.
     Drive the MaxReconnects-0 and RejectsBeforeDialing tests through
     `Provision`.
-  - [ ] Document in `docs/mutation` that the MSI covers operator mutations only.
+  - [x] Document in `docs/mutation` that the MSI covers operator mutations only.
     Optionally add a statement-deletion script for the six hot files.
 
 ## Phase 3: Replay and cursor correctness → v0.5.0

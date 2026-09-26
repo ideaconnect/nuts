@@ -999,55 +999,27 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 	h.mu.Unlock()
 
 	t.Run("SSE connection and message delivery", func(t *testing.T) {
-		// Create request with topic
-		req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil)
-		ctx, cancel := context.WithTimeout(req.Context(), 3*time.Second)
-		defer cancel()
-		req = req.WithContext(ctx)
+		rr, cancel, done := startSSE(t, h, "/events?topic=test", "")
+		defer stopSSE(t, cancel, done)
 
-		// Create response recorder that supports flushing
-		rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-
-		// Start serving in goroutine
-		done := make(chan error, 1)
-		go func() {
-			done <- h.ServeHTTP(rr, req, nil)
-		}()
-
-		// Wait for connection to establish
-		time.Sleep(100 * time.Millisecond)
-
-		// Publish a test message via JetStream
 		jsCtx, _ := nc.JetStream()
 		if _, err := jsCtx.Publish("events.test", []byte(`{"hello":"world"}`)); err != nil {
 			t.Fatalf("failed to publish message: %v", err)
 		}
-
-		// Wait for message or timeout
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			cancel()
-			<-done
+		if !waitForSSEBody(rr, `{"hello":"world"}`, 3*time.Second) {
+			t.Fatalf("message not delivered; body=%q", rr.Body())
 		}
 
-		// Check response headers
+		body := rr.Body()
 		if ct := rr.Header().Get("Content-Type"); ct != "text/event-stream" {
 			t.Errorf("Content-Type: expected text/event-stream, got %q", ct)
 		}
-
-		body := rr.Body.String()
-
-		// Should contain connected event
 		if !strings.Contains(body, "event: connected") {
 			t.Error("response should contain 'event: connected'")
 		}
-
-		// Should contain message event with ID
 		if !strings.Contains(body, "event: message") {
 			t.Error("response should contain 'event: message'")
 		}
-
 		// Should contain id field for replay support
 		if !strings.Contains(body, "id: ") {
 			t.Error("response should contain 'id: ' for replay support")
@@ -1064,32 +1036,14 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 				t.Fatalf("failed to publish message: %v", err)
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
 
 		// Request with last-id=1 should get messages after sequence 1
-		req := httptest.NewRequest(http.MethodGet, "/events?topic=history&last-id=1", nil)
-		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
-		defer cancel()
-		req = req.WithContext(ctx)
-
-		rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-
-		done := make(chan error, 1)
-		go func() {
-			done <- h.ServeHTTP(rr, req, nil)
-		}()
-
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-			cancel()
-			<-done
+		rr, cancel, done := startSSE(t, h, "/events?topic=history&last-id=1", "")
+		defer stopSSE(t, cancel, done)
+		if !waitForSSEBody(rr, `"count":2`, 3*time.Second) {
+			t.Fatalf("replay not delivered; body=%q", rr.Body())
 		}
-
-		body := rr.Body.String()
-
-		// Should have connected event
-		if !strings.Contains(body, "event: connected") {
+		if !strings.Contains(rr.Body(), "event: connected") {
 			t.Error("response should contain 'event: connected'")
 		}
 	})
@@ -1144,32 +1098,17 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 				firstSequence = ack.Sequence
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
 
-		req := httptest.NewRequest(http.MethodGet, "/events?topic=header-replay", nil)
-		req.Header.Set("Last-Event-ID", strconv.FormatUint(firstSequence, 10))
-		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
-		defer cancel()
-		req = req.WithContext(ctx)
-
-		rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-		done := make(chan error, 1)
-		go func() {
-			done <- h.ServeHTTP(rr, req, nil)
-		}()
-
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-			cancel()
-			<-done
+		rr, cancel, done := startSSE(t, h, "/events?topic=header-replay", strconv.FormatUint(firstSequence, 10))
+		defer stopSSE(t, cancel, done)
+		if !waitForSSEBody(rr, `"count":2`, 3*time.Second) {
+			t.Fatalf("messages after Last-Event-ID not delivered; body=%q", rr.Body())
 		}
-
-		body := rr.Body.String()
+		body := rr.Body()
 		if strings.Contains(body, `"count":0`) {
 			t.Errorf("response should not contain replayed message before Last-Event-ID, got: %s", body)
 		}
-		if !strings.Contains(body, `"count":1`) || !strings.Contains(body, `"count":2`) {
+		if !strings.Contains(body, `"count":1`) {
 			t.Errorf("response should contain messages after Last-Event-ID, got: %s", body)
 		}
 	})
@@ -1177,32 +1116,10 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 	t.Run("invalid Last-Event-ID header falls back to DeliverNew", func(t *testing.T) {
 		// A bad Last-Event-ID header must NOT 400 — the browser would loop
 		// forever reconnecting with the same bad value. The handler should
-		// log a warning and resume as a fresh subscriber.
-		ctx, cancel := context.WithCancel(context.Background())
-		req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil).WithContext(ctx)
-		req.Header.Set("Last-Event-ID", "invalid")
-		rr := httptest.NewRecorder()
-
-		done := make(chan error, 1)
-		go func() {
-			done <- h.ServeHTTP(rr, req, nil)
-		}()
-
-		// Give ServeHTTP time to write the connected event, then close.
-		time.Sleep(200 * time.Millisecond)
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("ServeHTTP did not return after context cancel")
-		}
-
-		if rr.Code == http.StatusBadRequest {
-			t.Errorf("expected streaming fallback, got 400: %s", rr.Body.String())
-		}
-		if !strings.Contains(rr.Body.String(), "event: connected") {
-			t.Errorf("response should contain connected event, got: %s", rr.Body.String())
-		}
+		// log a warning and resume as a fresh subscriber: startSSE fails
+		// unless the connected event arrives.
+		_, cancel, done := startSSE(t, h, "/events?topic=test", "invalid")
+		stopSSE(t, cancel, done)
 	})
 
 	t.Run("non get without next returns method not allowed", func(t *testing.T) {
@@ -1324,27 +1241,9 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 	})
 
 	t.Run("path-based topic", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/mytopic", nil)
-		ctx, cancel := context.WithTimeout(req.Context(), 500*time.Millisecond)
-		defer cancel()
-		req = req.WithContext(ctx)
-
-		rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-
-		done := make(chan error, 1)
-		go func() {
-			done <- h.ServeHTTP(rr, req, nil)
-		}()
-
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-			cancel()
-			<-done
-		}
-
-		body := rr.Body.String()
-		if !strings.Contains(body, `"topics":["mytopic"]`) {
+		rr, cancel, done := startSSE(t, h, "/mytopic", "")
+		stopSSE(t, cancel, done)
+		if body := rr.Body(); !strings.Contains(body, `"topics":["mytopic"]`) {
 			t.Errorf("response should contain topic 'mytopic', got: %s", body)
 		}
 	})
@@ -1366,27 +1265,9 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 	})
 
 	t.Run("multiple topics", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/events?topic=topic1&topic=topic2", nil)
-		ctx, cancel := context.WithTimeout(req.Context(), 500*time.Millisecond)
-		defer cancel()
-		req = req.WithContext(ctx)
-
-		rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-
-		done := make(chan error, 1)
-		go func() {
-			done <- h.ServeHTTP(rr, req, nil)
-		}()
-
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-			cancel()
-			<-done
-		}
-
-		body := rr.Body.String()
-		if !strings.Contains(body, "topic1") || !strings.Contains(body, "topic2") {
+		rr, cancel, done := startSSE(t, h, "/events?topic=topic1&topic=topic2", "")
+		stopSSE(t, cancel, done)
+		if body := rr.Body(); !strings.Contains(body, `"topics":["topic1","topic2"]`) {
 			t.Errorf("response should contain both topics, got: %s", body)
 		}
 	})
@@ -1989,7 +1870,11 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 		done <- h.ServeHTTP(w, req, nil)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	// Publish only once the consumer exists; published earlier, the message
+	// would precede the stream's start position.
+	if waitForFirstConsumer(t, mustJetStream(t, nc), "TEST_EVENTS", 3*time.Second) == nil {
+		t.Fatal("stream never created its consumer")
+	}
 	jsCtx, _ := nc.JetStream()
 	if _, err := jsCtx.Publish("events.test", []byte(`{"hello":"world"}`)); err != nil {
 		t.Fatalf("failed to publish message: %v", err)
@@ -2290,28 +2175,13 @@ func TestHandler_ServeHTTP_OversizedEventDropped(t *testing.T) {
 		t.Fatalf("failed to publish trailing message: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/events?topic=size&last-id=0", nil)
-	ctx, cancel := context.WithTimeout(req.Context(), 3*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	done := make(chan error, 1)
-	go func() {
-		done <- h.ServeHTTP(rr, req, nil)
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		cancel()
-		<-done
+	rr, cancel, done := startSSE(t, h, "/events?topic=size&last-id=0", "")
+	if !waitForSSEBody(rr, `"s":"after"`, 3*time.Second) {
+		t.Fatalf("trailing message not delivered; body=%q", rr.Body())
 	}
+	stopSSE(t, cancel, done)
 
-	body := rr.Body.String()
+	body := rr.Body()
 	// The small and trailing messages should be delivered; the oversized one should be skipped.
 	if !strings.Contains(body, `"s":"ok"`) {
 		t.Errorf("expected small message to be delivered, body: %s", body)
@@ -2461,21 +2331,8 @@ func TestHandler_HubDiscovery(t *testing.T) {
 		h.js = jsCtx
 		h.mu.Unlock()
 
-		req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil)
-		ctx, cancel := context.WithTimeout(req.Context(), 1*time.Second)
-		defer cancel()
-		req = req.WithContext(ctx)
-
-		rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-		done := make(chan error, 1)
-		go func() { done <- h.ServeHTTP(rr, req, nil) }()
-
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-			cancel()
-			<-done
-		}
+		rr, cancel, done := startSSE(t, h, "/events?topic=test", "")
+		stopSSE(t, cancel, done)
 
 		link := rr.Header().Get("Link")
 		expected := `<https://example.com/events>; rel="nuts"`
@@ -2505,21 +2362,8 @@ func TestHandler_HubDiscovery(t *testing.T) {
 		h.js = jsCtx
 		h.mu.Unlock()
 
-		req := httptest.NewRequest(http.MethodGet, "/events?topic=test", nil)
-		ctx, cancel := context.WithTimeout(req.Context(), 1*time.Second)
-		defer cancel()
-		req = req.WithContext(ctx)
-
-		rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-		done := make(chan error, 1)
-		go func() { done <- h.ServeHTTP(rr, req, nil) }()
-
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-			cancel()
-			<-done
-		}
+		rr, cancel, done := startSSE(t, h, "/events?topic=test", "")
+		stopSSE(t, cancel, done)
 
 		if link := rr.Header().Get("Link"); link != "" {
 			t.Errorf("expected no Link header, got %q", link)

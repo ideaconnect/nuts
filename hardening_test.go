@@ -524,7 +524,7 @@ func TestHandler_MaxEventSize_DropsOversizedRawPayload(t *testing.T) {
 		StreamName:        "EVENTS",
 		TopicPrefix:       "events.",
 		HeartbeatInterval: 30,
-		MaxEventSize:      64, // small cap so our big payload is dropped
+		MaxEventSize:      150, // drops the 512-byte payload, keeps a ~100-byte frame
 		AllowedOrigins:    []string{"*"},
 		logger:            zap.New(core),
 	}
@@ -543,33 +543,26 @@ func TestHandler_MaxEventSize_DropsOversizedRawPayload(t *testing.T) {
 	if _, err := jsPub.Publish("events.raw", []byte(big)); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
+	// A small message after it proves the stream kept going past the drop.
+	if _, err := jsPub.Publish("events.raw", []byte(`{"after":1}`)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	droppedBefore := counterValue(metricsMessagesDropped, dropReasonRawPayload)
 
-	req := httptest.NewRequest(http.MethodGet, "/events?topic=raw&last-id=0", nil)
-	ctx, cancel := context.WithTimeout(req.Context(), 1500*time.Millisecond)
-	defer cancel()
-	req = req.WithContext(ctx)
+	rr, cancel, done := startSSE(t, h, "/events?topic=raw&last-id=0", "")
+	if !waitForSSEBody(rr, `{"after":1}`, 3*time.Second) {
+		t.Fatalf("message after the oversized one not delivered; body=%q", rr.Body())
+	}
+	stopSSE(t, cancel, done)
 
-	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	done := make(chan error, 1)
-	go func() { done <- h.ServeHTTP(rr, req, nil) }()
-	<-done
-
-	if strings.Contains(rr.Body.String(), big) {
+	if strings.Contains(rr.Body(), big) {
 		t.Errorf("oversized raw payload leaked into response body")
 	}
-
-	found := false
-	for _, e := range obs.All() {
-		if strings.Contains(e.Message, "exceeds max_event_size") ||
-			strings.Contains(e.Message, "dropping oversized") ||
-			strings.Contains(strings.ToLower(e.Message), "max_event_size") {
-			found = true
-			break
-		}
+	if got := counterValue(metricsMessagesDropped, dropReasonRawPayload); got != droppedBefore+1 {
+		t.Errorf("messages_dropped_total{raw_payload} = %v, want %v", got, droppedBefore+1)
 	}
-	if !found {
-		t.Logf("warning log entries: %+v", obs.All())
-		// Not fatal — log wording may evolve. The body check is the contract.
+	if obs.FilterMessage("dropping oversized NATS payload").Len() != 1 {
+		t.Errorf("missing the oversized-payload warning: %+v", obs.All())
 	}
 }
 
@@ -823,6 +816,25 @@ func TestHandler_MaxReconnectsZero_HonoredFromJSON(t *testing.T) {
 	}
 	if *h.MaxReconnects != 0 {
 		t.Errorf("MaxReconnects should be 0 after explicit JSON field, got %d", *h.MaxReconnects)
+	}
+
+	// The explicit 0 must survive Provision and reach the connection.
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	h.NatsURL = ns.ClientURL()
+	h.logger = zap.NewNop()
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer h.Cleanup()
+	if got := h.conn.Opts.MaxReconnect; got != 0 {
+		t.Fatalf("connection MaxReconnects = %d after Provision, want 0", got)
 	}
 }
 
@@ -1801,19 +1813,11 @@ func TestHandler_MaxEventSize_NegativeDisablesLimit(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/events?topic=big&last-id=0", nil)
-	ctx, cancel := context.WithTimeout(req.Context(), 1500*time.Millisecond)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	done := make(chan error, 1)
-	go func() { done <- h.ServeHTTP(rr, req, nil) }()
-	<-done
-
-	if !strings.Contains(rr.Body.String(), strings.Repeat("Y", 4000)) {
+	rr, cancel, done := startSSE(t, h, "/events?topic=big&last-id=0", "")
+	if !waitForSSEBody(rr, strings.Repeat("Y", 4000), 3*time.Second) {
 		t.Errorf("expected large payload delivered when MaxEventSize<0")
 	}
+	stopSSE(t, cancel, done)
 }
 
 // ── #10: replay cap ──────────────────────────────────────────────────────
@@ -1937,11 +1941,18 @@ func TestHandler_ReplayMaxMessages_CapsValidRetainedReplay(t *testing.T) {
 	h.js = js
 	h.mu.Unlock()
 
-	req := httptest.NewRequest(http.MethodGet, "/events?topic=cap-valid&last-id=1", nil)
+	// The cap ends the stream by itself; the deadline only turns a broken
+	// cap into a failure instead of a hung test package.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=cap-valid&last-id=1", nil).WithContext(ctx)
 	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
 
 	if err := h.ServeHTTP(rr, req, nil); err != nil {
 		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("replay_max_messages did not end the stream; the request ran into its deadline")
 	}
 	if delivered := strings.Count(rr.Body.String(), "event: message"); delivered != 2 {
 		t.Fatalf("delivered %d messages, want 2 under replay_max_messages=2\nbody: %s", delivered, rr.Body.String())
@@ -1958,7 +1969,7 @@ func TestHandler_ReplayWindow_BoundsValidRetainedReplay(t *testing.T) {
 	}
 	defer nc.Close()
 	createTestStream(t, nc, "EVENTS", []string{"events.>"})
-	replayWindow := 2
+	replayWindow := 1
 
 	h := &Handler{
 		NatsURL:           ns.ClientURL(),
@@ -1993,24 +2004,18 @@ func TestHandler_ReplayWindow_BoundsValidRetainedReplay(t *testing.T) {
 	// out-of-window. We wait until the old message's publish time has
 	// aged past replay_window (+ a small buffer) so the next-published
 	// "new" message is strictly inside the window.
-	if wait := time.Until(oldMsg.Time.Add(time.Duration(replayWindow+3) * time.Second)); wait > 0 {
+	if wait := time.Until(oldMsg.Time.Add(time.Duration(replayWindow)*time.Second + 200*time.Millisecond)); wait > 0 {
 		time.Sleep(wait)
 	}
 	if _, err := jsPub.Publish("events.window-valid", []byte(`{"age":"new"}`)); err != nil {
 		t.Fatalf("publish new: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/events?topic=window-valid&last-id=0", nil)
-	ctx, cancel := context.WithTimeout(req.Context(), 1500*time.Millisecond)
-	defer cancel()
-	req = req.WithContext(ctx)
+	rr, cancel, done := startSSE(t, h, "/events?topic=window-valid&last-id=0", "")
+	waitForSSEBody(rr, `"new"`, 3*time.Second)
+	stopSSE(t, cancel, done)
 
-	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	done := make(chan error, 1)
-	go func() { done <- h.ServeHTTP(rr, req, nil) }()
-	<-done
-
-	body := rr.Body.String()
+	body := rr.Body()
 	if strings.Contains(body, `"old"`) {
 		t.Fatalf("old message outside replay_window was delivered:\n%s", body)
 	}
@@ -2035,11 +2040,10 @@ func TestHandler_ReplayWindow_UsesStartTime(t *testing.T) {
 	createTestStream(t, nc, "EVENTS", []string{"events.>"})
 
 	jsPub, _ := nc.JetStream()
-	// Old message, wait past the replay window, then new message.
+	// An old message, purged below, and a recent one inside the window.
 	if _, err := jsPub.Publish("events.win", []byte(`{"age":"old"}`)); err != nil {
 		t.Fatalf("publish old: %v", err)
 	}
-	time.Sleep(2 * time.Second)
 	if _, err := jsPub.Publish("events.win", []byte(`{"age":"new"}`)); err != nil {
 		t.Fatalf("publish new: %v", err)
 	}
@@ -2068,17 +2072,11 @@ func TestHandler_ReplayWindow_UsesStartTime(t *testing.T) {
 	h.js = js
 	h.mu.Unlock()
 
-	req := httptest.NewRequest(http.MethodGet, "/events?topic=win&last-id=0", nil)
-	ctx, cancel := context.WithTimeout(req.Context(), 1500*time.Millisecond)
-	defer cancel()
-	req = req.WithContext(ctx)
+	rr, cancel, done := startSSE(t, h, "/events?topic=win&last-id=0", "")
+	waitForSSEBody(rr, `"new"`, 3*time.Second)
+	stopSSE(t, cancel, done)
 
-	rr := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	done := make(chan error, 1)
-	go func() { done <- h.ServeHTTP(rr, req, nil) }()
-	<-done
-
-	body := rr.Body.String()
+	body := rr.Body()
 	if strings.Contains(body, `"old"`) {
 		t.Errorf("message older than replay_window leaked into body:\n%s", body)
 	}
@@ -2092,15 +2090,24 @@ func TestHandler_ReplayWindow_UsesStartTime(t *testing.T) {
 func TestHandler_Provision_RejectsBeforeDialing(t *testing.T) {
 	// Point at a guaranteed-closed port so any actual dial attempt would fail
 	// with a connection error — but we expect the missing-field error instead.
-	h := &Handler{
-		NatsURL: "", // intentionally empty; stream_name missing too
-	}
-	err := h.validateRequiredFields()
-	if err == nil {
-		t.Fatal("expected validation error for missing nats_url")
-	}
-	if !strings.Contains(err.Error(), "nats_url") {
-		t.Errorf("expected error to mention nats_url, got %v", err)
+	for _, c := range []struct {
+		name    string
+		h       *Handler
+		wantErr string
+	}{
+		{name: "missing nats_url", h: &Handler{StreamName: "EVENTS"}, wantErr: "nats_url is required"},
+		{name: "missing stream_name", h: &Handler{NatsURL: "nats://127.0.0.1:1"}, wantErr: "stream_name is required"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			c.h.logger = zap.NewNop()
+			err := c.h.Provision(caddy.Context{Context: context.Background()})
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("Provision error = %v, want %q before any dial", err, c.wantErr)
+			}
+			if c.h.conn != nil {
+				t.Fatal("Provision opened a connection despite invalid config")
+			}
+		})
 	}
 }
 

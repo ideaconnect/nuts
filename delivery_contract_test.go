@@ -128,11 +128,19 @@ func newContractServer(t *testing.T, natsURL string, configure func(*Handler)) (
 	return h, srv
 }
 
-// deliveryModes runs a delivery contract test twice: with every connection on
-// its own consumer, and with shared subscriptions.
+// deliveryModes runs a delivery contract test twice, in parallel: with every
+// connection on its own consumer, and with shared subscriptions. Each mode
+// has its own embedded server; the tests assert per-connection ids, and the
+// only metric they check (slow-client disconnects) must not move in either.
 func deliveryModes(t *testing.T, test func(t *testing.T, mode func(*Handler))) {
-	t.Run("own consumers", func(t *testing.T) { test(t, func(*Handler) {}) })
-	t.Run("shared subscriptions", func(t *testing.T) { test(t, func(h *Handler) { h.SharedSubscriptions = true }) })
+	t.Run("own consumers", func(t *testing.T) {
+		t.Parallel()
+		test(t, func(*Handler) {})
+	})
+	t.Run("shared subscriptions", func(t *testing.T) {
+		t.Parallel()
+		test(t, func(h *Handler) { h.SharedSubscriptions = true })
+	})
 }
 
 // TestDeliveryContract_NATSLinkLossLeavesNoHole: messages the server pushed
@@ -418,7 +426,7 @@ func TestJetStream_StartSequenceOutsideTheStream(t *testing.T) {
 		if err != nil {
 			t.Fatalf("OrderedConsumer(OptStartSeq=%d): %v", startSeq, err)
 		}
-		msg, err := cons.Next(jetstream.FetchMaxWait(time.Second))
+		msg, err := cons.Next(jetstream.FetchMaxWait(200 * time.Millisecond))
 		if err != nil {
 			return 0, err
 		}
@@ -437,6 +445,38 @@ func TestJetStream_StartSequenceOutsideTheStream(t *testing.T) {
 	t.Run("past the end delivers nothing yet", func(t *testing.T) {
 		if got, err := firstDelivered(t, 50); !errors.Is(err, nats.ErrTimeout) {
 			t.Fatalf("first delivered = %d (err %v), want a timeout", got, err)
+		}
+	})
+}
+
+// TestDeliveryContract_CaughtUpCursorUnderReplayWindow: a client resuming
+// from the newest message with replay_window set must get only new
+// messages. Its resume point does not exist yet, so its time cannot be read;
+// planning must see that it is caught up before treating the unknown time as
+// "outside the window" and replaying the whole window (#128).
+func TestDeliveryContract_CaughtUpCursorUnderReplayWindow(t *testing.T) {
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns := startJetStreamServer(t)
+		t.Cleanup(ns.Shutdown)
+		nc, _ := nats.Connect(ns.ClientURL())
+		t.Cleanup(nc.Close)
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		js, _ := nc.JetStream()
+		_, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) { mode(h); h.ReplayWindow = 3600 })
+		publishRange(t, js, "events.alpha", 1, 3)
+		fallbacksBefore := counterVal(t, metricsReplayFallbacks)
+
+		stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "3")
+		if ids := stream.collectIDs(1, 3*time.Second); len(ids) != 1 || ids[0] != 3 {
+			t.Fatalf("connected id = %v, want [3]", ids)
+		}
+		publishRange(t, js, "events.alpha", 4, 4)
+		assertContiguousIDs(t, stream.collectIDs(1, 3*time.Second), 4, 4)
+		if extra := stream.collectIDs(1, 200*time.Millisecond); len(extra) != 0 {
+			t.Fatalf("unexpected extra events %v", extra)
+		}
+		if got := counterVal(t, metricsReplayFallbacks); got != fallbacksBefore {
+			t.Fatalf("a caught-up client fell back to window replay (fallbacks %v -> %v)", fallbacksBefore, got)
 		}
 	})
 }
