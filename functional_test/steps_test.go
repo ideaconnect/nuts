@@ -199,58 +199,6 @@ func splitSubjects(subjectsCSV string) []string {
 	return subjects
 }
 
-func functionalSupportsMultiFilterSubjects(version string) bool {
-	version = strings.TrimPrefix(version, "v")
-	if cut := strings.IndexAny(version, "-+"); cut >= 0 {
-		version = version[:cut]
-	}
-	parts := strings.Split(version, ".")
-	if len(parts) < 2 {
-		return false
-	}
-	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return false
-	}
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return false
-	}
-	return major > 2 || (major == 2 && minor >= 10)
-}
-
-func functionalCommonSubjectFilter(subjects []string) string {
-	if len(subjects) == 0 {
-		return ">"
-	}
-	common := strings.Split(subjects[0], ".")
-	for _, subject := range subjects[1:] {
-		parts := strings.Split(subject, ".")
-		limit := len(common)
-		if len(parts) < limit {
-			limit = len(parts)
-		}
-		idx := 0
-		for idx < limit && common[idx] == parts[idx] {
-			idx++
-		}
-		common = common[:idx]
-		if len(common) == 0 {
-			return ">"
-		}
-	}
-	for _, subject := range subjects {
-		if len(strings.Split(subject, ".")) == len(common) {
-			common = common[:len(common)-1]
-			break
-		}
-	}
-	if len(common) == 0 {
-		return ">"
-	}
-	return strings.Join(common, ".") + ".>"
-}
-
 func sameStringSet(got, want []string) bool {
 	if len(got) != len(want) {
 		return false
@@ -268,11 +216,10 @@ func sameStringSet(got, want []string) bool {
 	return true
 }
 
-func consumerUsesExpectedMultiTopicStrategy(info *nats.ConsumerInfo, subjects []string, supportsMultiFilter bool) bool {
-	if supportsMultiFilter {
-		return info.Config.FilterSubject == "" && sameStringSet(info.Config.FilterSubjects, subjects)
-	}
-	return len(info.Config.FilterSubjects) == 0 && info.Config.FilterSubject == functionalCommonSubjectFilter(subjects)
+// consumerUsesExpectedMultiTopicStrategy reports whether a consumer filters
+// exactly the requested subjects server-side (nats-server >= 2.10).
+func consumerUsesExpectedMultiTopicStrategy(info *nats.ConsumerInfo, subjects []string) bool {
+	return info.Config.FilterSubject == "" && sameStringSet(info.Config.FilterSubjects, subjects)
 }
 
 func consumerFilterSummary(infos []*nats.ConsumerInfo) string {
@@ -288,13 +235,7 @@ func streamShouldHaveActiveConsumerUsingExpectedMultiTopicFilters(streamName, su
 	if len(subjects) < 2 {
 		return fmt.Errorf("expected at least two subjects, got %q", subjectsCSV)
 	}
-	version := ""
-	if tc.natsConn != nil {
-		version = tc.natsConn.ConnectedServerVersion()
-	}
-	supportsMultiFilter := functionalSupportsMultiFilterSubjects(version)
-
-	return waitUntil("active multi-topic consumer filter strategy", functionalWaitTimeout, func() (bool, string) {
+	return waitUntil("active multi-topic consumer with server-side FilterSubjects", functionalWaitTimeout, func() (bool, string) {
 		var infos []*nats.ConsumerInfo
 		for info := range tc.js.ConsumersInfo(streamName) {
 			if info != nil {
@@ -302,15 +243,11 @@ func streamShouldHaveActiveConsumerUsingExpectedMultiTopicFilters(streamName, su
 			}
 		}
 		for _, info := range infos {
-			if consumerUsesExpectedMultiTopicStrategy(info, subjects, supportsMultiFilter) {
+			if consumerUsesExpectedMultiTopicStrategy(info, subjects) {
 				return true, ""
 			}
 		}
-		strategy := "wildcard FilterSubject"
-		if supportsMultiFilter {
-			strategy = "FilterSubjects"
-		}
-		return false, fmt.Sprintf("server_version=%q expected=%s subjects=%v consumers=[%s]", version, strategy, subjects, consumerFilterSummary(infos))
+		return false, fmt.Sprintf("expected FilterSubjects=%v consumers=[%s]", subjects, consumerFilterSummary(infos))
 	})
 }
 
@@ -483,15 +420,11 @@ func readSSEEvents(body io.Reader, done chan<- struct{}) {
 	}
 }
 
-// iDeleteTheActiveJetStreamConsumer forces the M9 Batch A failure mode
-// end-to-end: find the ephemeral consumer NUTS opened on the stream,
-// delete it via the JetStream admin API, and let nats.go's
-// IdleHeartbeat detector (configured with 1s heartbeat in
-// Caddyfile.test) raise nats.ErrConsumerNotActive on the NUTS side.
-// Batch A surfaces that as
-// nuts_nats_async_errors_total{kind="consumer_invalidated"} + a
-// structured Warn log; the SSE handler stays attached until the
-// Batch B termination arm lands.
+// iDeleteTheActiveJetStreamConsumer deletes the consumer NUTS created for
+// the scenario's SSE client, simulating one reaped or lost on the server.
+// NUTS' ordered consumer notices the missing heartbeats (nats_idle_heartbeat
+// is 1s in Caddyfile.test) and recreates itself from the last delivered
+// sequence.
 func iDeleteTheActiveJetStreamConsumer(stream string) error {
 	if tc.js == nil {
 		return fmt.Errorf("no JetStream context — was the Background step skipped?")
@@ -518,29 +451,8 @@ func iDeleteTheActiveJetStreamConsumer(stream string) error {
 	return nil
 }
 
-// iWaitNSecondsForHeartbeatMissDetection blocks for the requested
-// duration. Used after the consumer-delete step to give nats.go's
-// activityCheck timer time to fire (~2× heartbeat interval). A bare
-// time.Sleep is the simplest fit; the assertion that follows (SSE
-// stream still open) does not depend on the exact firing time.
-func iWaitNSecondsForHeartbeatMissDetection(seconds int) error {
-	if seconds <= 0 || seconds > 30 {
-		return fmt.Errorf("wait window %ds is outside the supported (0, 30]s range", seconds)
-	}
-	time.Sleep(time.Duration(seconds) * time.Second)
-	return nil
-}
-
-// theSSEStreamShouldStillBeOpen pins the M9 Batch A contract: even
-// after nats.ErrConsumerNotActive has fired on the NUTS side, the
-// SSE HTTP response is still being streamed and the read goroutine
-// has NOT returned. A Batch B regression that prematurely added the
-// disconnect path would close tc.sseReadDone and trip this assertion.
-//
-// The check is intentionally non-blocking: we do a single
-// select-with-default on the readDone channel. A close would have
-// been observed by now (the wait step above gave detection ~3s of
-// headroom against a 1s heartbeat).
+// theSSEStreamShouldStillBeOpen asserts the SSE response is still being
+// streamed: the read goroutine has not returned.
 func theSSEStreamShouldStillBeOpen() error {
 	if tc.sseReadDone == nil {
 		return fmt.Errorf("no SSE read goroutine recorded — was the client connected via /events?")
@@ -551,40 +463,10 @@ func theSSEStreamShouldStillBeOpen() error {
 		// debuggable (probably a stray EOF/error closed the stream
 		// early — the very Batch B-leak we want to catch).
 		events, heartbeats := singleEventsSnapshot()
-		return fmt.Errorf("SSE read goroutine returned — handler exited prematurely (Batch A contract violation). events=%d heartbeats=%d", len(events), len(heartbeats))
+		return fmt.Errorf("SSE read goroutine returned — the stream closed. events=%d heartbeats=%d", len(events), len(heartbeats))
 	default:
 		return nil
 	}
-}
-
-// iShouldKeepReceivingHeartbeatComments asserts that the SSE-layer
-// heartbeat ticker (HeartbeatInterval=1 in Caddyfile.test) continues
-// firing after the consumer deletion. NUTS' SSE-side heartbeat is
-// independent of the JetStream push consumer — Phase 3's godoc on
-// subscriptionOptions calls out that the SSE-layer ticker only
-// proves the HTTP socket is open, not the JetStream push path. This
-// step confirms that property end-to-end: a dead push consumer does
-// NOT silence the SSE keepalive.
-//
-// Concretely: snapshot the heartbeat count, wait one quiet window
-// (~500ms by default), confirm the count grew. Any growth at all is
-// sufficient — with a 1s heartbeat interval and ≥1s of waiting in
-// the prior step, at least one new heartbeat MUST have arrived.
-func iShouldKeepReceivingHeartbeatComments() error {
-	before := func() int {
-		_, heartbeats := singleEventsSnapshot()
-		return len(heartbeats)
-	}()
-	return waitUntil("additional heartbeat comments after consumer invalidation",
-		3*time.Second,
-		func() (bool, string) {
-			_, heartbeats := singleEventsSnapshot()
-			if len(heartbeats) > before {
-				return true, ""
-			}
-			return false, fmt.Sprintf("heartbeats stayed at %d", len(heartbeats))
-		},
-	)
 }
 
 func iPublishMessageToSubject(message, subject string) error {
@@ -647,6 +529,34 @@ func theEventShouldHaveAnID() error {
 	return waitForSingleEvent("message event with an ID", func(event sseEvent) bool {
 		return event.Event == "message" && event.ID != ""
 	})
+}
+
+// theReceivedMessageEventIDsShouldBeContiguous asserts the delivery contract:
+// every message event id is exactly one more than the previous one, so the
+// stream has neither a gap nor a duplicate. Only meaningful for a stream
+// whose topic receives every message published in the scenario.
+func theReceivedMessageEventIDsShouldBeContiguous() error {
+	events, _ := singleEventsSnapshot()
+	var ids []uint64
+	for _, event := range events {
+		if event.Event != "message" {
+			continue
+		}
+		id, err := strconv.ParseUint(event.ID, 10, 64)
+		if err != nil {
+			return fmt.Errorf("message event without a numeric id: %+v", event)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) < 2 {
+		return fmt.Errorf("need at least two message events to check contiguity, got %v", ids)
+	}
+	for i := 1; i < len(ids); i++ {
+		if ids[i] != ids[i-1]+1 {
+			return fmt.Errorf("message ids are not contiguous: %v", ids)
+		}
+	}
+	return nil
 }
 
 func iShouldReceiveAnSSEEventContaining(text string) error {
@@ -1147,9 +1057,8 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 
 	// M9 Batch A — consumer invalidation observability
 	ctx.Step(`^I delete the active JetStream consumer for stream "([^"]*)"$`, iDeleteTheActiveJetStreamConsumer)
-	ctx.Step(`^I wait (\d+) seconds for heartbeat-miss detection$`, iWaitNSecondsForHeartbeatMissDetection)
 	ctx.Step(`^the SSE stream should still be open$`, theSSEStreamShouldStillBeOpen)
-	ctx.Step(`^I should keep receiving heartbeat comments$`, iShouldKeepReceivingHeartbeatComments)
+	ctx.Step(`^the received message event ids should be contiguous$`, theReceivedMessageEventIDsShouldBeContiguous)
 
 	// Multi-client steps
 	ctx.Step(`^client "([^"]*)" is connected to SSE endpoint "([^"]*)"$`, clientIsConnectedToSSEEndpoint)

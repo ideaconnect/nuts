@@ -2,6 +2,7 @@
 package nuts
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )
 
@@ -57,6 +59,22 @@ const defaultReadinessProbeTimeout = time.Second
 // frequently) but still well below the library default. The readiness
 // probe already establishes this pattern at serve.go's serveReadinessCheck.
 const defaultMetadataReadTimeout = 2 * time.Second
+
+// defaultConsumerCreateTimeout bounds creating a request's ordered consumer.
+// Creation is a single attempt; a timeout or refusal becomes a 503.
+const defaultConsumerCreateTimeout = 5 * time.Second
+
+// defaultConsumerMaxResetAttempts bounds how often an ordered consumer tries
+// to recreate itself after a gap, a reconnect or missed heartbeats. The
+// library backs off 1s, 2s, 4s, 8s, then 10s per attempt, so ten attempts give
+// up after roughly 75 seconds of failures; the SSE stream then closes with
+// disconnect_reason=consumer_unrecoverable and the client reconnects.
+const defaultConsumerMaxResetAttempts = 10
+
+// consumerNamePrefix marks the consumers NUTS creates so operators can tell
+// them apart in `nats consumer ls`. A random suffix keeps names unique across
+// NUTS instances sharing a stream.
+const consumerNamePrefix = "nuts_"
 
 // defaultNatsIdleHeartbeatSeconds is the M9 Batch A default for the
 // server-side IdleHeartbeat interval on every JetStream push consumer
@@ -183,7 +201,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		return provisionErr
 	}
 
-	// Step 3: Create a JetStream context.
+	// Step 3: Create the JetStream API handle. WithDefaultTimeout bounds any
+	// API call that is not given its own deadline.
 	h.mu.RLock()
 	conn := h.conn
 	if conn == nil {
@@ -191,7 +210,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		provisionErr = fmt.Errorf("NATS connection is nil after connect")
 		return provisionErr
 	}
-	js, err := conn.JetStream()
+	js, err := jetstream.New(conn, jetstream.WithDefaultTimeout(defaultMetadataReadTimeout))
 	h.mu.RUnlock()
 	if err != nil {
 		provisionErr = fmt.Errorf("failed to create JetStream context: %w", err)
@@ -202,8 +221,11 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.js = js
 	h.mu.Unlock()
 
-	// Step 4: Verify that the configured stream actually exists.
-	_, err = js.StreamInfo(h.StreamName)
+	// Step 4: Verify that the configured stream actually exists. Bounded so a
+	// degraded JetStream API cannot stall a Caddy reload.
+	streamCtx, cancelStream := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
+	_, err = js.Stream(streamCtx, h.StreamName)
+	cancelStream()
 	if err != nil {
 		provisionErr = fmt.Errorf("JetStream stream '%s' not found. Please create the stream first. See README for instructions. Error: %w", h.StreamName, err)
 		return provisionErr
@@ -532,6 +554,15 @@ func (h *Handler) Validate() error {
 
 	if h.NatsTLSInsecureSkipVerify {
 		h.log().Warn("nats_tls_insecure_skip_verify is enabled — server certificate is not verified")
+	}
+
+	if h.DispatchTimeout > 0 {
+		h.log().Warn("dispatch_timeout is deprecated and has no effect: the pull consumer applies backpressure instead of queueing, and stalled clients are bounded by write_timeout",
+			zap.Int("dispatch_timeout", h.DispatchTimeout))
+	}
+
+	if h.NatsIdleHeartbeat == natsIdleHeartbeatDisabledSentinel {
+		h.log().Warn("nats_idle_heartbeat -1 no longer disables consumer health checks: the ordered consumer always uses heartbeats, so the library default (5s) applies")
 	}
 
 	if h.SubscriberJWTKey != "" && len(h.SubscriberJWTKey) < minRecommendedJWTKeyLen {

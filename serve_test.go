@@ -1,8 +1,8 @@
 package nuts
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )
 
@@ -172,23 +172,6 @@ func TestShouldSkipReplayWindowMessage(t *testing.T) {
 	}
 }
 
-func TestStreamPlan_RequestedMessageHandlerFiltersSubjects(t *testing.T) {
-	plan := streamPlan{RequestedSubjects: map[string]struct{}{
-		"events.allowed": {},
-	}}
-	var delivered []string
-	handler := plan.requestedMessageHandler(func(msg *nats.Msg) {
-		delivered = append(delivered, msg.Subject)
-	})
-
-	handler(&nats.Msg{Subject: "events.blocked"})
-	handler(&nats.Msg{Subject: "events.allowed"})
-
-	if !reflect.DeepEqual(delivered, []string{"events.allowed"}) {
-		t.Fatalf("delivered subjects = %#v, want only events.allowed", delivered)
-	}
-}
-
 func TestHandler_ShouldUseReplayWindowWithoutStartSequenceTime(t *testing.T) {
 	h := &Handler{ReplayWindow: 60}
 	replay := replayPlan{HasLastID: true, StartSequence: 10}
@@ -199,25 +182,128 @@ func TestHandler_ShouldUseReplayWindowWithoutStartSequenceTime(t *testing.T) {
 	}
 }
 
-func TestHandler_SubscriptionOptionsFallbackStartTimeDefaultsWindow(t *testing.T) {
-	h := &Handler{StreamName: "EVENTS", ReplayWindow: 60, logger: zap.NewNop()}
-	plan := streamPlan{
-		Topics:       []string{"alpha"},
-		FullSubjects: []string{"events.alpha"},
-		Replay: replayPlan{
-			HasLastID:     true,
-			Mode:          replayModeFallbackStartTime,
-			StartSequence: 10,
-		},
+func TestHandler_OrderedConsumerConfig(t *testing.T) {
+	windowStart := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	base := streamPlan{Topics: []string{"alpha", "beta"}, FullSubjects: []string{"events.alpha", "events.beta"}}
+	cases := []struct {
+		name        string
+		replay      replayPlan
+		wantPolicy  jetstream.DeliverPolicy
+		wantSeq     uint64
+		wantStartAt *time.Time
+	}{
+		{name: "no cursor and no snapshot delivers new", replay: replayPlan{Mode: replayModeDeliverNew}, wantPolicy: jetstream.DeliverNewPolicy},
+		{name: "no cursor with snapshot starts after LastSeq", replay: replayPlan{Mode: replayModeDeliverNew, StartSequence: 42}, wantPolicy: jetstream.DeliverByStartSequencePolicy, wantSeq: 42},
+		{name: "cursor starts at last-id+1", replay: replayPlan{Mode: replayModeStartSequence, HasLastID: true, StartSequence: 10}, wantPolicy: jetstream.DeliverByStartSequencePolicy, wantSeq: 10},
+		{name: "time-bounded fallback uses the planned start", replay: replayPlan{Mode: replayModeFallbackStartTime, HasLastID: true, StartSequence: 10, StartTime: windowStart}, wantPolicy: jetstream.DeliverByStartTimePolicy, wantStartAt: &windowStart},
+		{name: "deliver-all fallback", replay: replayPlan{Mode: replayModeFallbackDeliverAll, HasLastID: true, StartSequence: 10}, wantPolicy: jetstream.DeliverAllPolicy},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := &Handler{StreamName: "EVENTS", ReplayWindow: 60}
+			plan := base
+			plan.Replay = c.replay
+			cfg := h.orderedConsumerConfig(plan)
+			if cfg.DeliverPolicy != c.wantPolicy {
+				t.Fatalf("DeliverPolicy = %v, want %v", cfg.DeliverPolicy, c.wantPolicy)
+			}
+			if cfg.OptStartSeq != c.wantSeq {
+				t.Fatalf("OptStartSeq = %d, want %d", cfg.OptStartSeq, c.wantSeq)
+			}
+			if c.wantStartAt == nil && cfg.OptStartTime != nil {
+				t.Fatalf("OptStartTime = %v, want unset", cfg.OptStartTime)
+			}
+			if c.wantStartAt != nil && (cfg.OptStartTime == nil || !cfg.OptStartTime.Equal(*c.wantStartAt)) {
+				t.Fatalf("OptStartTime = %v, want %v", cfg.OptStartTime, *c.wantStartAt)
+			}
+			if !reflect.DeepEqual(cfg.FilterSubjects, plan.FullSubjects) {
+				t.Fatalf("FilterSubjects = %v, want %v", cfg.FilterSubjects, plan.FullSubjects)
+			}
+			if cfg.InactiveThreshold != defaultConsumerInactiveThreshold {
+				t.Fatalf("InactiveThreshold = %v, want %v", cfg.InactiveThreshold, defaultConsumerInactiveThreshold)
+			}
+			if cfg.MaxResetAttempts != defaultConsumerMaxResetAttempts {
+				t.Fatalf("MaxResetAttempts = %d, want %d", cfg.MaxResetAttempts, defaultConsumerMaxResetAttempts)
+			}
+			if !strings.HasPrefix(cfg.NamePrefix, consumerNamePrefix) || len(cfg.NamePrefix) <= len(consumerNamePrefix) {
+				t.Fatalf("NamePrefix = %q, want %q plus a unique suffix", cfg.NamePrefix, consumerNamePrefix)
+			}
+		})
 	}
 
-	before := counterVal(t, metricsReplayFallbacks)
-	opts := h.subscriptionOptions(plan)
-	if len(opts) < 3 {
-		t.Fatalf("subscriptionOptions returned %d opts, want fallback StartTime option included", len(opts))
+	t.Run("time-bounded fallback without a planned start uses now-window", func(t *testing.T) {
+		h := &Handler{StreamName: "EVENTS", ReplayWindow: 60}
+		plan := base
+		plan.Replay = replayPlan{Mode: replayModeFallbackStartTime, HasLastID: true, StartSequence: 10}
+		before := time.Now().Add(-60 * time.Second)
+		cfg := h.orderedConsumerConfig(plan)
+		after := time.Now().Add(-60 * time.Second)
+		if cfg.OptStartTime == nil || cfg.OptStartTime.Before(before) || cfg.OptStartTime.After(after) {
+			t.Fatalf("OptStartTime = %v, want within [%v, %v]", cfg.OptStartTime, before, after)
+		}
+	})
+
+	t.Run("each consumer gets a distinct name prefix", func(t *testing.T) {
+		h := &Handler{StreamName: "EVENTS"}
+		if a, b := h.orderedConsumerConfig(base).NamePrefix, h.orderedConsumerConfig(base).NamePrefix; a == b {
+			t.Fatalf("two consumers share NamePrefix %q", a)
+		}
+	})
+}
+
+func TestHandler_PullOptions(t *testing.T) {
+	cases := []struct {
+		name          string
+		buffer        int
+		heartbeat     int
+		wantMax       int
+		wantHeartbeat time.Duration
+	}{
+		{name: "defaults", buffer: 0, heartbeat: 0, wantMax: defaultClientBufferSize},
+		{name: "custom buffer and heartbeat", buffer: 8, heartbeat: 5, wantMax: 8, wantHeartbeat: 5 * time.Second},
+		{name: "disabled heartbeat leaves the library default", buffer: 16, heartbeat: natsIdleHeartbeatDisabledSentinel, wantMax: 16},
 	}
-	if got := counterVal(t, metricsReplayFallbacks); got <= before {
-		t.Fatalf("replay fallback metric did not increment: before=%v got=%v", before, got)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := &Handler{ClientBufferSize: c.buffer, NatsIdleHeartbeat: c.heartbeat}
+			var gotMax int
+			var gotHeartbeat time.Duration
+			for _, opt := range h.pullOptions() {
+				switch o := opt.(type) {
+				case jetstream.PullMaxMessages:
+					gotMax = int(o)
+				case jetstream.PullHeartbeat:
+					gotHeartbeat = time.Duration(o)
+				default:
+					t.Fatalf("unexpected pull option %T", opt)
+				}
+			}
+			if gotMax != c.wantMax {
+				t.Fatalf("PullMaxMessages = %d, want %d", gotMax, c.wantMax)
+			}
+			if gotHeartbeat != c.wantHeartbeat {
+				t.Fatalf("PullHeartbeat = %v, want %v", gotHeartbeat, c.wantHeartbeat)
+			}
+		})
+	}
+}
+
+func TestHandler_LogSubscriptionCountsOnlyFallbacks(t *testing.T) {
+	h := &Handler{ReplayWindow: 60, logger: zap.NewNop()}
+	for _, c := range []struct {
+		mode replayMode
+		want float64
+	}{
+		{replayModeDeliverNew, 0},
+		{replayModeStartSequence, 0},
+		{replayModeFallbackStartTime, 1},
+		{replayModeFallbackDeliverAll, 1},
+	} {
+		before := counterVal(t, metricsReplayFallbacks)
+		h.logSubscription(streamPlan{Replay: replayPlan{Mode: c.mode}})
+		if got := counterVal(t, metricsReplayFallbacks) - before; got != c.want {
+			t.Errorf("mode %s: nuts_replay_fallbacks_total delta = %v, want %v", c.mode, got, c.want)
+		}
 	}
 }
 
@@ -270,12 +356,6 @@ func TestHandler_RecordDroppedMessageLogsFormattedEvent(t *testing.T) {
 	}
 }
 
-func TestConnectedServerVersionNil(t *testing.T) {
-	if got := connectedServerVersion(nil); got != "" {
-		t.Fatalf("connectedServerVersion(nil) = %q, want empty string", got)
-	}
-}
-
 func TestHandler_ServeReadinessCheckReportsMissingRuntime(t *testing.T) {
 	h := &Handler{logger: zap.NewNop()}
 	rr := httptest.NewRecorder()
@@ -315,21 +395,79 @@ func TestHandler_ServeReadinessCheckReportsMissingRuntime(t *testing.T) {
 	}
 }
 
-func TestHandler_ExecuteSubscriptionPlan_PlanningRejectionBumpsMetric(t *testing.T) {
-	h := &Handler{logger: zap.NewNop()}
-	plan := streamPlan{
-		Topics:       []string{"allowed", "blocked"},
-		FullSubjects: []string{"events.allowed", "events.blocked"},
-		FailedTopics: []string{"blocked"},
+func TestHandler_PlanSubscriptionRejectsSingleTopicOutsideStream(t *testing.T) {
+	h := &Handler{}
+	plan := streamPlan{Topics: []string{"orders"}, FullSubjects: []string{"orders"}, Replay: replayPlan{Mode: replayModeDeliverNew}}
+
+	got := h.planSubscription(plan, streamInfoSnapshot{HasSnapshot: true, Subjects: []string{"events.>"}, LastSeq: 5})
+	if !reflect.DeepEqual(got.FailedTopics, []string{"orders"}) {
+		t.Fatalf("FailedTopics = %#v, want [orders]", got.FailedTopics)
+	}
+	if got.Replay.StartSequence != 0 {
+		t.Fatalf("StartSequence = %d, want 0 for a rejected plan", got.Replay.StartSequence)
+	}
+}
+
+func TestHandler_PlanSubscriptionGivesNoCursorRequestsAnExplicitStart(t *testing.T) {
+	h := &Handler{}
+	plan := streamPlan{Topics: []string{"alpha"}, FullSubjects: []string{"events.alpha"}, Replay: replayPlan{Mode: replayModeDeliverNew}}
+
+	got := h.planSubscription(plan, streamInfoSnapshot{HasSnapshot: true, Subjects: []string{"events.>"}, FirstSeq: 3, LastSeq: 41})
+	if got.Replay.Mode != replayModeDeliverNew || got.Replay.StartSequence != 42 || got.Replay.HasLastID {
+		t.Fatalf("Replay = %+v, want deliver_new starting at 42", got.Replay)
+	}
+	if id, ok := connectedEventID(got); !ok || id != 41 {
+		t.Fatalf("connectedEventID = %d, %v; want 41, true", id, ok)
 	}
 
-	before := counterVal(t, metricsSubscriptionErrors)
-	got := h.executeSubscriptionPlan(nil, nil, plan, nil, nil)
-	if len(got.FailedTopics) != 1 || got.FailedTopics[0] != "blocked" {
-		t.Fatalf("FailedTopics = %#v, want [blocked]", got.FailedTopics)
+	empty := h.planSubscription(plan, streamInfoSnapshot{HasSnapshot: true})
+	if empty.Replay.StartSequence != 1 {
+		t.Fatalf("empty stream StartSequence = %d, want 1", empty.Replay.StartSequence)
 	}
-	if after := counterVal(t, metricsSubscriptionErrors); after <= before {
-		t.Errorf("nuts_subscription_errors_total did not increment on planning-time rejection: %v -> %v", before, after)
+	if id, ok := connectedEventID(empty); !ok || id != 0 {
+		t.Fatalf("empty stream connectedEventID = %d, %v; want 0, true", id, ok)
+	}
+
+	noSnapshot := h.planSubscription(plan, streamInfoSnapshot{})
+	if noSnapshot.Replay.StartSequence != 0 {
+		t.Fatalf("StartSequence without snapshot = %d, want 0 (DeliverNew)", noSnapshot.Replay.StartSequence)
+	}
+	if _, ok := connectedEventID(noSnapshot); ok {
+		t.Fatal("connectedEventID must be absent without a snapshot")
+	}
+}
+
+func TestConnectedEventID(t *testing.T) {
+	cases := []struct {
+		name   string
+		replay replayPlan
+		wantID uint64
+		wantOK bool
+	}{
+		{name: "deliver new without a start", replay: replayPlan{Mode: replayModeDeliverNew}},
+		{name: "deliver new after LastSeq", replay: replayPlan{Mode: replayModeDeliverNew, StartSequence: 8}, wantID: 7, wantOK: true},
+		{name: "cursor resumes at last-id", replay: replayPlan{Mode: replayModeStartSequence, HasLastID: true, StartSequence: 11}, wantID: 10, wantOK: true},
+		{name: "time-bounded fallback keeps the client cursor", replay: replayPlan{Mode: replayModeFallbackStartTime, HasLastID: true, StartSequence: 11}},
+		{name: "deliver-all fallback keeps the client cursor", replay: replayPlan{Mode: replayModeFallbackDeliverAll, HasLastID: true, StartSequence: 11}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			id, ok := connectedEventID(streamPlan{Replay: c.replay})
+			if id != c.wantID || ok != c.wantOK {
+				t.Fatalf("connectedEventID = %d, %v; want %d, %v", id, ok, c.wantID, c.wantOK)
+			}
+		})
+	}
+}
+
+func TestFormatConnectedEvent(t *testing.T) {
+	withID := formatConnectedEvent(streamPlan{Topics: []string{"a", "b"}, Replay: replayPlan{Mode: replayModeDeliverNew, StartSequence: 43}})
+	if withID != "id: 42\nevent: connected\ndata: {\"topics\":[\"a\",\"b\"]}\n\n" {
+		t.Fatalf("connected event with id = %q", withID)
+	}
+	withoutID := formatConnectedEvent(streamPlan{Topics: []string{"a"}, Replay: replayPlan{Mode: replayModeDeliverNew}})
+	if withoutID != "event: connected\ndata: {\"topics\":[\"a\"]}\n\n" {
+		t.Fatalf("connected event without id = %q", withoutID)
 	}
 }
 
@@ -444,7 +582,7 @@ func TestHandler_PlanSubscriptionDetectsMultiTopicStreamMismatch(t *testing.T) {
 func TestHandler_FormatMessageEventEmbedsJSONPayload(t *testing.T) {
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	now := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
-	msg := &nats.Msg{Subject: "events.json", Data: []byte(`{"n":900719925474099312345}`)}
+	msg := streamMessage{Subject: "events.json", Data: []byte(`{"n":900719925474099312345}`)}
 
 	formatted := h.formatMessageEvent(msg, now)
 	if formatted.Dropped {
@@ -459,7 +597,7 @@ func TestHandler_FormatMessageEventEmbedsJSONPayload(t *testing.T) {
 
 func TestHandler_FormatMessageEventEmbedsRawStringPayload(t *testing.T) {
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
-	msg := &nats.Msg{Subject: "events.raw", Data: []byte("plain text")}
+	msg := streamMessage{Subject: "events.raw", Data: []byte("plain text")}
 
 	formatted := h.formatMessageEvent(msg, time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC))
 	if formatted.Dropped {
@@ -474,11 +612,13 @@ func TestHandler_FormatMessageEventUsesJetStreamMetadata(t *testing.T) {
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	now := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
 	metaTime := time.Date(2026, 4, 28, 12, 1, 2, 0, time.UTC)
-	msg := &nats.Msg{
-		Subject: "events.meta",
-		Data:    []byte(`{"ok":true}`),
-		Reply:   jetStreamAckReply("EVENTS", "consumer", 1, 42, 1, metaTime, 0),
-		Sub:     &nats.Subscription{},
+	msg := streamMessage{
+		Subject:        "events.meta",
+		Data:           []byte(`{"ok":true}`),
+		HasMetadata:    true,
+		StreamSequence: 42,
+		ConsumerName:   "nuts_abc_1",
+		Timestamp:      metaTime,
 	}
 
 	formatted := h.formatMessageEvent(msg, now)
@@ -494,6 +634,12 @@ func TestHandler_FormatMessageEventUsesJetStreamMetadata(t *testing.T) {
 	if strings.Contains(formatted.Frame, now.Format(time.RFC3339)) {
 		t.Fatalf("formatted frame used fallback clock instead of metadata timestamp:\n%s", formatted.Frame)
 	}
+	if !formatted.HasStreamSequence || formatted.StreamSequence != 42 || formatted.ConsumerName != "nuts_abc_1" {
+		t.Fatalf("formatted metadata = seq %d (has=%v) consumer %q", formatted.StreamSequence, formatted.HasStreamSequence, formatted.ConsumerName)
+	}
+	if !formatted.HasMessageTime || !formatted.MessageTime.Equal(metaTime) {
+		t.Fatalf("MessageTime = %v (has=%v), want %v", formatted.MessageTime, formatted.HasMessageTime, metaTime)
+	}
 }
 
 func TestHandler_FormatMessageEventRejectsOversizedEvents(t *testing.T) {
@@ -501,15 +647,21 @@ func TestHandler_FormatMessageEventRejectsOversizedEvents(t *testing.T) {
 
 	t.Run("raw payload", func(t *testing.T) {
 		h := &Handler{TopicPrefix: "events.", MaxEventSize: 4}
-		formatted := h.formatMessageEvent(&nats.Msg{Subject: "events.big", Data: []byte("12345")}, now)
+		formatted := h.formatMessageEvent(streamMessage{Subject: "events.big", Data: []byte("12345"), HasMetadata: true, StreamSequence: 7}, now)
 		if !formatted.Dropped || formatted.DropReason != dropReasonRawPayload || formatted.DropSize != 5 {
 			t.Fatalf("formatted = %#v, want raw payload drop", formatted)
+		}
+		if formatted.StreamSequence != 7 {
+			t.Fatalf("dropped event StreamSequence = %d, want 7 for the drop log", formatted.StreamSequence)
+		}
+		if fits := h.formatMessageEvent(streamMessage{Subject: "events.fits", Data: []byte("1234")}, now); fits.DropReason == dropReasonRawPayload {
+			t.Fatal("payload exactly at max_event_size must not be dropped as raw payload")
 		}
 	})
 
 	t.Run("formatted SSE event", func(t *testing.T) {
 		h := &Handler{TopicPrefix: "events.", MaxEventSize: 10}
-		formatted := h.formatMessageEvent(&nats.Msg{Subject: "events.small", Data: []byte(`{}`)}, now)
+		formatted := h.formatMessageEvent(streamMessage{Subject: "events.small", Data: []byte(`{}`)}, now)
 		if !formatted.Dropped || formatted.DropReason != dropReasonFormattedSSEMessage {
 			t.Fatalf("formatted = %#v, want formatted SSE drop", formatted)
 		}
@@ -519,99 +671,103 @@ func TestHandler_FormatMessageEventRejectsOversizedEvents(t *testing.T) {
 	})
 }
 
-func jetStreamAckReply(stream, consumer string, delivered, streamSeq, consumerSeq uint64, timestamp time.Time, pending uint64) string {
-	return fmt.Sprintf("$JS.ACK.%s.%s.%d.%d.%d.%d.%d", stream, consumer, delivered, streamSeq, consumerSeq, timestamp.UnixNano(), pending)
-}
-
-// stubStreamMetadata is a minimal streamMetadataReader for testing the
-// error paths of readStreamSnapshot without standing up a JetStream
-// connection.
-type stubStreamMetadata struct {
-	info      *nats.StreamInfo
-	infoErr   error
-	msg       *nats.RawStreamMsg
+// fakeStream stubs the two jetstream.Stream methods readStreamSnapshot uses;
+// any other method panics through the nil embedded interface.
+type fakeStream struct {
+	jetstream.Stream
+	info      *jetstream.StreamInfo
+	msg       *jetstream.RawStreamMsg
 	getMsgErr error
 }
 
-func (s stubStreamMetadata) StreamInfo(stream string, opts ...nats.JSOpt) (*nats.StreamInfo, error) {
-	return s.info, s.infoErr
+func (f fakeStream) CachedInfo() *jetstream.StreamInfo { return f.info }
+
+func (f fakeStream) GetMsg(_ context.Context, _ uint64, _ ...jetstream.GetMsgOpt) (*jetstream.RawStreamMsg, error) {
+	return f.msg, f.getMsgErr
 }
 
-func (s stubStreamMetadata) GetMsg(name string, seq uint64, opts ...nats.JSOpt) (*nats.RawStreamMsg, error) {
-	return s.msg, s.getMsgErr
+// fakeStreamLookup is a streamLookup that returns a fixed stream or error.
+type fakeStreamLookup struct {
+	stream jetstream.Stream
+	err    error
+}
+
+func (f fakeStreamLookup) Stream(_ context.Context, _ string) (jetstream.Stream, error) {
+	return f.stream, f.err
 }
 
 func TestHandler_ReadStreamSnapshot_StreamInfoErrorReturnsEmptySnapshot(t *testing.T) {
 	h := &Handler{StreamName: "EVENTS", logger: zap.NewNop()}
 	plan := streamPlan{Replay: replayPlan{HasLastID: true}}
-	stub := stubStreamMetadata{infoErr: errors.New("stream info boom")}
 
-	snapshot := h.readStreamSnapshot(stub, plan)
+	snapshot := h.readStreamSnapshot(context.Background(), fakeStreamLookup{err: errors.New("stream info boom")}, plan)
 
 	if !reflect.DeepEqual(snapshot, streamInfoSnapshot{}) {
 		t.Errorf("readStreamSnapshot with StreamInfo error: got %+v, want zero-value snapshot", snapshot)
 	}
 }
 
+func TestHandler_ReadStreamSnapshot_ReadsStateForEveryRequest(t *testing.T) {
+	h := &Handler{StreamName: "EVENTS", logger: zap.NewNop()}
+	stream := fakeStream{info: &jetstream.StreamInfo{
+		State:  jetstream.StreamState{FirstSeq: 3, LastSeq: 9},
+		Config: jetstream.StreamConfig{Subjects: []string{"events.>"}},
+	}}
+	plan := streamPlan{Topics: []string{"alpha"}, FullSubjects: []string{"events.alpha"}, Replay: replayPlan{Mode: replayModeDeliverNew}}
+
+	snapshot := h.readStreamSnapshot(context.Background(), fakeStreamLookup{stream: stream}, plan)
+
+	want := streamInfoSnapshot{HasSnapshot: true, FirstSeq: 3, LastSeq: 9, Subjects: []string{"events.>"}}
+	if !reflect.DeepEqual(snapshot, want) {
+		t.Fatalf("snapshot = %+v, want %+v", snapshot, want)
+	}
+}
+
+func TestHandler_ReadStreamSnapshot_ReadsStartSequenceTimeUnderReplayWindow(t *testing.T) {
+	h := &Handler{StreamName: "EVENTS", ReplayWindow: 60, logger: zap.NewNop()}
+	published := time.Date(2026, 9, 26, 10, 0, 0, 0, time.UTC)
+	stream := fakeStream{
+		info: &jetstream.StreamInfo{State: jetstream.StreamState{FirstSeq: 1, LastSeq: 10}},
+		msg:  &jetstream.RawStreamMsg{Sequence: 5, Time: published},
+	}
+	plan := streamPlan{Replay: replayPlan{HasLastID: true, StartSequence: 5}}
+
+	snapshot := h.readStreamSnapshot(context.Background(), fakeStreamLookup{stream: stream}, plan)
+
+	if !snapshot.HasStartSequenceTime || !snapshot.StartSequenceTime.Equal(published) {
+		t.Fatalf("StartSequenceTime = %v (has=%v), want %v", snapshot.StartSequenceTime, snapshot.HasStartSequenceTime, published)
+	}
+
+	// Below retention the message cannot exist, so it is not looked up.
+	belowRetention := h.readStreamSnapshot(context.Background(), fakeStreamLookup{stream: stream}, streamPlan{Replay: replayPlan{HasLastID: true, StartSequence: 0}})
+	if belowRetention.HasStartSequenceTime {
+		t.Fatal("StartSequenceTime read for a sequence below FirstSeq")
+	}
+	// Without replay_window the timestamp is not needed.
+	h.ReplayWindow = 0
+	if noWindow := h.readStreamSnapshot(context.Background(), fakeStreamLookup{stream: stream}, plan); noWindow.HasStartSequenceTime {
+		t.Fatal("StartSequenceTime read without replay_window")
+	}
+}
+
 func TestHandler_ReadStreamSnapshot_GetMsgErrorKeepsSnapshotWithoutStartTime(t *testing.T) {
 	h := &Handler{StreamName: "EVENTS", ReplayWindow: 60, logger: zap.NewNop()}
 	plan := streamPlan{Replay: replayPlan{HasLastID: true, StartSequence: 5}}
-	stub := stubStreamMetadata{
-		info: &nats.StreamInfo{
-			State:  nats.StreamState{FirstSeq: 1, LastSeq: 10},
-			Config: nats.StreamConfig{Subjects: []string{"events.>"}},
+	stream := fakeStream{
+		info: &jetstream.StreamInfo{
+			State:  jetstream.StreamState{FirstSeq: 1, LastSeq: 10},
+			Config: jetstream.StreamConfig{Subjects: []string{"events.>"}},
 		},
 		getMsgErr: errors.New("get msg boom"),
 	}
 
-	snapshot := h.readStreamSnapshot(stub, plan)
+	snapshot := h.readStreamSnapshot(context.Background(), fakeStreamLookup{stream: stream}, plan)
 
 	if snapshot.HasStartSequenceTime {
 		t.Errorf("HasStartSequenceTime = true on GetMsg error, want false")
 	}
 	if snapshot.FirstSeq != 1 || snapshot.LastSeq != 10 {
 		t.Errorf("Seq range: got FirstSeq=%d LastSeq=%d, want 1/10", snapshot.FirstSeq, snapshot.LastSeq)
-	}
-}
-
-func TestHandler_FinalizeStreamedMessage(t *testing.T) {
-	h := &Handler{logger: zap.NewNop()}
-
-	cases := []struct {
-		name  string
-		plan  streamPlan
-		event formattedMessageEvent
-		want  bool
-	}{
-		{
-			name:  "normal message delivers",
-			plan:  streamPlan{},
-			event: formattedMessageEvent{Subject: "events.x"},
-			want:  true,
-		},
-		{
-			name:  "dropped message skips",
-			plan:  streamPlan{},
-			event: formattedMessageEvent{Subject: "events.x", Dropped: true, DropReason: "queue_full", DropSize: 100},
-			want:  false,
-		},
-		{
-			name: "out-of-replay-window message skips",
-			plan: streamPlan{Replay: replayPlan{Mode: replayModeFallbackStartTime, StartTime: time.Unix(1_700_000_000, 0)}},
-			event: formattedMessageEvent{
-				Subject:        "events.x",
-				MessageTime:    time.Unix(1_699_999_000, 0),
-				HasMessageTime: true,
-			},
-			want: false,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := h.finalizeStreamedMessage(c.plan, c.event); got != c.want {
-				t.Errorf("finalizeStreamedMessage = %v, want %v", got, c.want)
-			}
-		})
 	}
 }
 

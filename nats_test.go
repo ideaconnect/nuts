@@ -22,6 +22,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
@@ -989,7 +990,7 @@ func TestHandler_ServeHTTP_Integration(t *testing.T) {
 	defer h.Cleanup()
 
 	// Initialize JetStream context
-	js, err := h.conn.JetStream()
+	js, err := jetstream.New(h.conn)
 	if err != nil {
 		t.Fatalf("failed to create JetStream context: %v", err)
 	}
@@ -1460,9 +1461,11 @@ func TestHandler_ServeHTTP_MultiTopicReplayEmitsIncreasingIDs(t *testing.T) {
 	<-done
 
 	ids := parseSSEIDs(t, rr.Body())
-	if len(ids) != 40 {
-		t.Fatalf("expected 40 message ids, got %d; ids=%v body=%s", len(ids), ids, rr.Body())
+	// The connected event carries the replay cursor (last-id=0) first.
+	if len(ids) != 41 || ids[0] != 0 {
+		t.Fatalf("expected the connected id 0 then 40 message ids, got %d; ids=%v body=%s", len(ids), ids, rr.Body())
 	}
+	ids = ids[1:]
 	for i := 1; i < len(ids); i++ {
 		if ids[i] <= ids[i-1] {
 			t.Fatalf("SSE ids must be strictly increasing for a single Last-Event-ID cursor; ids=%v body=%s", ids, rr.Body())
@@ -1484,104 +1487,6 @@ func parseSSEIDs(t *testing.T, body string) []uint64 {
 		ids = append(ids, id)
 	}
 	return ids
-}
-
-func TestCommonSubjectFilter(t *testing.T) {
-	tests := []struct {
-		name     string
-		subjects []string
-		expect   string
-	}{
-		{
-			name:     "same prefix siblings",
-			subjects: []string{"events.alpha", "events.beta"},
-			expect:   "events.>",
-		},
-		{
-			name:     "nested subject backs up one token",
-			subjects: []string{"events.alpha", "events.alpha.beta"},
-			expect:   "events.>",
-		},
-		{
-			name:     "unrelated subjects use root wildcard",
-			subjects: []string{"alpha", "beta"},
-			expect:   ">",
-		},
-		{
-			name:     "deeper sibling prefix",
-			subjects: []string{"events.alpha.one", "events.alpha.two"},
-			expect:   "events.alpha.>",
-		},
-		{
-			name:     "empty input uses root wildcard",
-			subjects: nil,
-			expect:   ">",
-		},
-		{
-			name:     "shorter later subject backs up to root wildcard",
-			subjects: []string{"alpha.beta", "alpha"},
-			expect:   ">",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := commonSubjectFilter(tt.subjects); got != tt.expect {
-				t.Fatalf("commonSubjectFilter(%v) = %q, want %q", tt.subjects, got, tt.expect)
-			}
-		})
-	}
-}
-
-func TestParseMajorMinorVersion(t *testing.T) {
-	tests := []struct {
-		version string
-		major   int
-		minor   int
-		ok      bool
-	}{
-		{version: "2.10.1", major: 2, minor: 10, ok: true},
-		{version: "v2.12.0", major: 2, minor: 12, ok: true},
-		{version: "2.10.0-beta.1", major: 2, minor: 10, ok: true},
-		{version: "3.0.0+meta", major: 3, minor: 0, ok: true},
-		{version: "2", ok: false},
-		{version: "x.10", ok: false},
-		{version: "2.y", ok: false},
-		{version: "not-a-version", ok: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.version, func(t *testing.T) {
-			major, minor, ok := parseMajorMinorVersion(tt.version)
-			if ok != tt.ok || major != tt.major || minor != tt.minor {
-				t.Fatalf("parseMajorMinorVersion(%q) = (%d, %d, %v), want (%d, %d, %v)",
-					tt.version, major, minor, ok, tt.major, tt.minor, tt.ok)
-			}
-		})
-	}
-}
-
-func TestSupportsMultiFilterSubjectsVersion(t *testing.T) {
-	tests := []struct {
-		version string
-		want    bool
-	}{
-		{version: "", want: false},
-		{version: "2.8.4", want: false},
-		{version: "2.9.25", want: false},
-		{version: "2.10.0", want: true},
-		{version: "v2.12.0", want: true},
-		{version: "3.0.0", want: true},
-		{version: "not-a-version", want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.version, func(t *testing.T) {
-			if got := supportsMultiFilterSubjectsVersion(tt.version); got != tt.want {
-				t.Fatalf("supportsMultiFilterSubjectsVersion(%q) = %v, want %v", tt.version, got, tt.want)
-			}
-		})
-	}
 }
 
 func TestSubjectAllowedByStream(t *testing.T) {
@@ -1629,45 +1534,6 @@ func TestSubjectAllowedByStream(t *testing.T) {
 				t.Fatalf("subjectAllowedByStream(%q, %v) = %v, want %v", tt.subject, tt.streamSubjects, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestHandler_StreamNotFound(t *testing.T) {
-	// Start embedded NATS server with JetStream
-	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
-
-	// Create handler with non-existent stream
-	h := &Handler{
-		NatsURL:           ns.ClientURL(),
-		StreamName:        "NONEXISTENT_STREAM",
-		TopicPrefix:       "events.",
-		HeartbeatInterval: 30,
-		ReconnectWait:     2,
-		MaxReconnects:     intPtr(-1),
-		AllowedOrigins:    []string{"*"},
-		logger:            zap.NewNop(),
-	}
-
-	// Connect to NATS
-	if err := h.connectNATS(); err != nil {
-		t.Fatalf("failed to connect to NATS: %v", err)
-	}
-	defer h.Cleanup()
-
-	// Initialize JetStream context
-	js, err := h.conn.JetStream()
-	if err != nil {
-		t.Fatalf("failed to create JetStream context: %v", err)
-	}
-	h.mu.Lock()
-	h.js = js
-	h.mu.Unlock()
-
-	// Verify stream doesn't exist
-	_, err = h.js.StreamInfo(h.StreamName)
-	if err == nil {
-		t.Error("expected error for non-existent stream")
 	}
 }
 
@@ -1876,7 +1742,7 @@ func (f *failingFlushRecorder) Flush() {
 	// No-op for testing, actual flushing happens in real HTTP response.
 }
 
-func waitForConsumerCount(t *testing.T, js nats.JetStreamContext, stream string, want int, timeout time.Duration) bool {
+func waitForConsumerCount(t *testing.T, js jetstream.JetStream, stream string, want int, timeout time.Duration) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1888,26 +1754,16 @@ func waitForConsumerCount(t *testing.T, js nats.JetStreamContext, stream string,
 	return consumerCount(js, stream) == want
 }
 
-func consumerCount(js nats.JetStreamContext, stream string) int {
-	count := 0
-	for range js.ConsumerNames(stream) {
-		count++
+// consumerCount returns the stream's consumer count, or -1 when the stream
+// cannot be read.
+func consumerCount(js jetstream.JetStream, stream string) int {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	s, err := js.Stream(ctx, stream)
+	if err != nil {
+		return -1
 	}
-	return count
-}
-
-type slowFlushRecorder struct {
-	*httptest.ResponseRecorder
-	writeDelay time.Duration
-}
-
-func (f *slowFlushRecorder) Write(p []byte) (int, error) {
-	time.Sleep(f.writeDelay)
-	return f.ResponseRecorder.Write(p)
-}
-
-func (f *slowFlushRecorder) Flush() {
-	// No-op for testing.
+	return s.CachedInfo().State.Consumers
 }
 
 func TestIsValidTopic(t *testing.T) {
@@ -1934,30 +1790,6 @@ func TestIsValidTopic(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isValidTopic(tt.topic); got != tt.want {
 				t.Errorf("isValidTopic(%q) = %v, want %v", tt.topic, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestIsReplayStartSequenceError(t *testing.T) {
-	tests := []struct {
-		name      string
-		err       error
-		hasLastID bool
-		want      bool
-	}{
-		{name: "nil", hasLastID: true},
-		{name: "no last id", err: errors.New("start sequence 42 is no longer available"), want: false},
-		{name: "sequence not found api error", err: &nats.APIError{ErrorCode: jsErrCodeSequenceNotFound, Description: "sequence 42 not found"}, hasLastID: true, want: true},
-		{name: "consumer sequence mismatch", err: &nats.ErrConsumerSequenceMismatch{StreamResumeSequence: 42, ConsumerSequence: 1, LastConsumerSequence: 2}, hasLastID: true, want: true},
-		{name: "plain sequence string", err: errors.New("sequence not found"), hasLastID: true, want: false},
-		{name: "unrelated", err: errors.New("stream not found"), hasLastID: true, want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isReplayStartSequenceError(tt.err, tt.hasLastID); got != tt.want {
-				t.Fatalf("isReplayStartSequenceError(%v, %v) = %v, want %v", tt.err, tt.hasLastID, got, tt.want)
 			}
 		})
 	}
@@ -1995,7 +1827,7 @@ func TestHandler_ServeHTTP_InvalidTopic(t *testing.T) {
 
 	createTestStream(t, nc, "EVENTS", []string{"events.>"})
 
-	js, _ := nc.JetStream()
+	js, _ := jetstream.New(nc)
 	h := &Handler{
 		StreamName:        "EVENTS",
 		TopicPrefix:       "events.",
@@ -2048,7 +1880,7 @@ func TestHandler_ServeHTTP_ConnectedWriteFailure(t *testing.T) {
 	}
 	defer h.Cleanup()
 
-	js, err := h.conn.JetStream()
+	js, err := jetstream.New(h.conn)
 	if err != nil {
 		t.Fatalf("failed to create JetStream context: %v", err)
 	}
@@ -2127,7 +1959,7 @@ func TestHandler_ServeHTTP_SubjectPrecheckReleasesConnectionSlot(t *testing.T) {
 		t.Fatalf("failed to connect handler to NATS: %v", err)
 	}
 	defer h.Cleanup()
-	js, err := h.conn.JetStream()
+	js, err := jetstream.New(h.conn)
 	if err != nil {
 		t.Fatalf("failed to create JetStream context: %v", err)
 	}
@@ -2180,7 +2012,7 @@ func TestHandler_ServeHTTP_MessageWriteFailure(t *testing.T) {
 	}
 	defer h.Cleanup()
 
-	js, err := h.conn.JetStream()
+	js, err := jetstream.New(h.conn)
 	if err != nil {
 		t.Fatalf("failed to create JetStream context: %v", err)
 	}
@@ -2298,13 +2130,13 @@ func TestHandler_Cleanup_AfterConnectionClosed(t *testing.T) {
 	// surfaces on the first API call (StreamInfo here). Close the
 	// connection first so the StreamInfo call fails the way Provision's
 	// JS-context failure branch is meant to.
-	js, err := h.conn.JetStream()
+	js, err := jetstream.New(h.conn)
 	if err != nil {
 		t.Fatalf("conn.JetStream(): %v", err)
 	}
 	h.conn.Close()
-	if _, err := js.StreamInfo("EVENTS"); err == nil {
-		t.Fatal("expected StreamInfo on closed conn to error")
+	if _, err := js.Stream(context.Background(), "EVENTS"); err == nil {
+		t.Fatal("expected a stream lookup on a closed conn to error")
 	}
 
 	// Now call Cleanup explicitly — this is what the deferred handler
@@ -2357,7 +2189,7 @@ func TestHandler_ServeHTTP_HeartbeatWriteFailure(t *testing.T) {
 	}
 	defer h.Cleanup()
 
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -2390,128 +2222,65 @@ func TestHandler_ServeHTTP_HeartbeatWriteFailure(t *testing.T) {
 	}
 }
 
-func TestHandler_ProvisionCleanupOnFailure(t *testing.T) {
-	// Simulate the provision path: connect succeeds, but StreamInfo fails.
-	// The deferred cleanup should close the connection and nil the fields.
-	ns := startJetStreamServer(t)
+// TestHandler_ServeHTTP_SlowReaderGetsBackpressureNotDisconnect: a reader
+// slower than JetStream receives the whole backlog, in order, on one
+// connection. The pull consumer waits for the writer instead of a queue
+// overflowing into a slow-client disconnect (#100).
+func TestHandler_ServeHTTP_SlowReaderGetsBackpressureNotDisconnect(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
 	defer ns.Shutdown()
-
-	nc, err := nats.Connect(ns.ClientURL())
-	if err != nil {
-		t.Fatalf("failed to connect: %v", err)
-	}
-
-	h := &Handler{
-		NatsURL:    ns.ClientURL(),
-		StreamName: "NONEXISTENT",
-		logger:     zap.NewNop(),
-		conn:       nc,
-	}
-
-	// JetStream context creation should succeed.
-	js, err := nc.JetStream()
-	if err != nil {
-		t.Fatalf("JetStream() failed: %v", err)
-	}
-	h.mu.Lock()
-	h.js = js
-	h.mu.Unlock()
-
-	// StreamInfo should fail; verify Cleanup restores nil state.
-	_, err = js.StreamInfo("NONEXISTENT")
-	if err == nil {
-		t.Fatal("expected StreamInfo to fail for non-existent stream")
-	}
-
-	// Simulate the deferred cleanup that Provision now does on error.
-	if cleanupErr := h.Cleanup(); cleanupErr != nil {
-		t.Fatalf("Cleanup returned error: %v", cleanupErr)
-	}
-
-	h.mu.RLock()
-	connNil := h.conn == nil
-	jsNil := h.js == nil
-	h.mu.RUnlock()
-	if !connNil {
-		t.Error("expected conn to be nil after cleanup on provision failure")
-	}
-	if !jsNil {
-		t.Error("expected js to be nil after cleanup on provision failure")
-	}
-}
-
-func TestHandler_ServeHTTP_DisconnectsSlowClientBeforeDropping(t *testing.T) {
-	ns := startJetStreamServer(t)
-	defer ns.Shutdown()
-
-	nc, err := nats.Connect(ns.ClientURL())
-	if err != nil {
-		t.Fatalf("failed to connect to NATS: %v", err)
-	}
 	defer nc.Close()
-
-	createTestStream(t, nc, "TEST_EVENTS", []string{"events.>"})
-
-	h := &Handler{
-		NatsURL:           ns.ClientURL(),
-		StreamName:        "TEST_EVENTS",
-		TopicPrefix:       "events.",
-		HeartbeatInterval: 30,
-		ReconnectWait:     2,
-		MaxReconnects:     intPtr(-1),
-		AllowedOrigins:    []string{"*"},
-		logger:            zap.NewNop(),
-	}
-
-	if err := h.connectNATS(); err != nil {
-		t.Fatalf("failed to connect handler to NATS: %v", err)
-	}
 	defer h.Cleanup()
-
-	js, err := h.conn.JetStream()
-	if err != nil {
-		t.Fatalf("failed to create JetStream context: %v", err)
-	}
-	h.mu.Lock()
-	h.js = js
-	h.mu.Unlock()
+	h.ClientBufferSize = 4
 
 	jsCtx, _ := nc.JetStream()
-	var firstSequence uint64
-	for i := 0; i < 256; i++ {
-		payload, err := json.Marshal(map[string]int{"count": i})
-		if err != nil {
-			t.Fatalf("failed to marshal payload %d: %v", i, err)
-		}
-		ack, err := jsCtx.Publish("events.burst", payload)
-		if err != nil {
-			t.Fatalf("failed to publish message %d: %v", i, err)
-		}
-		if i == 0 {
-			firstSequence = ack.Sequence
+	const total = 100
+	for i := 1; i <= total; i++ {
+		if _, err := jsCtx.Publish("events.burst", []byte(`{"count":`+strconv.Itoa(i)+`}`)); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
 		}
 	}
+	slowBefore := counterVal(t, metricsSlowClientDisconnects)
 
 	req := httptest.NewRequest(http.MethodGet, "/events?topic=burst", nil)
-	req.Header.Set("Last-Event-ID", strconv.FormatUint(firstSequence-1, 10))
-	ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+	req.Header.Set("Last-Event-ID", "0")
+	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
 	defer cancel()
 	req = req.WithContext(ctx)
-
-	rr := &slowFlushRecorder{ResponseRecorder: httptest.NewRecorder(), writeDelay: 20 * time.Millisecond}
+	rr := &slowSafeRecorder{safeFlushRecorder: newSafeRecorder(), delay: 5 * time.Millisecond}
 	done := make(chan error, 1)
-	go func() {
-		done <- h.ServeHTTP(rr, req, nil)
-	}()
+	go func() { done <- h.ServeHTTP(rr, req, nil) }()
 
+	if !waitForSSEBody(rr.safeFlushRecorder, `{"count":100}`, 8*time.Second) {
+		t.Fatalf("slow reader did not receive the whole backlog; body tail=%q", tail(rr.Body(), 200))
+	}
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("ServeHTTP did not disconnect slow client after queue saturation")
+		t.Fatalf("slow reader was disconnected (err=%v) instead of throttled", err)
+	default:
 	}
+	ids := parseSSEIDs(t, rr.Body())
+	if len(ids) != total+1 || ids[0] != 0 {
+		t.Fatalf("got %d ids starting %v, want the connected id 0 then %d messages", len(ids), ids[:min(3, len(ids))], total)
+	}
+	for i, id := range ids[1:] {
+		if id != uint64(i+1) {
+			t.Fatalf("id[%d] = %d, want %d (ids must be contiguous)", i+1, id, i+1)
+		}
+	}
+	if got := counterVal(t, metricsSlowClientDisconnects); got != slowBefore {
+		t.Fatalf("slow_client_disconnects_total moved from %v to %v for a reader that kept up", slowBefore, got)
+	}
+	cancel()
+	<-done
+}
+
+// tail returns the last n bytes of s.
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 func TestHandler_ServeHTTP_OversizedEventDropped(t *testing.T) {
@@ -2543,7 +2312,7 @@ func TestHandler_ServeHTTP_OversizedEventDropped(t *testing.T) {
 	}
 	defer h.Cleanup()
 
-	js, err := h.conn.JetStream()
+	js, err := jetstream.New(h.conn)
 	if err != nil {
 		t.Fatalf("failed to create JetStream context: %v", err)
 	}
@@ -2621,7 +2390,7 @@ func TestHandler_HealthCheck(t *testing.T) {
 	}
 	defer h.Cleanup()
 
-	jsCtx, err := h.conn.JetStream()
+	jsCtx, err := jetstream.New(h.conn)
 	if err != nil {
 		t.Fatalf("failed to create JetStream context: %v", err)
 	}
@@ -2729,7 +2498,7 @@ func TestHandler_HubDiscovery(t *testing.T) {
 		}
 		defer h.Cleanup()
 
-		jsCtx, _ := h.conn.JetStream()
+		jsCtx, _ := jetstream.New(h.conn)
 		h.mu.Lock()
 		h.js = jsCtx
 		h.mu.Unlock()
@@ -2773,7 +2542,7 @@ func TestHandler_HubDiscovery(t *testing.T) {
 		}
 		defer h.Cleanup()
 
-		jsCtx, _ := h.conn.JetStream()
+		jsCtx, _ := jetstream.New(h.conn)
 		h.mu.Lock()
 		h.js = jsCtx
 		h.mu.Unlock()
@@ -2884,14 +2653,14 @@ func TestHandler_ConnectNATS_TokenAuth_Integration(t *testing.T) {
 			t.Fatalf("connectNATS: %v", err)
 		}
 		defer h.Cleanup()
-		js, err := h.conn.JetStream()
+		js, err := jetstream.New(h.conn)
 		if err != nil {
 			t.Fatalf("JetStream: %v", err)
 		}
-		if _, err := js.AddStream(&nats.StreamConfig{
+		if _, err := js.CreateStream(context.Background(), jetstream.StreamConfig{
 			Name:     "EVENTS",
 			Subjects: []string{"events.>"},
-			Storage:  nats.MemoryStorage,
+			Storage:  jetstream.MemoryStorage,
 		}); err != nil {
 			t.Fatalf("AddStream: %v", err)
 		}
@@ -2941,14 +2710,14 @@ func TestHandler_ConnectNATS_UserPassAuth_Integration(t *testing.T) {
 			t.Fatalf("connectNATS: %v", err)
 		}
 		defer h.Cleanup()
-		js, err := h.conn.JetStream()
+		js, err := jetstream.New(h.conn)
 		if err != nil {
 			t.Fatalf("JetStream: %v", err)
 		}
-		if _, err := js.AddStream(&nats.StreamConfig{
+		if _, err := js.CreateStream(context.Background(), jetstream.StreamConfig{
 			Name:     "EVENTS",
 			Subjects: []string{"events.>"},
-			Storage:  nats.MemoryStorage,
+			Storage:  jetstream.MemoryStorage,
 		}); err != nil {
 			t.Fatalf("AddStream: %v", err)
 		}

@@ -2,6 +2,9 @@ package nuts
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"runtime"
 	"strconv"
@@ -17,7 +20,7 @@ const (
 	performanceConcurrentMessages      = 40
 	performanceConcurrentBudget        = 5 * time.Second
 	performanceSlowDisconnectBudget    = 3 * time.Second
-	performanceGoroutineSlack          = 20
+	performanceGoroutineSlack          = 3
 	performanceReplayRetainedMessages  = 160
 	performanceReplayCap               = 25
 	performanceReplayBudget            = 5 * time.Second
@@ -29,8 +32,6 @@ var (
 	benchmarkFormatted formattedMessageEvent
 	benchmarkParsed    interface{}
 	benchmarkBool      bool
-	benchmarkString    string
-	benchmarkInt       int
 )
 
 func TestPerformance_ConcurrentSSEClientsReceiveRealisticMessageRate(t *testing.T) {
@@ -95,54 +96,47 @@ func TestPerformance_ConcurrentSSEClientsReceiveRealisticMessageRate(t *testing.
 
 func TestPerformance_SlowReaderDisconnectsWithoutGoroutineLeak(t *testing.T) {
 	h, ns, nc := newProvisionedHandler(t)
-	h.ClientBufferSize = 4
-
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+	h.WriteTimeout = 1
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = h.ServeHTTP(w, r, nil) }))
+	defer srv.Close()
 	jsPub, _ := nc.JetStream()
-	var firstSequence uint64
-	for i := 0; i < 128; i++ {
-		ack, err := jsPub.Publish("events.slow-load", []byte(`{"i":`+strconv.Itoa(i)+`}`))
-		if err != nil {
-			h.Cleanup()
-			nc.Close()
-			ns.Shutdown()
+	slowBefore := counterVal(t, metricsSlowClientDisconnects)
+	baselineGoroutines := runtime.NumGoroutine()
+
+	// A client that sends the request and never reads the response.
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprint(conn, "GET /events?topic=slow-load HTTP/1.1\r\nHost: nuts\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	if !waitForConsumerCount(t, mustJetStream(t, nc), "EVENTS", 1, 3*time.Second) {
+		t.Fatal("stalled client never subscribed")
+	}
+
+	// Enough data to fill the kernel socket buffers on both ends, so the
+	// server's writes block and hit write_timeout.
+	payload := []byte(`{"blob":"` + strings.Repeat("x", 60*1024) + `"}`)
+	for i := 0; i < 400; i++ {
+		if _, err := jsPub.Publish("events.slow-load", payload); err != nil {
 			t.Fatalf("publish %d: %v", i, err)
 		}
-		if i == 0 {
-			firstSequence = ack.Sequence
-		}
 	}
-
-	baselineGoroutines := runtime.NumGoroutine()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req := httptest.NewRequest("GET", "/events?topic=slow-load", nil).WithContext(ctx)
-	req.Header.Set("Last-Event-ID", strconv.FormatUint(firstSequence-1, 10))
-	rr := &slowFlushRecorder{ResponseRecorder: httptest.NewRecorder(), writeDelay: 25 * time.Millisecond}
-	done := make(chan error, 1)
-
 	start := time.Now()
-	go func() { done <- h.ServeHTTP(rr, req, nil) }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("ServeHTTP returned error: %v", err)
+	for counterVal(t, metricsSlowClientDisconnects) == slowBefore {
+		if time.Since(start) > performanceSlowDisconnectBudget {
+			t.Fatalf("stalled reader not disconnected within %s", performanceSlowDisconnectBudget)
 		}
-	case <-time.After(performanceSlowDisconnectBudget):
-		cancel()
-		<-done
-		t.Fatalf("slow reader did not disconnect within %s", performanceSlowDisconnectBudget)
+		time.Sleep(20 * time.Millisecond)
 	}
-	if elapsed := time.Since(start); elapsed > performanceSlowDisconnectBudget {
-		t.Fatalf("slow reader disconnect took %s, budget %s", elapsed, performanceSlowDisconnectBudget)
-	}
-
-	if err := h.Cleanup(); err != nil {
-		t.Fatalf("Cleanup: %v", err)
-	}
-	nc.Close()
-	ns.Shutdown()
-	if !waitForGoroutinesAtMost(baselineGoroutines+performanceGoroutineSlack, 3*time.Second) {
-		t.Fatalf("goroutines did not return near baseline: before=%d after=%d slack=%d", baselineGoroutines, runtime.NumGoroutine(), performanceGoroutineSlack)
+	_ = conn.Close()
+	if !waitForGoroutinesAtMost(baselineGoroutines+performanceGoroutineSlack, 5*time.Second) {
+		t.Fatalf("goroutines did not return to baseline: before=%d after=%d slack=%d", baselineGoroutines, runtime.NumGoroutine(), performanceGoroutineSlack)
 	}
 }
 
@@ -178,14 +172,17 @@ func TestPerformance_MemoryGrowthLargePayloadFormattingWithinBudget(t *testing.T
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	now := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
 	payload := []byte(`{"blob":"` + strings.Repeat("x", performanceLargePayloadBytes) + `"}`)
-	msg := &nats.Msg{Subject: "events.large", Data: payload}
+	msg := streamMessage{Subject: "events.large", Data: payload}
 
 	runtime.GC()
 	before := readMemStats()
 	for i := 0; i < 128; i++ {
 		formatted := h.formatMessageEvent(msg, now)
-		if formatted.Dropped {
-			t.Fatalf("large payload was unexpectedly dropped: %#v", formatted)
+		// The payload must survive formatting intact: a regression that
+		// truncated or dropped it would otherwise also shrink the heap
+		// growth this test measures and pass.
+		if !strings.Contains(formatted.Frame, string(payload)) {
+			t.Fatalf("formatted frame lost the payload: frame_len=%d payload_len=%d", len(formatted.Frame), len(payload))
 		}
 		benchmarkFormatted = formatted
 	}
@@ -311,11 +308,12 @@ func heapGrowthBytes(before, after runtime.MemStats) uint64 {
 func BenchmarkFormatMessageEvent(b *testing.B) {
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	now := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
-	msg := &nats.Msg{
-		Subject: "events.bench",
-		Data:    []byte(`{"kind":"bench","value":123,"nested":{"ok":true}}`),
-		Reply:   jetStreamAckReply("EVENTS", "consumer", 1, 42, 1, now, 0),
-		Sub:     &nats.Subscription{},
+	msg := streamMessage{
+		Subject:        "events.bench",
+		Data:           []byte(`{"kind":"bench","value":123,"nested":{"ok":true}}`),
+		HasMetadata:    true,
+		StreamSequence: 42,
+		Timestamp:      now,
 	}
 
 	b.ReportAllocs()
@@ -361,112 +359,24 @@ func BenchmarkIsValidTopic(b *testing.B) {
 	}
 }
 
-func BenchmarkCommonSubjectFilter(b *testing.B) {
-	subjects := make([]string, 64)
-	for i := range subjects {
-		subjects[i] = "events.tenant." + strconv.Itoa(i) + ".updates"
-	}
-
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		benchmarkString = commonSubjectFilter(subjects)
-	}
-}
-
-// BenchmarkEnqueueMessageSteadyState exercises the actual per-message
-// dispatch hot path: the NATS callback hands a message to enqueueMessage,
-// the channel pump accepts it, and a consumer drains. Counter to the
-// pure-function benchmarks (FormatMessageEvent et al.), this one
-// includes the channel send + goroutine scheduling cost that
-// dominates real-world throughput.
-//
-// The consumer goroutine drains as fast as possible; the bench measures
-// the steady-state cost when there is no buffer pressure.
-func BenchmarkEnqueueMessageSteadyState(b *testing.B) {
-	h := &Handler{ClientBufferSize: 256, logger: nil}
-	msgChan, _, done, enqueueMessage := h.newMessageQueue()
-	defer close(done)
-
-	// Drainer.
-	stop := make(chan struct{})
+// BenchmarkStreamFeed measures the per-message path from the JetStream
+// iterator to the SSE writer: read metadata, format the frame, and hand it
+// over the feed channel to a reader that drains as fast as possible.
+func BenchmarkStreamFeed(b *testing.B) {
+	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
+	it := newFakeIterator(1024)
+	feed := h.startStreamFeed(it, streamPlan{Topics: []string{"bench"}, FullSubjects: []string{"events.bench"}})
+	defer feed.stop()
+	msg := newFakeJSMsg("events.bench", 42, "nuts_bench_1", `{"kind":"bench","value":123,"nested":{"ok":true}}`)
 	go func() {
-		for {
-			select {
-			case <-msgChan:
-			case <-stop:
-				return
-			}
+		for i := 0; i < b.N; i++ {
+			it.msgs <- msg
 		}
 	}()
-	defer close(stop)
 
-	msg := &nats.Msg{Subject: "events.x", Data: []byte(`{"hello":"world"}`)}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		enqueueMessage(msg)
+		benchmarkFormatted = <-feed.frames
 	}
-}
-
-// BenchmarkEnqueueMessageBackpressure measures the steady-state cost of
-// the slow-client signal handoff including the receiver goroutine. With
-// ClientBufferSize=1 and DispatchTimeout=0, every iteration after the
-// first hits signalSlowClient's unbounded branch (serve.go:586-591) and
-// sends on slowClient to the drainer below — so this benchmark tracks
-// the scheduler+channel cost path, not signalSlowClient's intrinsic
-// work in isolation. ReportAllocs() catches only allocations escaping
-// from signalSlowClient itself (currently zero); the channel handoff
-// dominates the ns/op number.
-func BenchmarkEnqueueMessageBackpressure(b *testing.B) {
-	h := &Handler{ClientBufferSize: 1, DispatchTimeout: 0, logger: nil}
-	msgChan, slowClient, done, enqueueMessage := h.newMessageQueue()
-	defer close(done)
-
-	// Fill the buffer; never drain. signalSlowClient's slowClient send
-	// must also be drained or signalSlowClient would block.
-	go func() {
-		for {
-			select {
-			case <-slowClient:
-			case <-done:
-				return
-			}
-		}
-	}()
-	_ = msgChan // intentionally unread to keep msgChan saturated
-
-	msg := &nats.Msg{Subject: "events.x", Data: []byte(`{"hello":"world"}`)}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		enqueueMessage(msg)
-	}
-}
-
-func BenchmarkMultiTopicRequestedMessageHandler(b *testing.B) {
-	requestedSubjects := map[string]struct{}{
-		"events.a": {},
-		"events.b": {},
-		"events.c": {},
-		"events.d": {},
-	}
-	plan := streamPlan{RequestedSubjects: requestedSubjects}
-	messages := []*nats.Msg{
-		{Subject: "events.a"},
-		{Subject: "events.x"},
-		{Subject: "events.b"},
-		{Subject: "events.y"},
-		{Subject: "events.c"},
-		{Subject: "events.z"},
-		{Subject: "events.d"},
-		{Subject: "events.unrequested"},
-	}
-	delivered := 0
-	filter := plan.requestedMessageHandler(func(*nats.Msg) { delivered++ })
-
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		filter(messages[i%len(messages)])
-	}
-	benchmarkInt = delivered
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
 	iopm "github.com/prometheus/client_model/go"
 	"go.uber.org/zap"
@@ -529,7 +530,7 @@ func TestHandler_MaxEventSize_DropsOversizedRawPayload(t *testing.T) {
 		t.Fatalf("connectNATS: %v", err)
 	}
 	defer h.Cleanup()
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -597,7 +598,7 @@ func TestHandler_MaxConnections_RejectsExcess(t *testing.T) {
 		t.Fatalf("connectNATS: %v", err)
 	}
 	defer h.Cleanup()
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -1250,31 +1251,6 @@ func TestWriteSSEChunkWithTimeout_SetsAndClearsDeadline(t *testing.T) {
 	}
 }
 
-func TestMessageQueue_DispatchTimeoutCapsSlowSignalWait(t *testing.T) {
-	h := &Handler{ClientBufferSize: 1, DispatchTimeout: 1, logger: zap.NewNop()}
-	msgChan, slowClient, done, enqueueMessage := h.newMessageQueue()
-	defer close(done)
-
-	msgChan <- &nats.Msg{Subject: "events.pending"}
-	slowClient <- "events.already-slow"
-
-	returned := make(chan struct{})
-	started := time.Now()
-	go func() {
-		enqueueMessage(&nats.Msg{Subject: "events.blocked"})
-		close(returned)
-	}()
-
-	select {
-	case <-returned:
-		if elapsed := time.Since(started); elapsed > 2*time.Second {
-			t.Fatalf("enqueueMessage returned after %s, want dispatch_timeout to cap the wait", elapsed)
-		}
-	case <-time.After(2500 * time.Millisecond):
-		t.Fatal("enqueueMessage did not return after dispatch_timeout")
-	}
-}
-
 func TestHandler_Provision_PreservesSentinelConfigSemantics(t *testing.T) {
 	ns := startJetStreamServer(t)
 	defer ns.Shutdown()
@@ -1523,7 +1499,7 @@ func TestHandler_HealthPath_CustomSuffix(t *testing.T) {
 		t.Fatalf("connectNATS: %v", err)
 	}
 	defer h.Cleanup()
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -1657,7 +1633,7 @@ func TestHandler_MaxEventSize_NegativeDisablesLimit(t *testing.T) {
 		t.Fatalf("connectNATS: %v", err)
 	}
 	defer h.Cleanup()
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -1725,7 +1701,7 @@ func TestHandler_ReplayMaxMessages_CapsFallback(t *testing.T) {
 		t.Fatalf("connectNATS: %v", err)
 	}
 	defer h.Cleanup()
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -1799,7 +1775,7 @@ func TestHandler_ReplayMaxMessages_CapsValidRetainedReplay(t *testing.T) {
 		t.Fatalf("connectNATS: %v", err)
 	}
 	defer h.Cleanup()
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -1841,7 +1817,7 @@ func TestHandler_ReplayWindow_BoundsValidRetainedReplay(t *testing.T) {
 		t.Fatalf("connectNATS: %v", err)
 	}
 	defer h.Cleanup()
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -1930,7 +1906,7 @@ func TestHandler_ReplayWindow_UsesStartTime(t *testing.T) {
 		t.Fatalf("connectNATS: %v", err)
 	}
 	defer h.Cleanup()
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -2037,15 +2013,6 @@ func TestHandler_Cleanup_WakesInFlightHandlers(t *testing.T) {
 // ── Sanity: make sure io.Discard reference is retained for vet/imports ──
 
 var _ = io.Discard
-
-// counterPlainValue reads the current value of a plain (non-labelled) counter.
-func counterPlainValue(c prometheus.Counter) float64 {
-	pb := &iopm.Metric{}
-	if err := c.Write(pb); err != nil {
-		return 0
-	}
-	return pb.GetCounter().GetValue()
-}
 
 // ── M1: MaxTopicsPerSubscription cap ──────────────────────────────────────
 
@@ -2161,33 +2128,6 @@ func TestHandler_LastEventID_OversizedHeaderFallsBackToDeliverNew(t *testing.T) 
 
 // ── M2: dispatch_timeout metric ───────────────────────────────────────────
 
-func TestMessageQueue_DispatchTimeout_IncrementsMetric(t *testing.T) {
-	before := counterPlainValue(metricsDispatchTimeouts)
-
-	h := &Handler{ClientBufferSize: 1, DispatchTimeout: 1, logger: zap.NewNop()}
-	msgChan, slowClient, done, enqueueMessage := h.newMessageQueue()
-	defer close(done)
-
-	msgChan <- &nats.Msg{Subject: "events.pending"}
-	slowClient <- "events.already-slow"
-
-	returned := make(chan struct{})
-	go func() {
-		enqueueMessage(&nats.Msg{Subject: "events.blocked"})
-		close(returned)
-	}()
-	select {
-	case <-returned:
-	case <-time.After(2500 * time.Millisecond):
-		t.Fatal("enqueueMessage did not return after dispatch_timeout")
-	}
-
-	after := counterPlainValue(metricsDispatchTimeouts)
-	if delta := after - before; delta < 1 {
-		t.Fatalf("metricsDispatchTimeouts delta = %v, want >= 1", delta)
-	}
-}
-
 // ── L1: Short subscriber_jwt_key warning ──────────────────────────────────
 
 func TestHandler_Validate_WarnsShortJWTKey(t *testing.T) {
@@ -2251,7 +2191,7 @@ func TestHandler_SubscriberJWT_RejectionCreatesNoConsumer(t *testing.T) {
 		t.Fatalf("connectNATS: %v", err)
 	}
 	defer h.Cleanup()
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -2280,7 +2220,6 @@ func TestHandler_SubscriberJWT_RejectionCreatesNoConsumer(t *testing.T) {
 	// we took the reject branch; this assertion proves the branch did
 	// not allocate JetStream state on the way out.
 	if got := consumerCount(js, "EVENTS"); got != 0 {
-		info, _ := js.StreamInfo("EVENTS")
-		t.Fatalf("post-rejection: consumer count = %d (stream reported %d consumers), want 0 (auth must run BEFORE Subscribe)", got, info.State.Consumers)
+		t.Fatalf("post-rejection: consumer count = %d, want 0 (auth must run before the consumer is created)", got)
 	}
 }

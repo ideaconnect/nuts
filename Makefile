@@ -28,7 +28,7 @@ test-unit:
 # Run performance confidence tests and hot-path benchmarks.
 test-performance:
 	go test -run '^TestPerformance_' -timeout 180s .
-	go test -run '^$$' -bench 'Benchmark(FormatMessageEvent|TryParseJSON|IsValidTopic|CommonSubjectFilter|MultiTopicRequestedMessageHandler)' -benchmem .
+	go test -run '^$$' -bench 'Benchmark(FormatMessageEvent|TryParseJSON|IsValidTopic|StreamFeed)' -benchmem .
 
 # Validate GoReleaser config without requiring a local GoReleaser install.
 release-check:

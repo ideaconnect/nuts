@@ -1,35 +1,37 @@
 // serve.go — HTTP/SSE request handling.
 //
 // This file contains the per-request hot path: it accepts an HTTP GET from a
-// browser EventSource, parses the requested topics and replay cursor, opens a
-// JetStream subscription, and pumps messages back as Server-Sent Events until
-// the client disconnects, the handler shuts down, or the slow-client guard
-// fires.
+// browser EventSource, parses the requested topics and replay cursor, opens an
+// ordered JetStream consumer (consumer.go), and writes messages back as
+// Server-Sent Events until the client disconnects, the handler shuts down, a
+// write misses its deadline, or the consumer cannot be recreated.
 //
 // The request lifecycle is broken into small, testable steps invoked from
 // ServeHTTP:
 //
-//  1. handleControlRequest    — short-circuits health/liveness/readiness/CORS.
-//  2. parseStreamRequest      — extracts and validates topics and Last-Event-ID.
-//  3. authorizeStreamRequest  — enforces optional subscriber JWT auth.
-//  4. readStreamSnapshot      — reads JetStream state to inform planning.
-//  5. planSubscription        — picks the replay mode and detects bad topics.
-//  6. executeSubscriptionPlan — opens the JetStream subscription (with fallback).
-//  7. serveStream             — runs the SSE select-loop until disconnect.
+//  1. handleControlRequest   — short-circuits health/liveness/readiness/CORS.
+//  2. parseStreamRequest     — extracts and validates topics and the cursor.
+//  3. authorizeStreamRequest — enforces optional subscriber JWT auth.
+//  4. readStreamSnapshot     — reads JetStream state to inform planning.
+//  5. planSubscription       — picks the start position and detects bad topics.
+//  6. openConsumerStream     — creates the ordered consumer and its feed.
+//  7. serveStream            — runs the SSE select-loop until disconnect.
 package nuts
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )
 
@@ -61,12 +63,6 @@ const (
 	// equal to math.MaxUint64 cannot be incremented for StartSequence without
 	// wrapping, so we reject it up-front and fall back to DeliverNew.
 	maxReplayCursor = ^uint64(0)
-
-	// jsErrCodeSequenceNotFound is the JetStream API error returned when a
-	// requested StartSequence has been purged from retention. nats.go v1.37
-	// exposes APIError but not this server error-code constant, so we redeclare
-	// it locally and match against APIError.ErrorCode.
-	jsErrCodeSequenceNotFound nats.ErrorCode = 10043
 )
 
 // replayMode describes how a JetStream subscription should position itself
@@ -146,8 +142,8 @@ type streamPlan struct {
 	// FullSubjects are the topics with TopicPrefix applied, in the same order.
 	// These are what JetStream actually sees.
 	FullSubjects []string
-	// RequestedSubjects is a set of FullSubjects, used as a fast filter for
-	// the multi-topic wildcard fallback path (see subscribeToMultipleTopics).
+	// RequestedSubjects is the set of FullSubjects, used to drop duplicate
+	// topics while parsing the request.
 	RequestedSubjects map[string]struct{}
 	// Replay is the resolved replay plan for this request.
 	Replay replayPlan
@@ -190,15 +186,6 @@ func appendStreamLogFields(plan streamPlan, fields ...zap.Field) []zap.Field {
 	return append(streamLogFields(plan), fields...)
 }
 
-// streamMetadataReader is the subset of nats.JetStreamContext that
-// readStreamSnapshot depends on. Extracted so tests can stub the metadata
-// reads independently of a live JetStream connection — `*nats.js` (the
-// real implementation) satisfies it automatically.
-type streamMetadataReader interface {
-	StreamInfo(stream string, opts ...nats.JSOpt) (*nats.StreamInfo, error)
-	GetMsg(name string, seq uint64, opts ...nats.JSOpt) (*nats.RawStreamMsg, error)
-}
-
 // streamInfoSnapshot is a frozen view of relevant JetStream stream state at
 // the moment the request was planned. Reading once and reusing avoids racing
 // against background JetStream activity during planning decisions.
@@ -232,8 +219,7 @@ type streamInfoSnapshot struct {
 // handler mutex. Captured once per request so the streaming loop can run
 // without re-locking on every message.
 type streamRuntime struct {
-	conn     *nats.Conn
-	js       nats.JetStreamContext
+	js       jetstream.JetStream
 	shutdown <-chan struct{}
 }
 
@@ -254,14 +240,6 @@ func (e *streamRequestError) write(w http.ResponseWriter) {
 	http.Error(w, e.message, e.status)
 }
 
-// subscriptionResult is the outcome of executeSubscriptionPlan: either a set
-// of opened subscriptions to be cleaned up on disconnect, or a list of
-// topics that could not be subscribed.
-type subscriptionResult struct {
-	Subscriptions []*nats.Subscription
-	FailedTopics  []string
-}
-
 // formattedMessageEvent is the output of formatMessageEvent: either a fully
 // rendered SSE frame, or a drop record explaining why nothing was sent.
 // Splitting "format" from "write" keeps the streaming select-loop free of
@@ -279,6 +257,9 @@ type formattedMessageEvent struct {
 	// to filter out messages older than the replay window.
 	MessageTime    time.Time
 	HasMessageTime bool
+	// ConsumerName is the server-side consumer that delivered the message. A
+	// change between messages means the ordered consumer recreated itself.
+	ConsumerName string
 	// Dropped is set when the formatter chose not to emit (oversize).
 	Dropped bool
 	// DropReason names the drop bucket for metrics/logging.
@@ -291,27 +272,12 @@ type formattedMessageEvent struct {
 	MetadataErr error
 }
 
-// isReplayStartSequenceError reports whether the JetStream subscribe error
-// signals "the requested StartSequence is unreachable". Two server signals
-// can mean this: an APIError with code 10043, or a consumer sequence
-// mismatch. Both are recoverable via the replay-fallback path.
-func isReplayStartSequenceError(err error, hasLastID bool) bool {
-	if err == nil || !hasLastID {
-		return false
-	}
-	var apiErr *nats.APIError
-	if errors.As(err, &apiErr) && apiErr.ErrorCode == jsErrCodeSequenceNotFound {
-		return true
-	}
-	var sequenceMismatch *nats.ErrConsumerSequenceMismatch
-	return errors.As(err, &sequenceMismatch)
-}
-
 // ServeHTTP implements caddyhttp.MiddlewareHandler. It dispatches health and
 // CORS-preflight requests, validates and authorizes the SSE subscription
-// request, opens a JetStream subscription, and runs the SSE streaming loop
-// until the client or the server closes the connection. Non-stream requests
-// are passed to the next handler in the Caddy chain when one is configured.
+// request, opens an ordered JetStream consumer, and runs the SSE streaming
+// loop until the client or the server closes the connection. Non-stream
+// requests are passed to the next handler in the Caddy chain when one is
+// configured.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// Set CORS headers before any short-circuit response path. Otherwise a
 	// browser hitting a 401 (JWT failure), 400 (validation), 405 (method),
@@ -350,8 +316,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
-	// Reserve before opening a JetStream subscription so we never pay the
-	// subscription cost for a request we'd just reject anyway.
+	// Reserve before creating a JetStream consumer so we never pay the
+	// consumer cost for a request we'd just reject anyway.
 	if h.MaxConnections > 0 {
 		if !h.reserveConnSlot() {
 			metricsConnectionsRejected.WithLabelValues("max_connections").Inc()
@@ -374,34 +340,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		defer h.releaseConnSlot()
 	}
 
-	msgChan, slowClient, done, enqueueMessage := h.newMessageQueue()
-	snapshot := h.readStreamSnapshot(runtime.js, plan)
+	snapshot := h.readStreamSnapshot(r.Context(), runtime.js, plan)
 	plan = h.planSubscription(plan, snapshot)
-	enqueueRequestedMessage := plan.requestedMessageHandler(enqueueMessage)
-
-	result := h.executeSubscriptionPlan(runtime.js, runtime.conn, plan, enqueueMessage, enqueueRequestedMessage)
-	if len(result.FailedTopics) > 0 {
+	if len(plan.FailedTopics) > 0 {
+		metricsSubscriptionErrors.Inc()
 		h.log().Warn("failed to subscribe to requested SSE topics",
 			appendStreamLogFields(plan,
-				zap.Strings("failed_topics", result.FailedTopics),
+				zap.Strings("failed_topics", plan.FailedTopics),
 				zap.String("disconnect_reason", "subscription_failed"),
 			)...,
 		)
-		h.cleanupStream(done, result.Subscriptions)
-		http.Error(w, fmt.Sprintf("Failed to subscribe to requested topics: %s", strings.Join(result.FailedTopics, ", ")), http.StatusServiceUnavailable)
+		http.Error(w, fmt.Sprintf("Failed to subscribe to requested topics: %s", strings.Join(plan.FailedTopics, ", ")), http.StatusServiceUnavailable)
 		return nil
 	}
-	if len(result.Subscriptions) == 0 {
-		h.log().Warn("failed to subscribe to any requested SSE topics",
-			appendStreamLogFields(plan, zap.String("disconnect_reason", "subscription_empty"))...,
-		)
-		h.cleanupStream(done, nil)
-		http.Error(w, "Failed to subscribe to any requested topics", http.StatusServiceUnavailable)
-		return nil
-	}
-	defer h.cleanupStream(done, result.Subscriptions)
 
-	return h.serveStream(w, r, plan, msgChan, slowClient, runtime.shutdown)
+	stream, err := h.openConsumerStream(r.Context(), runtime.js, plan)
+	if err != nil {
+		h.log().Error("failed to create JetStream consumer",
+			appendStreamLogFields(plan,
+				zap.String("disconnect_reason", "subscription_failed"),
+				zap.Error(err),
+			)...,
+		)
+		http.Error(w, fmt.Sprintf("Failed to subscribe to requested topics: %s", strings.Join(plan.Topics, ", ")), http.StatusServiceUnavailable)
+		return nil
+	}
+	defer stream.close()
+
+	return h.serveStream(w, r, plan, stream.feed, runtime.shutdown)
 }
 
 // handleControlRequest short-circuits requests that aren't SSE subscriptions:
@@ -546,164 +512,63 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 // the lock for the duration of the connection.
 func (h *Handler) currentStreamRuntime() streamRuntime {
 	h.mu.RLock()
-	runtime := streamRuntime{conn: h.conn, js: h.js, shutdown: h.shutdown}
+	runtime := streamRuntime{js: h.js, shutdown: h.shutdown}
 	h.mu.RUnlock()
 	return runtime
 }
 
-// newMessageQueue creates the per-request fan-in channels used to ferry
-// JetStream messages from the NATS callback goroutine to the SSE writer.
-// Returns:
-//   - msgChan: the bounded buffer the SSE loop reads from.
-//   - slowClient: 1-slot signal channel; receives the offending subject when
-//     the buffer fills, telling the loop to disconnect rather than drop.
-//   - done: closed by cleanupStream to release the NATS callback if it is
-//     blocked trying to publish to a dead client.
-//   - enqueueMessage: the nats.MsgHandler the subscription is bound to.
+// readStreamSnapshot reads the JetStream stream metadata that planning needs:
+// first/last sequence for the start position and the replay cap, the
+// configured subjects to validate the requested topics, and, for replay
+// requests under a replay_window, the publish time of the resume message.
+// Every request reads it, since requests without a cursor start at
+// LastSeq+1. A failed read is logged and returns a zero-value snapshot, which
+// planning treats as "no snapshot information available".
 //
-// Buffer size comes from ClientBufferSize (defaults to defaultClientBufferSize).
-func (h *Handler) newMessageQueue() (chan *nats.Msg, chan string, chan struct{}, nats.MsgHandler) {
-	bufSize := h.ClientBufferSize
-	if bufSize <= 0 {
-		bufSize = defaultClientBufferSize
-	}
-	dispatchTimeout := time.Duration(h.DispatchTimeout) * time.Second
-	msgChan := make(chan *nats.Msg, bufSize)
-	done := make(chan struct{})
-	slowClient := make(chan string, 1)
-
-	enqueueMessage := func(msg *nats.Msg) {
-		select {
-		case <-done:
-			// Connection already torn down; drop silently rather than
-			// blocking the NATS callback indefinitely.
-			return
-		case msgChan <- msg:
-		default:
-			// Buffer is full: the client is consuming slower than the stream
-			// is producing. Signal the SSE loop to disconnect (the only safe
-			// option — accumulating would OOM, dropping would silently lose).
-			//
-			// An earlier iteration of this code added a runtime.Gosched()
-			// then retried before declaring the client slow, on the theory
-			// that a transient scheduler stall could fill msgChan briefly.
-			// In practice the yield gave the parallel SSE-writer goroutine
-			// time to drain one slot, which made the retry succeed and the
-			// slow-client detection never fire — TestPerformance_SlowReader-
-			// DisconnectsWithoutGoroutineLeak began missing its 3 s budget.
-			// Sensitivity beats leniency here: a slightly-slow client is
-			// still slow, and the slow-client metric+log accurately
-			// reflects what happened. The transient-stall concern is
-			// better addressed by raising ClientBufferSize.
-			h.signalSlowClient(slowClient, msg.Subject, done, dispatchTimeout)
-		}
-	}
-	return msgChan, slowClient, done, enqueueMessage
-}
-
-// signalSlowClient sends the subject of the message that overflowed the
-// client buffer to the SSE loop, so it can disconnect with a meaningful
-// log line. If timeout > 0 the send is bounded so a wedged loop cannot
-// deadlock the NATS callback goroutine; instead a warning is logged and
-// the message is effectively dropped at this point. The done channel
-// short-circuits the wait when the connection is being torn down.
-func (h *Handler) signalSlowClient(slowClient chan<- string, subject string, done <-chan struct{}, timeout time.Duration) {
-	if timeout <= 0 {
-		select {
-		case slowClient <- subject:
-		case <-done:
-		}
-		return
-	}
-
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case slowClient <- subject:
-	case <-done:
-	case <-timer.C:
-		metricsDispatchTimeouts.Inc()
-		h.log().Warn("timed out signaling slow SSE client",
-			zap.String("subject", subject),
-			zap.Int("dispatch_timeout_seconds", h.DispatchTimeout),
+// Both reads share one context bounded by defaultMetadataReadTimeout, so a
+// partially degraded JetStream cluster cannot stall a new SSE handshake past
+// the per-request budget while holding a Caddy handler goroutine and a
+// MaxConnections slot. The readiness probe (serveReadinessCheck) applies the
+// same pattern with the tighter defaultReadinessProbeTimeout.
+func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan streamPlan) streamInfoSnapshot {
+	readCtx, cancel := context.WithTimeout(ctx, defaultMetadataReadTimeout)
+	defer cancel()
+	stream, err := js.Stream(readCtx, h.StreamName)
+	if err != nil {
+		h.log().Warn("failed to read JetStream stream info for request planning",
+			appendStreamLogFields(plan, zap.Error(err))...,
 		)
+		return streamInfoSnapshot{}
 	}
-}
-
-// requestedMessageHandler wraps enqueueMessage with a subject filter. Used
-// for the multi-topic wildcard fallback (servers older than NATS 2.10 do
-// not support multi-filter consumers, so we subscribe to a common parent
-// subject and filter client-side).
-func (p streamPlan) requestedMessageHandler(enqueueMessage nats.MsgHandler) nats.MsgHandler {
-	return func(msg *nats.Msg) {
-		if _, ok := p.RequestedSubjects[msg.Subject]; !ok {
-			metricsWildcardFilterDrops.Inc()
-			return
-		}
-		enqueueMessage(msg)
+	info := stream.CachedInfo()
+	snapshot := streamInfoSnapshot{
+		HasSnapshot: true,
+		FirstSeq:    info.State.FirstSeq,
+		LastSeq:     info.State.LastSeq,
+		Subjects:    info.Config.Subjects,
 	}
-}
-
-// readStreamSnapshot fetches the JetStream stream metadata needed for
-// planning, but only when planning actually depends on it: replay requests
-// (need first/last sequence and the start-sequence timestamp for window
-// checks) or multi-topic requests (need configured subjects to validate
-// each topic against the stream filter). Single-topic, no-replay requests
-// skip the round trip entirely. Read failures are logged at debug and
-// return a zero-value snapshot, which downstream code treats as "no
-// snapshot info available".
-//
-// Both metadata reads are bounded by nats.MaxWait(defaultMetadataReadTimeout)
-// so a partially-degraded JetStream cluster cannot stall a new SSE handshake
-// past the per-request budget — without it the calls inherit nats.go's 5s
-// library default and each new subscription would hold a Caddy handler
-// goroutine and consume a MaxConnections slot while the cluster is unhealthy.
-// The readiness probe (serveReadinessCheck) already applies the same pattern
-// with the tighter defaultReadinessProbeTimeout; this is the request-path
-// counterpart. nats.Context is intentionally NOT propagated here: in nats.go
-// passing a non-nil ctx to JS opts takes precedence over MaxWait, which would
-// either disable the bound (no deadline on the inbound request) or invalidate
-// the cached embedded-server StreamInfo response in tests — so the bounded
-// MaxWait carries the protection on its own.
-func (h *Handler) readStreamSnapshot(js streamMetadataReader, plan streamPlan) streamInfoSnapshot {
-	if plan.Replay.HasLastID || len(plan.FullSubjects) > 1 {
-		jsOpts := []nats.JSOpt{nats.MaxWait(defaultMetadataReadTimeout)}
-		if info, infoErr := js.StreamInfo(h.StreamName, jsOpts...); infoErr == nil {
-			snapshot := streamInfoSnapshot{
-				HasSnapshot: true,
-				FirstSeq:    info.State.FirstSeq,
-				LastSeq:     info.State.LastSeq,
-				Subjects:    info.Config.Subjects,
-			}
-			if plan.Replay.HasLastID && h.ReplayWindow > 0 && plan.Replay.StartSequence >= info.State.FirstSeq {
-				if msg, err := js.GetMsg(h.StreamName, plan.Replay.StartSequence, jsOpts...); err == nil {
-					snapshot.StartSequenceTime = msg.Time
-					snapshot.HasStartSequenceTime = true
-				} else {
-					h.log().Debug("failed to read replay start sequence timestamp",
-						appendStreamLogFields(plan, zap.Error(err))...,
-					)
-				}
-			}
-			return snapshot
+	if plan.Replay.HasLastID && h.ReplayWindow > 0 && plan.Replay.StartSequence >= info.State.FirstSeq {
+		if msg, err := stream.GetMsg(readCtx, plan.Replay.StartSequence); err == nil {
+			snapshot.StartSequenceTime = msg.Time
+			snapshot.HasStartSequenceTime = true
 		} else {
-			h.log().Debug("failed to read StreamInfo for request pre-check",
-				appendStreamLogFields(plan, zap.Error(infoErr))...,
+			h.log().Debug("failed to read replay start sequence timestamp",
+				appendStreamLogFields(plan, zap.Error(err))...,
 			)
 		}
 	}
-	return streamInfoSnapshot{}
+	return snapshot
 }
 
 // planSubscription finalises the streamPlan in the light of the JetStream
-// snapshot. It detects topics that the configured stream does not allow
-// (multi-topic only — single-topic subscribe failures surface at subscribe
-// time as a clearer error), and rewrites the replay plan to a fallback
-// when the requested sequence is below retention or outside the configured
-// replay_window. Idempotent: calling it twice with the same snapshot yields
-// the same result.
+// snapshot. It rejects topics that the configured stream's subjects do not
+// cover (current nats-servers would otherwise create a consumer that silently
+// delivers nothing), gives requests without a cursor an explicit start
+// sequence, and rewrites the replay plan to a fallback when the requested
+// sequence is below retention or outside the configured replay_window.
+// Idempotent: calling it twice with the same snapshot yields the same result.
 func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot) streamPlan {
-	if len(plan.FullSubjects) > 1 && len(snapshot.Subjects) > 0 {
+	if len(snapshot.Subjects) > 0 {
 		for idx, fullSubject := range plan.FullSubjects {
 			if !subjectAllowedByStream(fullSubject, snapshot.Subjects) {
 				plan.FailedTopics = append(plan.FailedTopics, plan.Topics[idx])
@@ -713,14 +578,21 @@ func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot)
 	if len(plan.FailedTopics) > 0 {
 		return plan
 	}
-	if plan.Replay.HasLastID {
-		plan.Replay.CapSequence = snapshot.LastSeq
-		plan.Replay.HasSnapshot = snapshot.HasSnapshot
-		if snapshot.FirstSeq > 0 && plan.Replay.StartSequence < snapshot.FirstSeq {
-			plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence below retention")
-		} else if h.shouldUseReplayWindow(plan.Replay, snapshot) {
-			plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence outside replay window")
+	if !plan.Replay.HasLastID {
+		// Start right after the snapshot's last message. The connected event
+		// then carries that position as its id, so a client that disconnects
+		// before its first message still resumes without a gap.
+		if snapshot.HasSnapshot {
+			plan.Replay.StartSequence = snapshot.LastSeq + 1
 		}
+		return plan
+	}
+	plan.Replay.CapSequence = snapshot.LastSeq
+	plan.Replay.HasSnapshot = snapshot.HasSnapshot
+	if snapshot.FirstSeq > 0 && plan.Replay.StartSequence < snapshot.FirstSeq {
+		plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence below retention")
+	} else if h.shouldUseReplayWindow(plan.Replay, snapshot) {
+		plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence outside replay window")
 	}
 	return plan
 }
@@ -773,163 +645,24 @@ func (h *Handler) replayWindowStart() time.Time {
 	return time.Now().Add(-time.Duration(h.ReplayWindow) * time.Second)
 }
 
-// subscriptionOptions translates the resolved replay plan into the SubOpts
-// that JetStream expects. Always pins the consumer to the configured stream
-// (BindStream), disables acks (AckNone) — NUTS is read-only and replay is
-// driven entirely by start position, not by ack state — and sets an
-// explicit InactiveThreshold so server-side consumer state is reaped
-// promptly after a client disconnect (default 30s; see
-// defaultConsumerInactiveThreshold for rationale).
-//
-// When h.NatsIdleHeartbeat > 0 (the M9 Batch A default is 10s), also
-// requests server-side IdleHeartbeat. Without it, an ephemeral
-// consumer reaped by InactiveThreshold during a network blip, or one
-// lost during a leafnode route failover, stays attached to the SSE
-// handler silently — the SSE-layer heartbeat ticker (serve.go's
-// HeartbeatInterval) only proves the HTTP socket is open, not that
-// the JetStream push path is live. A negative value is the operator-
-// disable sentinel and skips the SubOpt append entirely.
-//
-// Batch A surfaces a missed heartbeat as
-// nuts_nats_async_errors_total{kind="consumer_invalidated"};
-// Batch B (#54) will terminate the affected SSE handler with
-// disconnect_reason=consumer_invalidated. Validate enforces
-// NatsIdleHeartbeat < defaultConsumerInactiveThreshold/2 so two
-// missed heartbeats are detectable before the server reaps.
-func (h *Handler) subscriptionOptions(plan streamPlan) []nats.SubOpt {
-	opts := []nats.SubOpt{
-		nats.BindStream(h.StreamName),
-		nats.AckNone(),
-		nats.InactiveThreshold(defaultConsumerInactiveThreshold),
-	}
-	if h.NatsIdleHeartbeat > 0 {
-		opts = append(opts, nats.IdleHeartbeat(time.Duration(h.NatsIdleHeartbeat)*time.Second))
-	}
-	switch plan.Replay.Mode {
-	case replayModeStartSequence:
-		opts = append(opts, nats.StartSequence(plan.Replay.StartSequence))
-		h.log().Debug("subscribing from sequence",
-			appendStreamLogFields(plan, zap.Uint64("start_sequence", plan.Replay.StartSequence))...,
-		)
-	case replayModeFallbackStartTime:
-		metricsReplayFallbacks.Inc()
-		start := plan.Replay.StartTime
-		if start.IsZero() {
-			start = h.replayWindowStart()
-		}
-		opts = append(opts, nats.StartTime(start))
-		h.log().Warn("replay fallback: using time-bounded window",
-			appendStreamLogFields(plan,
-				zap.Uint64("requested_sequence", plan.Replay.StartSequence),
-				zap.String("reason", plan.Replay.FallbackReason),
-				zap.Int("replay_window_seconds", h.ReplayWindow),
-				zap.Time("replay_window_start", start),
-			)...,
-		)
-	case replayModeFallbackDeliverAll:
-		metricsReplayFallbacks.Inc()
-		opts = append(opts, nats.DeliverAll())
-		h.log().Warn("replay fallback: delivering all retained messages",
-			appendStreamLogFields(plan,
-				zap.Uint64("requested_sequence", plan.Replay.StartSequence),
-				zap.String("reason", plan.Replay.FallbackReason),
-			)...,
-		)
-	default:
-		opts = append(opts, nats.DeliverNew())
-	}
-	return opts
-}
-
-// executeSubscriptionPlan opens the JetStream subscription that backs the
-// SSE stream. If the initial subscribe fails specifically because the
-// requested StartSequence is unreachable, it retries once via the
-// replay-fallback path so a transient race between StreamInfo (used for
-// planning) and Subscribe (which actually positions the consumer) does not
-// surface as a 503 to the client.
-func (h *Handler) executeSubscriptionPlan(js nats.JetStreamContext, conn *nats.Conn, plan streamPlan, enqueueMessage, enqueueRequestedMessage nats.MsgHandler) subscriptionResult {
-	if len(plan.FailedTopics) > 0 {
-		// Planning-time topic rejection (subject not allowed by the
-		// stream's configured subjects) hits the same 503 path as a
-		// subscribe-time failure below; align the metric so the
-		// nuts_subscription_errors_total alert fires for both shapes.
-		metricsSubscriptionErrors.Inc()
-		return subscriptionResult{FailedTopics: append([]string{}, plan.FailedTopics...)}
-	}
-
-	activePlan := plan
-	sub, err := h.subscribeWithPlan(js, conn, activePlan, enqueueMessage, enqueueRequestedMessage)
-	if err != nil && !activePlan.Replay.Mode.isFallback() && isReplayStartSequenceError(err, activePlan.Replay.HasLastID) {
-		activePlan.Replay = h.fallbackReplayPlan(activePlan.Replay, "subscribe-time start sequence error")
-		sub, err = h.subscribeWithPlan(js, conn, activePlan, enqueueMessage, enqueueRequestedMessage)
-	}
-	if err != nil {
-		metricsSubscriptionErrors.Inc()
-		if len(activePlan.FullSubjects) == 1 {
-			h.log().Error("failed to subscribe to topic",
-				appendStreamLogFields(activePlan, zap.Error(err))...,
-			)
-			return subscriptionResult{FailedTopics: []string{activePlan.Topics[0]}}
-		}
-		h.log().Error("failed to subscribe to topics",
-			appendStreamLogFields(activePlan, zap.Error(err))...,
-		)
-		return subscriptionResult{FailedTopics: append([]string{}, activePlan.Topics...)}
-	}
-
-	if len(activePlan.FullSubjects) == 1 {
-		h.log().Debug("subscribed to topic", streamLogFields(activePlan)...)
-	} else {
-		h.log().Debug("subscribed to topics", streamLogFields(activePlan)...)
-	}
-	return subscriptionResult{
-		Subscriptions: []*nats.Subscription{sub},
-	}
-}
-
-// subscribeWithPlan opens one JetStream subscription that satisfies the
-// plan. Single-topic uses Subscribe directly; multi-topic dispatches to
-// subscribeToMultipleTopics, which picks between native multi-filter
-// (NATS 2.10+) and the wildcard-with-client-filter fallback.
-func (h *Handler) subscribeWithPlan(js nats.JetStreamContext, conn *nats.Conn, plan streamPlan, enqueueMessage, enqueueRequestedMessage nats.MsgHandler) (*nats.Subscription, error) {
-	opts := h.subscriptionOptions(plan)
-	if len(plan.FullSubjects) == 1 {
-		return js.Subscribe(plan.FullSubjects[0], enqueueMessage, opts...)
-	}
-	return h.subscribeToMultipleTopics(js, plan, opts, enqueueRequestedMessage, supportsMultiFilterSubjects(conn), connectedServerVersion(conn))
-}
-
-// cleanupStream tears down a request's NATS subscriptions and signals the
-// message-queue side via the done channel. Closing done first releases any
-// NATS callback that may still be blocked on a slow-client signal so it
-// doesn't outlive the request. Unsubscribe failures are logged but not
-// propagated — there's nothing the caller can do about them.
-func (h *Handler) cleanupStream(done chan struct{}, subscriptions []*nats.Subscription) {
-	close(done)
-	for _, sub := range subscriptions {
-		if err := sub.Unsubscribe(); err != nil {
-			h.log().Warn("failed to unsubscribe",
-				zap.String("topic", sub.Subject),
-				zap.Error(err))
-		}
-	}
-}
-
 // serveStream is the SSE writer loop. It writes the response headers and the
-// initial "connected" event, then multiplexes between four sources until any
+// initial "connected" event, then multiplexes between these sources until one
 // of them terminates the connection:
 //
-//   - shutdown    — Cleanup() closing the handler-wide channel.
-//   - slowClient  — the message queue overflowed; disconnect to protect us.
-//   - ctx.Done()  — the HTTP client closed or timed out.
-//   - msgChan     — a JetStream message to format and flush.
-//   - heartbeat.C — periodic SSE comment to keep proxies from closing idle
+//   - shutdown     — Cleanup() closing the handler-wide channel.
+//   - ctx.Done()   — the HTTP client closed or timed out.
+//   - feed.errs    — the ordered consumer could not be recreated.
+//   - feed.frames  — a formatted JetStream message to write and flush.
+//   - heartbeat.C  — periodic SSE comment to keep proxies from closing idle
 //     connections.
+//
+// A slow client is one whose writes miss the write_timeout deadline; the
+// feed never overflows, because it stops pulling while the writer is busy.
 //
 // Returns nil on every termination path: SSE has no notion of an HTTP error
 // after streaming has begun, so all exits are observable as a normal
 // connection close.
-func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan streamPlan, msgChan <-chan *nats.Msg, slowClient <-chan string, shutdown <-chan struct{}) error {
+func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan streamPlan, feed *streamFeed, shutdown <-chan struct{}) error {
 	metricsActiveConnections.Inc()
 	defer metricsActiveConnections.Dec()
 	writeTimeout := time.Duration(h.WriteTimeout) * time.Second
@@ -950,16 +683,8 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 		w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"nuts\"", h.HubURL))
 	}
 
-	if err := writeSSEChunkWithTimeout(w, rc, formatConnectedEvent(plan.Topics), writeTimeout); err != nil {
-		metricsWriteDisconnects.WithLabelValues("connected").Inc()
-		h.log().Warn("failed to write connected event",
-			appendStreamLogFields(plan,
-				zap.String("disconnect_reason", "write_error"),
-				zap.String("write_site", "connected"),
-				zap.Int("write_timeout_seconds", h.WriteTimeout),
-				zap.Error(err),
-			)...,
-		)
+	if err := writeSSEChunkWithTimeout(w, rc, formatConnectedEvent(plan), writeTimeout); err != nil {
+		h.recordWriteDisconnect(plan, "connected", err)
 		return nil
 	}
 
@@ -967,6 +692,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 	defer heartbeat.Stop()
 
 	replayDelivered := 0
+	consumerName := ""
 
 	ctx := r.Context()
 	for {
@@ -974,17 +700,6 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 		case <-shutdown:
 			h.log().Debug("handler shutting down; closing SSE stream",
 				appendStreamLogFields(plan, zap.String("disconnect_reason", "handler_shutdown"))...,
-			)
-			return nil
-
-		case slowTopic := <-slowClient:
-			metricsSlowClientDisconnects.Inc()
-			h.log().Warn("disconnecting slow SSE client before dropping messages",
-				appendStreamLogFields(plan,
-					zap.String("disconnect_reason", "slow_client"),
-					zap.String("slow_subject", slowTopic),
-					zap.Int("buffer_size", cap(msgChan)),
-				)...,
 			)
 			return nil
 
@@ -997,33 +712,36 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 			)
 			return nil
 
-		case msg := <-msgChan:
-			// msgChan is never closed (enqueueMessage is the sole sender
-			// and only ever pushes non-nil *nats.Msg). No nil-guard needed.
-			formatted := h.formatMessageEvent(msg, time.Now())
-			if formatted.MetadataErr != nil {
-				h.log().Warn("failed to read JetStream metadata",
-					appendStreamLogFields(plan,
-						zap.String("message_subject", formatted.Subject),
-						zap.Error(formatted.MetadataErr),
-					)...,
-				)
+		case err := <-feed.errs:
+			metricsConsumerInvalidated.WithLabelValues("unrecoverable").Inc()
+			h.log().Warn("closing SSE stream: JetStream consumer could not be recreated",
+				appendStreamLogFields(plan,
+					zap.String("disconnect_reason", "consumer_unrecoverable"),
+					zap.Error(err),
+				)...,
+			)
+			return nil
+
+		case formatted := <-feed.frames:
+			if formatted.ConsumerName != "" {
+				if consumerName != "" && formatted.ConsumerName != consumerName {
+					metricsConsumerInvalidated.WithLabelValues("recreated").Inc()
+					h.log().Info("JetStream consumer recreated; delivery resumed after the last delivered message",
+						appendStreamLogFields(plan,
+							zap.String("previous_consumer", consumerName),
+							zap.String("consumer", formatted.ConsumerName),
+							zap.Uint64("resumed_at_sequence", formatted.StreamSequence),
+						)...,
+					)
+				}
+				consumerName = formatted.ConsumerName
 			}
-			if !h.finalizeStreamedMessage(plan, formatted) {
+			if shouldSkipReplayWindowMessage(plan, formatted) {
 				continue
 			}
 
 			if err := writeSSEChunkWithTimeout(w, rc, formatted.Frame, writeTimeout); err != nil {
-				metricsWriteDisconnects.WithLabelValues("message").Inc()
-				h.log().Warn("failed to write message event",
-					appendStreamLogFields(plan,
-						zap.String("disconnect_reason", "write_error"),
-						zap.String("write_site", "message"),
-						zap.String("message_subject", msg.Subject),
-						zap.Int("write_timeout_seconds", h.WriteTimeout),
-						zap.Error(err),
-					)...,
-				)
+				h.recordWriteDisconnect(plan, "message", err, zap.String("message_subject", formatted.Subject))
 				return nil
 			}
 			metricsMessagesDelivered.Inc()
@@ -1045,35 +763,37 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 
 		case <-heartbeat.C:
 			if err := writeSSEChunkWithTimeout(w, rc, formatHeartbeatEvent(time.Now()), writeTimeout); err != nil {
-				metricsWriteDisconnects.WithLabelValues("heartbeat").Inc()
-				h.log().Warn("failed to write heartbeat",
-					appendStreamLogFields(plan,
-						zap.String("disconnect_reason", "heartbeat_write_error"),
-						zap.String("write_site", "heartbeat"),
-						zap.Int("write_timeout_seconds", h.WriteTimeout),
-						zap.Error(err),
-					)...,
-				)
+				h.recordWriteDisconnect(plan, "heartbeat", err)
 				return nil
 			}
 		}
 	}
 }
 
-// finalizeStreamedMessage handles the side effects of a formatted message
-// just received from the JetStream subscription, then reports whether it
-// should be written to the SSE response. Returns false when the message
-// was Dropped (and recorded to metrics) or when it falls outside the
-// active replay window.
-func (h *Handler) finalizeStreamedMessage(plan streamPlan, formatted formattedMessageEvent) bool {
-	if formatted.Dropped {
-		h.recordDroppedMessage(formatted)
-		return false
+// recordWriteDisconnect logs and counts a stream that ended on a failed write.
+// A write that missed its write_timeout deadline means the client stopped
+// reading: that is the slow-client case now that backpressure keeps the feed
+// from ever overflowing.
+func (h *Handler) recordWriteDisconnect(plan streamPlan, site string, err error, fields ...zap.Field) {
+	metricsWriteDisconnects.WithLabelValues(site).Inc()
+	reason := "write_error"
+	message := "failed to write " + site + " event"
+	if site == "heartbeat" {
+		reason = "heartbeat_write_error"
+		message = "failed to write heartbeat"
 	}
-	if shouldSkipReplayWindowMessage(plan, formatted) {
-		return false
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		metricsSlowClientDisconnects.Inc()
+		reason = "slow_client"
 	}
-	return true
+	h.log().Warn(message,
+		appendStreamLogFields(plan, append([]zap.Field{
+			zap.String("disconnect_reason", reason),
+			zap.String("write_site", site),
+			zap.Int("write_timeout_seconds", h.WriteTimeout),
+			zap.Error(err),
+		}, fields...)...)...,
+	)
 }
 
 // shouldSkipReplayWindowMessage filters out messages that JetStream
@@ -1122,9 +842,30 @@ func (h *Handler) countsTowardReplayCap(plan streamPlan, formatted formattedMess
 // formatConnectedEvent renders the SSE handshake event sent immediately
 // after headers. Useful for clients that want to confirm the subscription
 // landed on the topics they expected (after path-shorthand expansion or
-// authorization-driven topic filtering).
-func formatConnectedEvent(topics []string) string {
-	return fmt.Sprintf("event: connected\ndata: {\"topics\":%s}\n\n", toJSON(topics))
+// authorization-driven topic filtering). It carries the stream position the
+// consumer starts after as its id, so a client that reconnects before its
+// first message resumes from there instead of from "now".
+func formatConnectedEvent(plan streamPlan) string {
+	var event strings.Builder
+	if id, ok := connectedEventID(plan); ok {
+		event.WriteString("id: ")
+		event.WriteString(strconv.FormatUint(id, 10))
+		event.WriteString("\n")
+	}
+	event.WriteString("event: connected\ndata: {\"topics\":")
+	event.WriteString(toJSON(plan.Topics))
+	event.WriteString("}\n\n")
+	return event.String()
+}
+
+// connectedEventID is the last sequence before the consumer's explicit start
+// position. Fallback plans have none: the client keeps its previous cursor,
+// which replans to the same fallback on reconnect.
+func connectedEventID(plan streamPlan) (uint64, bool) {
+	if plan.Replay.Mode.isFallback() || plan.Replay.StartSequence == 0 {
+		return 0, false
+	}
+	return plan.Replay.StartSequence - 1, true
 }
 
 // formatHeartbeatEvent renders an SSE comment line ("colon-prefixed"
@@ -1134,19 +875,25 @@ func formatHeartbeatEvent(now time.Time) string {
 	return fmt.Sprintf(": heartbeat %s\n\n", now.UTC().Format(time.RFC3339))
 }
 
-// formatMessageEvent turns a NATS message into a fully rendered SSE frame
+// formatMessageEvent turns a JetStream message into a fully rendered SSE frame
 // (or a Dropped record). Drops are decided in two places:
 //
 //  1. Before any work: if the raw NATS payload exceeds MaxEventSize, we
 //     bail before parsing JSON or building the envelope.
 //  2. After rendering: if the JSON-wrapped frame exceeds MaxEventSize.
 //
-// JetStream metadata read failures do not drop the message — we render
-// with `now` as the timestamp and no `id:` field so a metadata blip
-// doesn't take the stream down — but the error is surfaced to the caller
-// so it can be logged once.
-func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMessageEvent {
-	formatted := formattedMessageEvent{Subject: msg.Subject}
+// A message without JetStream metadata is still rendered, with `now` as the
+// timestamp and no `id:` field, so a metadata blip doesn't take the stream
+// down; the error is surfaced to the caller so it can be logged once.
+func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formattedMessageEvent {
+	formatted := formattedMessageEvent{Subject: msg.Subject, MetadataErr: msg.MetadataErr}
+	if msg.HasMetadata {
+		formatted.StreamSequence = msg.StreamSequence
+		formatted.HasStreamSequence = true
+		formatted.MessageTime = msg.Timestamp
+		formatted.HasMessageTime = true
+		formatted.ConsumerName = msg.ConsumerName
+	}
 	if h.MaxEventSize > 0 && len(msg.Data) > h.MaxEventSize {
 		formatted.Dropped = true
 		formatted.DropReason = dropReasonRawPayload
@@ -1158,34 +905,19 @@ func (h *Handler) formatMessageEvent(msg *nats.Msg, now time.Time) formattedMess
 		Topic:   strings.TrimPrefix(msg.Subject, h.TopicPrefix),
 		Payload: tryParseJSON(msg.Data),
 	}
-	// Format the timestamp once, lazily: when JetStream metadata is present
-	// (the common case) we use meta.Timestamp; otherwise we fall back to
-	// `now`. Doing this after the metadata check avoids the wasted
-	// now.UTC().Format(time.RFC3339) allocation that the previous version
-	// always performed and then immediately overwrote.
-	var eventID uint64
-	hasEventID := false
-	meta, metaErr := msg.Metadata()
-	if metaErr != nil {
-		formatted.MetadataErr = metaErr
-		payload.Time = now.UTC().Format(time.RFC3339)
+	if msg.HasMetadata {
+		payload.Time = msg.Timestamp.UTC().Format(time.RFC3339)
 	} else {
-		payload.Time = meta.Timestamp.UTC().Format(time.RFC3339)
-		eventID = meta.Sequence.Stream
-		hasEventID = true
-		formatted.StreamSequence = eventID
-		formatted.HasStreamSequence = true
-		formatted.MessageTime = meta.Timestamp
-		formatted.HasMessageTime = true
+		payload.Time = now.UTC().Format(time.RFC3339)
 	}
 
 	// Pre-size the SSE frame builder to avoid reallocations: payload + a
 	// rough envelope budget (id/event/data lines plus JSON wrapper).
 	var event strings.Builder
 	event.Grow(len(msg.Data) + 128)
-	if hasEventID {
+	if msg.HasMetadata {
 		event.WriteString("id: ")
-		event.WriteString(strconv.FormatUint(eventID, 10))
+		event.WriteString(strconv.FormatUint(msg.StreamSequence, 10))
 		event.WriteString("\n")
 	}
 	event.WriteString("event: message\n")
@@ -1218,143 +950,18 @@ func (h *Handler) recordDroppedMessage(formatted formattedMessageEvent) {
 	case dropReasonRawPayload:
 		h.log().Warn("dropping oversized NATS payload",
 			zap.String("topic", formatted.Subject),
+			zap.Uint64("stream_sequence", formatted.StreamSequence),
 			zap.Int("payload_size", formatted.DropSize),
 			zap.Int("max_event_size", h.MaxEventSize),
 		)
 	case dropReasonFormattedSSEMessage:
 		h.log().Warn("dropping oversized SSE event",
 			zap.String("topic", formatted.Subject),
+			zap.Uint64("stream_sequence", formatted.StreamSequence),
 			zap.Int("event_size", formatted.DropSize),
 			zap.Int("max_event_size", h.MaxEventSize),
 		)
 	}
-}
-
-// subscribeToMultipleTopics opens one consumer that delivers every
-// requested subject. Two paths:
-//
-//   - useMultiFilter (NATS 2.10+): use ConsumerFilterSubjects, the
-//     server-side multi-filter API. Server delivers only the requested
-//     subjects, no client-side filtering needed.
-//   - fallback (older servers): subscribe to the smallest common
-//     wildcard parent subject and rely on requestedMessageHandler to
-//     drop subjects the request didn't ask for. This wastes some bandwidth
-//     when sibling subjects are busy, but keeps the feature usable on
-//     older servers; we log a warning so operators notice.
-func (h *Handler) subscribeToMultipleTopics(js nats.JetStreamContext, plan streamPlan, opts []nats.SubOpt, cb nats.MsgHandler, useMultiFilter bool, serverVersion string) (*nats.Subscription, error) {
-	if useMultiFilter {
-		filterOpts := append([]nats.SubOpt{}, opts...)
-		filterOpts = append(filterOpts, nats.ConsumerFilterSubjects(plan.FullSubjects...))
-		return js.Subscribe("", cb, filterOpts...)
-	}
-
-	wildcardSubject := commonSubjectFilter(plan.FullSubjects)
-	h.log().Warn("NATS server does not support multi-filter consumers; using common wildcard subscription",
-		appendStreamLogFields(plan,
-			zap.String("wildcard_subject", wildcardSubject),
-			zap.String("server_version", serverVersion),
-		)...,
-	)
-	return js.Subscribe(wildcardSubject, cb, opts...)
-}
-
-// supportsMultiFilterSubjects reports whether the connected NATS server is
-// new enough to support ConsumerFilterSubjects (multi-filter consumers,
-// added in NATS 2.10).
-func supportsMultiFilterSubjects(conn *nats.Conn) bool {
-	return supportsMultiFilterSubjectsVersion(connectedServerVersion(conn))
-}
-
-// supportsMultiFilterSubjectsVersion is the version-string-only half of
-// supportsMultiFilterSubjects, exposed separately so it can be unit-tested
-// without standing up a NATS server.
-func supportsMultiFilterSubjectsVersion(version string) bool {
-	major, minor, ok := parseMajorMinorVersion(version)
-	if !ok {
-		// Unknown version → assume unsupported and use the wildcard fallback.
-		return false
-	}
-	return major > 2 || (major == 2 && minor >= 10)
-}
-
-// connectedServerVersion returns the version reported by the currently
-// connected NATS server, or "" if the connection isn't established.
-func connectedServerVersion(conn *nats.Conn) string {
-	if conn == nil {
-		return ""
-	}
-	return conn.ConnectedServerVersion()
-}
-
-// parseMajorMinorVersion extracts the MAJOR and MINOR components from a
-// semver-ish string (with optional leading "v" and "-pre"/"+build" suffix).
-// Returns ok=false if the string can't be parsed; callers should treat that
-// as an unknown / unsupported version.
-func parseMajorMinorVersion(version string) (int, int, bool) {
-	version = strings.TrimPrefix(version, "v")
-	if cut := strings.IndexAny(version, "-+"); cut >= 0 {
-		version = version[:cut]
-	}
-	parts := strings.Split(version, ".")
-	if len(parts) < 2 {
-		return 0, 0, false
-	}
-	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return 0, 0, false
-	}
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, 0, false
-	}
-	return major, minor, true
-}
-
-// commonSubjectFilter returns the narrowest single wildcard NATS subject
-// that matches every input subject. Used by the older-server fallback in
-// subscribeToMultipleTopics.
-//
-// Examples:
-//
-//	["a.b.c", "a.b.d"]   → "a.b.>"
-//	["a.b", "a.c"]       → "a.>"
-//	["a.b", "x.y"]       → ">"
-//	["a.b.c", "a.b"]     → "a.>"   (the second is a parent of the first)
-//
-// The trim-by-one step at the end handles the parent/child case: if any
-// input subject is exactly the length of the common prefix, the prefix
-// itself can't be the wildcard subject (it would be too narrow), so we
-// drop one token before appending ">".
-func commonSubjectFilter(subjects []string) string {
-	if len(subjects) == 0 {
-		return ">"
-	}
-	common := strings.Split(subjects[0], ".")
-	for _, subject := range subjects[1:] {
-		parts := strings.Split(subject, ".")
-		limit := len(common)
-		if len(parts) < limit {
-			limit = len(parts)
-		}
-		idx := 0
-		for idx < limit && common[idx] == parts[idx] {
-			idx++
-		}
-		common = common[:idx]
-		if len(common) == 0 {
-			return ">"
-		}
-	}
-	for _, subject := range subjects {
-		if len(strings.Split(subject, ".")) == len(common) {
-			common = common[:len(common)-1]
-			break
-		}
-	}
-	if len(common) == 0 {
-		return ">"
-	}
-	return strings.Join(common, ".") + ".>"
 }
 
 // subjectAllowedByStream reports whether the configured stream's subject
@@ -1609,7 +1216,9 @@ func (h *Handler) serveReadinessCheck(w http.ResponseWriter) error {
 		// Bound the JetStream call so a partially-degraded server can't stall
 		// the probe past the orchestrator's readiness budget. See
 		// defaultReadinessProbeTimeout for rationale.
-		_, err := js.StreamInfo(h.StreamName, nats.MaxWait(defaultReadinessProbeTimeout))
+		ctx, cancel := context.WithTimeout(context.Background(), defaultReadinessProbeTimeout)
+		_, err := js.Stream(ctx, h.StreamName)
+		cancel()
 		if err != nil {
 			resp.Status = "degraded"
 			resp.Stream = "unavailable"

@@ -40,24 +40,24 @@ var (
 		Help:      "Total number of messages dropped during SSE formatting. Labelled by drop reason.",
 	}, []string{"reason"})
 
-	// nuts_wildcard_filter_drops_total counts how many JetStream messages
-	// were silently filtered client-side by the multi-topic wildcard
-	// fallback path (servers older than NATS 2.10 that lack
-	// ConsumerFilterSubjects). A non-zero value means the wildcard
-	// subscription is wasting bandwidth on subjects no client requested;
-	// operators can use this to size the move to NATS >= 2.10.
-	metricsWildcardFilterDrops = promauto.NewCounter(prometheus.CounterOpts{
+	// nuts_wildcard_filter_drops_total is deprecated: it counted messages the
+	// pre-NATS-2.10 multi-topic wildcard fallback filtered client-side. That
+	// fallback is gone (nats-server >= 2.10 is required), so the series stays
+	// at zero until it is removed in the next major release.
+	_ = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "wildcard_filter_drops_total",
-		Help:      "Total number of messages dropped by the multi-topic wildcard fallback's client-side filter (subjects not requested by the client).",
+		Help:      "Deprecated, always 0: the pre-NATS-2.10 multi-topic wildcard fallback was removed.",
 	})
 
-	// nuts_slow_client_disconnects_total counts clients that were
-	// disconnected because their per-connection buffer was full.
+	// nuts_slow_client_disconnects_total counts clients disconnected because
+	// a write missed its write_timeout deadline: the client stopped reading.
+	// A client that is merely slower than JetStream is throttled by the pull
+	// consumer instead and never counted here.
 	metricsSlowClientDisconnects = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "slow_client_disconnects_total",
-		Help:      "Total number of clients disconnected due to slow consumption.",
+		Help:      "Total number of clients disconnected because a write missed its write_timeout deadline.",
 	})
 
 	// nuts_replay_requests_total counts how many times clients connected
@@ -101,15 +101,13 @@ var (
 		Help:      "Total number of replaying SSE connections closed after replay_max_messages was reached.",
 	})
 
-	// nuts_dispatch_timeout_total counts how often the NATS callback gave up
-	// waiting to signal a slow SSE client because dispatch_timeout fired.
-	// Distinct from nuts_slow_client_disconnects_total: that counter ticks
-	// when the SSE loop observed the slow-client signal and disconnected;
-	// this one ticks when the signal itself could not be delivered.
-	metricsDispatchTimeouts = promauto.NewCounter(prometheus.CounterOpts{
+	// nuts_dispatch_timeout_total is deprecated along with dispatch_timeout:
+	// the pull consumer has no queue hand-off that can time out. The series
+	// stays at zero until it is removed in the next major release.
+	_ = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "dispatch_timeout_total",
-		Help:      "Total number of NATS callbacks that timed out signalling a slow SSE client.",
+		Help:      "Deprecated, always 0: dispatch_timeout has no effect since the pull consumer replaced the push queue.",
 	})
 
 	// nuts_nats_async_errors_total counts asynchronous errors reported by
@@ -144,42 +142,21 @@ var (
 		Help:      "Total number of asynchronous NATS client errors observed by the registered ErrorHandler. Labelled by kind: slow_consumer, timeout, connection_state, consumer_invalidated, other.",
 	}, []string{"kind"})
 
-	// nuts_consumer_invalidated_total — declared in M9 Batch A
-	// (#M9-1) so the series is visible at /metrics from day one;
-	// populated by M9 Batch B (#M9-5) from the serveStream
-	// consumer_invalidated termination arm. During Batch A the
-	// series is permastuck at zero and the SSE handler is NOT
-	// disconnected on heartbeat miss; the Help string below is
-	// phrased to reflect that current behaviour rather than the
-	// post-Batch-B contract, so an operator reading /metrics
-	// without source access can tell which milestone has shipped.
+	// nuts_consumer_invalidated_total counts JetStream consumer failures
+	// under live SSE streams, by reason:
 	//
-	// Reason labels (kept in lockstep with the classifyNATSAsync
-	// Error label set, so a Batch B implementer routing the
-	// classifier output to a reason label has one mapping to
-	// follow, not two):
-	//
-	//   - heartbeat_missed: from kind=consumer_invalidated. Covers
-	//                      all three nats.go errors that classifier
-	//                      buckets there: ErrConsumerNotActive
-	//                      (primary heartbeat-miss path),
-	//                      ErrConsumerDeleted (forward-compat),
-	//                      *ErrConsumerSequenceMismatch (sequence
-	//                      drift). The earlier Phase 1 attribution
-	//                      that wired heartbeat_missed only to
-	//                      *ErrConsumerSequenceMismatch was the bug
-	//                      the Batch A hardening (104299f) caught
-	//                      and corrected — this comment is the
-	//                      authoritative wiring spec for Batch B.
-	//   - slow_consumer:   from kind=slow_consumer (nats.ErrSlowConsumer
-	//                      at the nats.go library layer; distinct from
-	//                      nuts_slow_client_disconnects_total which
-	//                      fires when the SSE writer falls behind
-	//                      NUTS' bounded msgChan one layer downstream).
+	//   - recreated:     the ordered consumer recreated itself after a
+	//                    delivery gap, a NATS reconnect or missed
+	//                    heartbeats (consumer reaped, deleted or lost), and
+	//                    delivery resumed after the last delivered message.
+	//                    The client noticed nothing.
+	//   - unrecoverable: recreation kept failing, so the SSE stream closed
+	//                    with disconnect_reason=consumer_unrecoverable and
+	//                    the client reconnects with Last-Event-ID.
 	metricsConsumerInvalidated = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "consumer_invalidated_total",
-		Help:      "Total JetStream push-consumer invalidation events. Declared in M9 Batch A (#M9-1) and currently always 0 — Batch A is detection-only; M9 Batch B (#M9-5) will increment this when an invalidated consumer triggers an SSE disconnect with reason=consumer_invalidated. Labels: heartbeat_missed, slow_consumer.",
+		Help:      "Total JetStream consumer failures under live SSE streams. reason: recreated (the ordered consumer recovered after a gap, reconnect or missed heartbeats), unrecoverable (recreation failed and the stream closed).",
 	}, []string{"reason"})
 
 	// nuts_write_disconnects_total counts SSE streams that ended because a

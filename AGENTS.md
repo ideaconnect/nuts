@@ -60,6 +60,7 @@ Top-level Go source is the Caddy module package itself (`package nuts`):
 | [provision.go](provision.go) | `Provision`, `Validate`, `Cleanup`; NATS dial and TLS config. |
 | [auth.go](auth.go) | Subscriber JWT verification and `subscribe`-claim parsing. |
 | [serve.go](serve.go) | `ServeHTTP`, the SSE streaming loop, replay planning, probes, CORS. |
+| [consumer.go](consumer.go) | The JetStream side of a stream: ordered pull consumer config, pull options, the feed goroutine, consumer teardown. |
 | [caddyfile.go](caddyfile.go) | Caddyfile parsing (`UnmarshalCaddyfile`, `parseCaddyfile`). |
 | [helpers.go](helpers.go) | Pure helpers: SSE writers, JSON helpers, topic/cookie validation, URL redaction. |
 | [metrics.go](metrics.go) | Prometheus counters and gauges. |
@@ -76,6 +77,10 @@ Tests live alongside the source:
 | [helpers_test.go](helpers_test.go) | Helper edge-case tests for cookie names and SSE write behavior. |
 | [performance_test.go](performance_test.go) | `TestPerformance_*` confidence tests and benchmarks. |
 | [serve_test.go](serve_test.go) | Request parsing, replay planning, formatting, and stream helper unit tests without live NATS. |
+| [consumer_test.go](consumer_test.go) | Feed unit tests (ordering, oversize drops, backpressure, failure and stop paths) with a fake iterator. |
+| [delivery_contract_test.go](delivery_contract_test.go) | End-to-end delivery contract over real HTTP: no hole after a NATS link loss, large backlogs on one connection, bursts without disconnects. |
+| [caddy_integration_test.go](caddy_integration_test.go) | Caddy-in-the-loop tests via `caddy.Load` (access logs, HTTP metrics). |
+| [testutil_test.go](testutil_test.go) | Shared test doubles: fake JetStream messages and iterator, stalled writers, the black-hole TCP proxy. |
 | [functional_test/](functional_test/) | [Godog](https://github.com/cucumber/godog) BDD tests against a real Docker Compose stack. |
 | [features/](features/) | Gherkin `.feature` files driving the Godog suite. |
 
@@ -210,7 +215,7 @@ is in [docs/mutation/baseline.md](docs/mutation/baseline.md).
 ### Requirement for agents
 
 Any change that adds or modifies code in **`auth.go`, `helpers.go`,
-`handler.go`, `serve.go`, `caddyfile.go`, or `provision.go`** must:
+`handler.go`, `serve.go`, `consumer.go`, `caddyfile.go`, or `provision.go`** must:
 
 1. Run `make mutate-pkg PKG=<changed-file>` locally before declaring the
    task complete.

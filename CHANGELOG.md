@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Planned as the next **MAJOR** release. Each SSE stream is now backed by an
+ordered **pull** consumer instead of a push consumer. That removes a class of
+silent message loss, and clients that fall behind no longer get disconnected.
+Read **Changed** before upgrading. **nats-server 2.10 or newer is required.**
+
+### Changed
+- **Breaking: the JetStream delivery pipeline is pull-based** (#116). Every SSE
+  request creates an ordered pull consumer (nats.go `jetstream` package), named
+  `nuts_<id>_<n>`. It is deleted when the stream ends, instead of lingering
+  until `InactiveThreshold`. A feed goroutine pulls up to `client_buffer_size`
+  messages ahead and hands them to the SSE writer one at a time. While the
+  writer is busy, pulling stops and the backlog waits in JetStream.
+- **Breaking: a slow client is now one whose write misses `write_timeout`.**
+  A full per-connection queue no longer disconnects the client, because the
+  queue can no longer overflow. `nuts_slow_client_disconnects_total` and
+  `disconnect_reason=slow_client` now mean "a write hit its deadline".
+- **Breaking: `client_buffer_size` is the per-connection prefetch** from
+  JetStream (default 64). It bounds per-connection memory at roughly
+  `client_buffer_size` × the largest message.
+- **Breaking: nats-server 2.10 or newer is required.** The pre-2.10
+  multi-topic fallback (subscribe to a common wildcard and filter in NUTS) is
+  removed, along with the server-version sniffing that chose it. Multi-topic
+  requests always use server-side `FilterSubjects` (#117). nats-server 2.9 has
+  been end-of-life since 2024, and keeping the fallback meant keeping a second
+  delivery path that nothing in the matrix could exercise alongside the new
+  consumer.
+- **Breaking: the stream's subjects are checked for every request.** A topic
+  outside them now gets `503 Failed to subscribe to requested topics` for
+  single-topic requests too. Current nats-servers would otherwise create a
+  consumer that silently delivers nothing.
+- The `connected` event now carries an `id:` (#101). For requests without a
+  cursor it is the stream's last sequence when the consumer was created (`0`
+  on an empty stream); for replay requests it is the requested cursor. Those
+  requests start at an explicit sequence instead of `DeliverNew`.
+- `nats_idle_heartbeat` now sets the heartbeat of every pull request. When
+  heartbeats stop, the ordered consumer recreates itself. `-1` is still
+  accepted but no longer disables anything: the library default (5s) applies,
+  and a warning is logged (#74).
+- `nuts_consumer_invalidated_total{reason}` now counts `recreated` (the consumer
+  recovered on its own) and `unrecoverable` (recreation failed and the stream
+  closed with `disconnect_reason=consumer_unrecoverable`). The old
+  `heartbeat_missed`/`slow_consumer` labels are gone.
+- `nuts_replay_fallbacks_total` counts fallback replays once the consumer
+  exists, rather than attempts (#71 D).
+- Provision's stream check is bounded to 2 seconds (#72), and every JetStream
+  API call has a default deadline.
+
+### Deprecated
+- `dispatch_timeout` has no effect, because there is no queue hand-off left to
+  time out. Setting it logs a warning. It will be removed in the next major
+  release.
+- `nuts_dispatch_timeout_total` and `nuts_wildcard_filter_drops_total` stay
+  registered at zero for dashboard compatibility, and will be removed in the
+  next major release.
+
+### Fixed
+- **Messages in flight when NUTS' NATS connection dropped were lost for good**,
+  and the SSE stream continued with a hole that `Last-Event-ID` could not
+  recover (#99). The ordered consumer now resumes after the last message it
+  actually delivered.
+- **Replays and publish bursts larger than `client_buffer_size` disconnected
+  even fast clients** as "slow" (#100). Catching up on a 3000-message backlog
+  took about 900 reconnects; it now completes on one connection.
+- **A client that reconnected before receiving its first message lost
+  everything published in between** (#101), for example after a Caddy reload.
+- **A consumer reaped or deleted under a live stream left the stream open and
+  silent** (#54). It is now recreated from the last delivered sequence without
+  the client noticing (#53).
+- A slow-client overflow race could write a message after an earlier one was
+  dropped (#104). The NATS callback could also stay parked for good behind a
+  stalled writer, with messages accumulating up to nats.go's 64 MiB pending
+  limit (#85). Both code paths are gone.
+- Oversize payloads are dropped before they are queued for the writer, and the
+  drop log now names the stream sequence (#107, #120).
+
+### Removed
+- The subscribe-time replay fallback, which could never run: nats-server
+  clamps a below-retention start sequence instead of returning an error (#97).
+- The unreachable `subscription_empty` rejection branch (#69).
+
 ## [0.4.3] - 2026-09-26
 
 Bug-fix and security release. Upgrade urgency: **high** if Caddy runs with

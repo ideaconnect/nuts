@@ -26,6 +26,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
 	iopm "github.com/prometheus/client_model/go"
 	"go.uber.org/zap"
@@ -273,31 +274,30 @@ func TestMetrics_SlowClientDisconnects_Increments(t *testing.T) {
 	defer ns.Shutdown()
 	defer nc.Close()
 	defer h.Cleanup()
-
-	h.ClientBufferSize = 4 // make the buffer easy to overflow
+	h.WriteTimeout = 1
+	core, obs := observer.New(zap.WarnLevel)
+	h.logger = zap.New(core)
 
 	jsPub, _ := nc.JetStream()
-	var firstSeq uint64
-	for i := 0; i < 200; i++ {
-		ack, err := jsPub.Publish("events.slow", []byte(`{"i":`+strconv.Itoa(i)+`}`))
-		if err != nil {
+	for i := 0; i < 5; i++ {
+		if _, err := jsPub.Publish("events.slow", []byte(`{"i":`+strconv.Itoa(i)+`}`)); err != nil {
 			t.Fatalf("publish %d: %v", i, err)
 		}
-		if i == 0 {
-			firstSeq = ack.Sequence
-		}
 	}
-
 	before := counterVal(t, metricsSlowClientDisconnects)
+	writeDisconnectsBefore := counterValue(metricsWriteDisconnects, "message")
 
 	req := httptest.NewRequest(http.MethodGet, "/events?topic=slow", nil)
-	req.Header.Set("Last-Event-ID", strconv.FormatUint(firstSeq-1, 10))
+	req.Header.Set("Last-Event-ID", "0")
 	ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
 	defer cancel()
 	req = req.WithContext(ctx)
-	rr := &slowFlushRecorder{ResponseRecorder: httptest.NewRecorder(), writeDelay: 15 * time.Millisecond}
+	// The connected event and the first message get through; the next
+	// write stalls until write_timeout expires.
+	w := newStalledDeadlineWriter(2)
 	done := make(chan error, 1)
-	go func() { done <- h.ServeHTTP(rr, req, nil) }()
+	start := time.Now()
+	go func() { done <- h.ServeHTTP(w, req, nil) }()
 
 	select {
 	case err := <-done:
@@ -307,11 +307,19 @@ func TestMetrics_SlowClientDisconnects_Increments(t *testing.T) {
 	case <-time.After(4 * time.Second):
 		cancel()
 		<-done
-		t.Fatal("handler did not disconnect slow client in time")
+		t.Fatal("a client that stopped reading was not disconnected by write_timeout")
 	}
-
-	if got := counterVal(t, metricsSlowClientDisconnects); got <= before {
-		t.Errorf("slow_client_disconnects_total did not increment: before=%v got=%v", before, got)
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Fatalf("disconnected after %v, before write_timeout expired", elapsed)
+	}
+	if got := counterVal(t, metricsSlowClientDisconnects); got != before+1 {
+		t.Errorf("slow_client_disconnects_total = %v, want %v", got, before+1)
+	}
+	if got := counterValue(metricsWriteDisconnects, "message"); got != writeDisconnectsBefore+1 {
+		t.Errorf("write_disconnects_total{site=message} = %v, want %v", got, writeDisconnectsBefore+1)
+	}
+	if !hasLogField(obs, "disconnect_reason", "slow_client") {
+		t.Fatalf("expected disconnect_reason=slow_client, logs=%v", obs.All())
 	}
 }
 
@@ -842,7 +850,7 @@ func TestHandler_NATSReconnect_AllowsSubsequentSSE(t *testing.T) {
 		ns.Shutdown()
 		t.Fatalf("connectNATS: %v", err)
 	}
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -982,7 +990,7 @@ func TestHandler_NATSReconnect_ConnectedSSEReceivesPostReconnectMessage(t *testi
 		ns.Shutdown()
 		t.Fatalf("connectNATS: %v", err)
 	}
-	js, _ := h.conn.JetStream()
+	js, _ := jetstream.New(h.conn)
 	h.mu.Lock()
 	h.js = js
 	h.mu.Unlock()
@@ -1091,7 +1099,7 @@ func TestHandler_JetStreamPersistence_MessagesSurviveHandlerLifetime(t *testing.
 	if err := h1.connectNATS(); err != nil {
 		t.Fatalf("h1 connectNATS: %v", err)
 	}
-	js1, _ := h1.conn.JetStream()
+	js1, _ := jetstream.New(h1.conn)
 	h1.mu.Lock()
 	h1.js = js1
 	h1.mu.Unlock()
@@ -1115,7 +1123,7 @@ func TestHandler_JetStreamPersistence_MessagesSurviveHandlerLifetime(t *testing.
 		t.Fatalf("h2 connectNATS: %v", err)
 	}
 	defer h2.Cleanup()
-	js2, _ := h2.conn.JetStream()
+	js2, _ := jetstream.New(h2.conn)
 	h2.mu.Lock()
 	h2.js = js2
 	h2.mu.Unlock()
@@ -1144,612 +1152,309 @@ func TestHandler_JetStreamPersistence_MessagesSurviveHandlerLifetime(t *testing.
 	}
 }
 
-// TestHandler_SubscribeToMultipleTopics_MultiFilterPath drives the modern
-// JetStream multi-filter branch. On nats-server >= 2.10 the subscribe
-// succeeds and the ephemeral consumer is configured with FilterSubjects
-// populated. On older servers (pre-2.10) the SDK surfaces "multiple
-// consumer filter subjects not supported"; that's also a valid outcome
-// — when useMultiFilter is true we hand the full subject list to the
-// SDK and let any server-side rejection bubble up rather than silently
-// degrading.
-func TestHandler_SubscribeToMultipleTopics_MultiFilterPath(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
-	defer nc.Close()
-	defer h.Cleanup()
-
-	plan := streamPlan{
-		Topics:       []string{"alpha", "beta"},
-		FullSubjects: []string{"events.alpha", "events.beta"},
-		Replay:       replayPlan{Mode: replayModeDeliverNew},
+// startSSE runs ServeHTTP for target on a goroutine and waits for the
+// connected event. The returned cancel ends the request; done yields
+// ServeHTTP's return value.
+func startSSE(t *testing.T, h *Handler, target, lastEventID string) (*safeFlushRecorder, context.CancelFunc, <-chan error) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	if lastEventID != "" {
+		req.Header.Set("Last-Event-ID", lastEventID)
 	}
-
-	cb := func(*nats.Msg) {}
-
-	sub, err := h.subscribeToMultipleTopics(h.js, plan, h.subscriptionOptions(plan), cb, true, "2.10.0")
-	if err == nil {
-		// Inspect the consumer before unsubscribing — Unsubscribe deletes
-		// the ephemeral consumer on the server, after which ConsumerInfo
-		// returns "consumer not found".
-		info, infoErr := sub.ConsumerInfo()
-		_ = sub.Unsubscribe()
-		if infoErr != nil {
-			t.Fatalf("ConsumerInfo: %v", infoErr)
-		}
-		if !reflect.DeepEqual(info.Config.FilterSubjects, plan.FullSubjects) {
-			t.Fatalf("FilterSubjects = %#v, want %#v", info.Config.FilterSubjects, plan.FullSubjects)
-		}
-		return
-	}
-	if !strings.Contains(err.Error(), "multiple consumer filter subjects not supported") {
-		t.Fatalf("err = %v, want SDK rejection from multi-filter branch", err)
-	}
-}
-
-// TestHandler_SubscribeToMultipleTopics_WildcardFallbackPath drives the
-// older-server fallback: the function must subscribe to the common-prefix
-// wildcard, log a warning that names the wildcard and the server version,
-// and still deliver the requested subjects.
-func TestHandler_SubscribeToMultipleTopics_WildcardFallbackPath(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
-	defer nc.Close()
-	defer h.Cleanup()
-
-	core, obs := observer.New(zap.WarnLevel)
-	h.logger = zap.New(core)
-
-	plan := streamPlan{
-		Topics:       []string{"alpha", "beta"},
-		FullSubjects: []string{"events.alpha", "events.beta"},
-		Replay:       replayPlan{Mode: replayModeDeliverNew},
-	}
-
-	received := make(chan *nats.Msg, 8)
-	cb := func(msg *nats.Msg) { received <- msg }
-
-	sub, err := h.subscribeToMultipleTopics(h.js, plan, h.subscriptionOptions(plan), cb, false, "2.9.25")
-	if err != nil {
-		t.Fatalf("subscribeToMultipleTopics: %v", err)
-	}
-	defer func() { _ = sub.Unsubscribe() }()
-
-	info, err := sub.ConsumerInfo()
-	if err != nil {
-		t.Fatalf("ConsumerInfo: %v", err)
-	}
-	wantWildcard := commonSubjectFilter(plan.FullSubjects)
-	if info.Config.FilterSubject != wantWildcard {
-		t.Fatalf("FilterSubject = %q, want %q", info.Config.FilterSubject, wantWildcard)
-	}
-	if len(info.Config.FilterSubjects) != 0 {
-		t.Fatalf("FilterSubjects = %#v, want empty on fallback path", info.Config.FilterSubjects)
-	}
-
-	if !hasLogContaining(obs, "NATS server does not support multi-filter consumers") {
-		t.Fatalf("expected fallback warning log, got: %#v", obs.All())
-	}
-	if !hasLogField(obs, "wildcard_subject", wantWildcard) {
-		t.Fatalf("expected wildcard_subject=%q in log fields, got: %#v", wantWildcard, obs.All())
-	}
-	if !hasLogField(obs, "server_version", "2.9.25") {
-		t.Fatalf("expected server_version=2.9.25 in log fields, got: %#v", obs.All())
-	}
-
-	jsPub, err := nc.JetStream()
-	if err != nil {
-		t.Fatalf("JetStream pub: %v", err)
-	}
-	if _, err := jsPub.Publish("events.alpha", []byte(`{}`)); err != nil {
-		t.Fatalf("publish alpha: %v", err)
-	}
-	select {
-	case msg := <-received:
-		if msg.Subject != "events.alpha" {
-			t.Fatalf("got subject %q, want events.alpha", msg.Subject)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive published message via wildcard fallback")
-	}
-}
-
-// TestHandler_IdleHeartbeat_AppearsInConsumerConfig drives the M9 Phase 3
-// end-to-end ConsumerInfo assertion: when h.NatsIdleHeartbeat is set,
-// subscriptionOptions appends nats.IdleHeartbeat(...) and the JetStream
-// server records the requested interval on the resulting ephemeral
-// consumer. The assertion is on info.Config.Heartbeat (the server-side
-// recorded value), not the SubOpt slice — that lifts the contract from
-// "we asked" to "the server agreed" and catches any future SubOpt
-// reordering that would silently drop the option.
-func TestHandler_IdleHeartbeat_AppearsInConsumerConfig(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
-	defer nc.Close()
-	defer h.Cleanup()
-
-	// Set after Provision so the test exercises the subscribe-time read
-	// of h.NatsIdleHeartbeat (Provision normalisation is covered by
-	// TestHandler_NatsIdleHeartbeat_ConfigContract). 5s keeps the value
-	// distinct from the 10s default and well inside the validation
-	// boundary so any future refactor that accidentally substitutes the
-	// default would change the assertion's failure mode visibly.
-	h.NatsIdleHeartbeat = 5
-
-	plan := streamPlan{
-		Topics:       []string{"alpha"},
-		FullSubjects: []string{"events.alpha"},
-		Replay:       replayPlan{Mode: replayModeDeliverNew},
-	}
-
-	sub, err := h.js.Subscribe("events.alpha", func(*nats.Msg) {}, h.subscriptionOptions(plan)...)
-	if err != nil {
-		t.Fatalf("js.Subscribe: %v", err)
-	}
-	info, infoErr := sub.ConsumerInfo()
-	_ = sub.Unsubscribe()
-	if infoErr != nil {
-		t.Fatalf("ConsumerInfo: %v", infoErr)
-	}
-
-	wantHeartbeat := 5 * time.Second
-	if info.Config.Heartbeat != wantHeartbeat {
-		t.Fatalf("ConsumerInfo.Config.Heartbeat = %v, want %v (IdleHeartbeat SubOpt not honoured by server)", info.Config.Heartbeat, wantHeartbeat)
-	}
-}
-
-// TestHandler_IdleHeartbeat_DisabledWhenNegative pins the operator-
-// disable contract. When h.NatsIdleHeartbeat is the -1 sentinel
-// (Validate accepts it; Provision preserves it), subscriptionOptions
-// MUST skip the SubOpt append entirely and the resulting ephemeral
-// consumer is created with Heartbeat == 0 — exactly the pre-M9
-// behaviour. Without this assertion a future "fix" that always sets
-// IdleHeartbeat would silently undermine the operator opt-out.
-func TestHandler_IdleHeartbeat_DisabledWhenNegative(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
-	defer nc.Close()
-	defer h.Cleanup()
-
-	h.NatsIdleHeartbeat = -1
-
-	plan := streamPlan{
-		Topics:       []string{"alpha"},
-		FullSubjects: []string{"events.alpha"},
-		Replay:       replayPlan{Mode: replayModeDeliverNew},
-	}
-
-	sub, err := h.js.Subscribe("events.alpha", func(*nats.Msg) {}, h.subscriptionOptions(plan)...)
-	if err != nil {
-		t.Fatalf("js.Subscribe: %v", err)
-	}
-	info, infoErr := sub.ConsumerInfo()
-	_ = sub.Unsubscribe()
-	if infoErr != nil {
-		t.Fatalf("ConsumerInfo: %v", infoErr)
-	}
-
-	if info.Config.Heartbeat != 0 {
-		t.Fatalf("ConsumerInfo.Config.Heartbeat = %v, want 0 (operator-disable sentinel must skip the SubOpt append)", info.Config.Heartbeat)
-	}
-}
-
-// TestHandler_IdleHeartbeat_PropagatesThroughProvisionDefault is the
-// strongest end-to-end gate for the M9 Batch A default-on contract.
-// Unlike TestHandler_IdleHeartbeat_DefaultOnAfterProvision which
-// mirrors the Provision normalisation manually, this one actually
-// calls h.Provision with NatsIdleHeartbeat omitted (== 0) and verifies
-// the JetStream server records the default 10s on the resulting
-// consumer. A regression in either Provision's normalisation block OR
-// the subscribe-time read of h.NatsIdleHeartbeat would slip past the
-// hardening_test.go field-level assertions but trip this test.
-func TestHandler_IdleHeartbeat_PropagatesThroughProvisionDefault(t *testing.T) {
-	ns := startJetStreamServer(t)
-	t.Cleanup(ns.Shutdown)
-
-	nc, err := nats.Connect(ns.ClientURL())
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(nc.Close)
-	createTestStream(t, nc, "EVENTS", []string{"events.>"})
-
-	h := &Handler{
-		NatsURL:    ns.ClientURL(),
-		StreamName: "EVENTS",
-		// NatsIdleHeartbeat deliberately omitted (zero value). Provision
-		// MUST normalise to 10s — the M9 Batch A default-on contract.
-	}
-	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
-		t.Fatalf("Provision: %v", err)
-	}
-	t.Cleanup(func() { _ = h.Cleanup() })
-
-	plan := streamPlan{
-		Topics:       []string{"alpha"},
-		FullSubjects: []string{"events.alpha"},
-		Replay:       replayPlan{Mode: replayModeDeliverNew},
-	}
-
-	sub, err := h.js.Subscribe("events.alpha", func(*nats.Msg) {}, h.subscriptionOptions(plan)...)
-	if err != nil {
-		t.Fatalf("js.Subscribe: %v", err)
-	}
-	info, infoErr := sub.ConsumerInfo()
-	_ = sub.Unsubscribe()
-	if infoErr != nil {
-		t.Fatalf("ConsumerInfo: %v", infoErr)
-	}
-
-	wantHeartbeat := 10 * time.Second
-	if info.Config.Heartbeat != wantHeartbeat {
-		t.Fatalf("ConsumerInfo.Config.Heartbeat = %v, want %v (full Provision-driven default-on contract)", info.Config.Heartbeat, wantHeartbeat)
-	}
-}
-
-// TestHandler_IdleHeartbeat_MultiFilterPathPropagates verifies the
-// multi-filter subscribe path (NATS 2.10+) also honours
-// NatsIdleHeartbeat. Phase 3's AppearsInConsumerConfig test covered
-// only the single-topic js.Subscribe path; subscribeToMultipleTopics
-// at serve.go:1207-1224 takes a different branch with
-// ConsumerFilterSubjects, and a future refactor that built its own
-// SubOpt slice instead of accepting one from subscriptionOptions
-// would silently break heartbeat coverage on multi-topic clients.
-func TestHandler_IdleHeartbeat_MultiFilterPathPropagates(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
-	defer nc.Close()
-	defer h.Cleanup()
-
-	h.NatsIdleHeartbeat = 3
-
-	plan := streamPlan{
-		Topics:       []string{"alpha", "beta"},
-		FullSubjects: []string{"events.alpha", "events.beta"},
-		Replay:       replayPlan{Mode: replayModeDeliverNew},
-	}
-
-	sub, err := h.subscribeToMultipleTopics(h.js, plan, h.subscriptionOptions(plan), func(*nats.Msg) {}, true, "2.10.0")
-	if err != nil {
-		if strings.Contains(err.Error(), "multiple consumer filter subjects not supported") {
-			t.Skip("embedded server does not support multi-filter consumers; the wildcard-fallback test covers the other branch")
-		}
-		t.Fatalf("subscribeToMultipleTopics (multi-filter): %v", err)
-	}
-	info, infoErr := sub.ConsumerInfo()
-	_ = sub.Unsubscribe()
-	if infoErr != nil {
-		t.Fatalf("ConsumerInfo: %v", infoErr)
-	}
-
-	if info.Config.Heartbeat != 3*time.Second {
-		t.Fatalf("multi-filter ConsumerInfo.Config.Heartbeat = %v, want 3s (IdleHeartbeat must propagate through the multi-filter branch)", info.Config.Heartbeat)
-	}
-}
-
-// TestHandler_IdleHeartbeat_WildcardFallbackPathPropagates covers the
-// pre-NATS-2.10 wildcard-fallback subscribe path at serve.go:1223.
-// The wildcard branch is what NUTS uses against the nats:2.9-alpine
-// functional matrix line, so heartbeat propagation here is operator-
-// visible on real deployments running older servers. The fallback
-// path constructs its own commonSubjectFilter and passes the original
-// opts slice through — this test pins that contract.
-func TestHandler_IdleHeartbeat_WildcardFallbackPathPropagates(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
-	defer nc.Close()
-	defer h.Cleanup()
-
-	h.NatsIdleHeartbeat = 4
-
-	plan := streamPlan{
-		Topics:       []string{"alpha", "beta"},
-		FullSubjects: []string{"events.alpha", "events.beta"},
-		Replay:       replayPlan{Mode: replayModeDeliverNew},
-	}
-
-	sub, err := h.subscribeToMultipleTopics(h.js, plan, h.subscriptionOptions(plan), func(*nats.Msg) {}, false, "2.9.25")
-	if err != nil {
-		t.Fatalf("subscribeToMultipleTopics (wildcard fallback): %v", err)
-	}
-	info, infoErr := sub.ConsumerInfo()
-	_ = sub.Unsubscribe()
-	if infoErr != nil {
-		t.Fatalf("ConsumerInfo: %v", infoErr)
-	}
-
-	if info.Config.Heartbeat != 4*time.Second {
-		t.Fatalf("wildcard fallback ConsumerInfo.Config.Heartbeat = %v, want 4s (IdleHeartbeat must propagate through the pre-2.10 fallback branch)", info.Config.Heartbeat)
-	}
-}
-
-// TestHandler_BatchA_HeartbeatMissTriggersClassifierAndLog is the
-// END-TO-END failure-chain test for Batch A. It exercises the full
-// production pipeline:
-//
-//  1. Subscribe with NatsIdleHeartbeat=1s and a Warn-level log
-//     observer wired into the same Handler.
-//  2. Force a heartbeat miss by deleting the server-side ephemeral
-//     consumer via the JetStream admin API. The server stops sending
-//     heartbeats; nats.go's IdleHeartbeat detection (built into the
-//     library when the SubOpt is set) raises an async error after
-//     approximately 2 missed intervals.
-//  3. Assert the nats.go async ErrorHandler at provision.go:234 fires
-//     classifyNATSAsyncError, which buckets the typed error as
-//     "consumer_invalidated" (the Phase 1 label) and bumps
-//     nuts_nats_async_errors_total{kind=...}.
-//  4. Assert the structured Warn log includes kind=consumer_sequence
-//     _mismatch — the operator-visible signal for the failure mode.
-//  5. Assert nuts_consumer_invalidated_total stays at zero: Batch A
-//     surfaces the failure as observability ONLY. Batch B (#54) will
-//     populate this metric from the serveStream termination arm.
-//
-// Without this test, a regression that broke any link in the chain —
-// the SubOpt not actually triggering server-side heartbeats, the
-// nats.go library not surfacing the error, the classifier silently
-// falling back to "other", the ErrorHandler missing the metric/log
-// path — would slip past Batch A's other tests that only inspect
-// individual links.
-func TestHandler_BatchA_HeartbeatMissTriggersClassifierAndLog(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
-	defer nc.Close()
-	defer h.Cleanup()
-
-	// 1s is the minimum integer value Validate accepts (must be > 0
-	// and < InactiveThreshold/2 = 15). At 1s nats.go fires the async
-	// error after ~2 missed heartbeats (~2-3s), so a 6s polling
-	// deadline below is comfortable.
-	h.NatsIdleHeartbeat = 1
-
-	// Capture logs at Warn level so we observe the structured async-
-	// error log from provision.go:241 without noise from Debug entries.
-	core, obs := observer.New(zap.WarnLevel)
-	h.logger = zap.New(core)
-
-	plan := streamPlan{
-		Topics:       []string{"alpha"},
-		FullSubjects: []string{"events.alpha"},
-		Replay:       replayPlan{Mode: replayModeDeliverNew},
-	}
-
-	sub, err := h.js.Subscribe("events.alpha", func(*nats.Msg) {}, h.subscriptionOptions(plan)...)
-	if err != nil {
-		t.Fatalf("js.Subscribe: %v", err)
-	}
-	defer func() { _ = sub.Unsubscribe() }()
-
-	info, err := sub.ConsumerInfo()
-	if err != nil {
-		t.Fatalf("ConsumerInfo: %v", err)
-	}
-	consumerName := info.Name
-
-	asyncErrsBefore := counterValue(metricsNATSAsyncErrors, "consumer_invalidated")
-	asyncErrsOtherBefore := counterValue(metricsNATSAsyncErrors, "other")
-	invalidatedHeartbeatBefore := counterValue(metricsConsumerInvalidated, "heartbeat_missed")
-	invalidatedSlowBefore := counterValue(metricsConsumerInvalidated, "slow_consumer")
-
-	// Force the failure server-side. nc was created in
-	// newProvisionedHandler as the admin connection separate from
-	// h.conn; deleting via nc means the server cleans up the
-	// ephemeral and h.conn's nats.go layer detects the missing
-	// heartbeats on its own subscription.
-	jsAdmin, err := nc.JetStream()
-	if err != nil {
-		t.Fatalf("admin JetStream: %v", err)
-	}
-	if err := jsAdmin.DeleteConsumer("EVENTS", consumerName); err != nil {
-		t.Fatalf("DeleteConsumer: %v", err)
-	}
-
-	// Wait up to 6s for nats.go's IdleHeartbeat-miss detector to
-	// fire. The detection cadence is governed by nats.go and is
-	// typically 2× heartbeat plus a small fudge.
-	asyncErrsAfter := waitForCounterValue(t, metricsNATSAsyncErrors, "consumer_invalidated", asyncErrsBefore, 6*time.Second)
-	if asyncErrsAfter <= asyncErrsBefore {
-		t.Fatalf("nuts_nats_async_errors_total{kind=\"consumer_invalidated\"} did not increment after consumer deletion: before=%v after=%v\nlogs: %#v", asyncErrsBefore, asyncErrsAfter, obs.All())
-	}
-
-	// Classifier-regression guard: ensure the failure did NOT silently
-	// bucket as "other" instead of consumer_invalidated. If a
-	// future refactor swapped errors.As for errors.Is, the
-	// consumer_invalidated counter would stay flat and the
-	// "other" counter would tick instead.
-	if got := counterValue(metricsNATSAsyncErrors, "other"); got > asyncErrsOtherBefore {
-		t.Fatalf("nuts_nats_async_errors_total{kind=\"other\"} incremented from %v to %v — classifier regressed to errors.Is path", asyncErrsOtherBefore, got)
-	}
-
-	// Structured Warn log must carry kind=consumer_invalidated.
-	if !hasLogField(obs, "kind", "consumer_invalidated") {
-		t.Fatalf("expected Warn log with kind=consumer_invalidated field, got: %#v", obs.All())
-	}
-
-	// CRITICAL BATCH A CONTRACT: nuts_consumer_invalidated_total MUST
-	// remain at zero. Batch A is detection-only; Batch B (#54) will
-	// populate this metric from the SSE termination arm. If a future
-	// change starts ticking it during Batch A's window, Batch B has
-	// leaked into Batch A.
-	if got := counterValue(metricsConsumerInvalidated, "heartbeat_missed"); got > invalidatedHeartbeatBefore {
-		t.Fatalf("nuts_consumer_invalidated_total{reason=\"heartbeat_missed\"} incremented from %v to %v during Batch A — Batch B has leaked into Batch A code", invalidatedHeartbeatBefore, got)
-	}
-	if got := counterValue(metricsConsumerInvalidated, "slow_consumer"); got > invalidatedSlowBefore {
-		t.Fatalf("nuts_consumer_invalidated_total{reason=\"slow_consumer\"} incremented from %v to %v during Batch A — Batch B has leaked into Batch A code", invalidatedSlowBefore, got)
-	}
-}
-
-// TestHandler_BatchA_SSEHandlerStaysOpenOnHeartbeatMiss is the SSE-
-// client-side complement to the failure-chain test above. It drives
-// h.ServeHTTP through a real SSE connection, forces a server-side
-// consumer deletion mid-stream, and verifies the SSE handler does NOT
-// terminate. This is the load-bearing Batch A contract: a missed
-// heartbeat surfaces in metrics/logs but the client connection stays
-// open until the deliberate Batch B termination work lands.
-//
-// A regression that prematurely added the disconnect arm (e.g. by
-// hooking the global ErrorHandler to close serveStream's loop) would
-// be caught here: the goroutine would exit early and the assertion
-// "handler still running" would fail with a disconnect_reason that
-// shouldn't exist yet.
-func TestHandler_BatchA_SSEHandlerStaysOpenOnHeartbeatMiss(t *testing.T) {
-	h, ns, nc := newProvisionedHandler(t)
-	defer ns.Shutdown()
-	defer nc.Close()
-	defer h.Cleanup()
-
-	h.NatsIdleHeartbeat = 1
-	// HeartbeatInterval (the SSE-side keepalive ticker) is long enough
-	// that it does not fire during the test window. Without this we
-	// would conflate SSE writes from the ticker with the
-	// no-disconnect contract.
-	h.HeartbeatInterval = 60
-
-	core, obs := observer.New(zap.DebugLevel)
-	h.logger = zap.New(core)
-
-	req := httptest.NewRequest(http.MethodGet, "/events?topic=alpha", nil)
-	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
-	defer cancel()
+	ctx, cancel := context.WithTimeout(req.Context(), 15*time.Second)
 	req = req.WithContext(ctx)
-
 	rr := newSafeRecorder()
 	done := make(chan error, 1)
 	go func() { done <- h.ServeHTTP(rr, req, nil) }()
-
-	// Wait for the JetStream consumer to materialise before forcing
-	// the failure — the subscribe is async with respect to ServeHTTP
-	// returning the connected event.
-	jsAdmin, err := nc.JetStream()
-	if err != nil {
-		t.Fatalf("admin JetStream: %v", err)
+	if !waitForSSEBody(rr, "event: connected", 3*time.Second) {
+		cancel()
+		t.Fatalf("no connected event for %s; body=%q", target, rr.Body())
 	}
-	consumerName := waitForFirstConsumer(t, jsAdmin, "EVENTS", 3*time.Second)
-	if consumerName == "" {
-		t.Fatalf("no consumer appeared on EVENTS within 3s — ServeHTTP did not subscribe")
-	}
+	return rr, cancel, done
+}
 
-	asyncErrsBefore := counterValue(metricsNATSAsyncErrors, "consumer_invalidated")
-
-	if err := jsAdmin.DeleteConsumer("EVENTS", consumerName); err != nil {
-		t.Fatalf("DeleteConsumer: %v", err)
-	}
-
-	got := waitForCounterValue(t, metricsNATSAsyncErrors, "consumer_invalidated", asyncErrsBefore, 6*time.Second)
-	if got <= asyncErrsBefore {
-		t.Fatalf("ErrConsumerSequenceMismatch did not fire within 6s of consumer deletion (before=%v after=%v) — heartbeat-miss detection broken", asyncErrsBefore, got)
-	}
-
-	// CRITICAL BATCH A CONTRACT: handler MUST still be running. Give
-	// it 500ms more grace after the metric ticked to catch any race
-	// where the disconnect path is wired but slow.
-	select {
-	case err := <-done:
-		t.Fatalf("SSE handler exited (err=%v) after consumer invalidation — Batch B has leaked into Batch A code", err)
-	case <-time.After(500 * time.Millisecond):
-		// Good — handler still alive.
-	}
-
-	// Cancel the context so ServeHTTP exits cleanly.
+// stopSSE cancels a request started with startSSE and waits for ServeHTTP.
+func stopSSE(t *testing.T, cancel context.CancelFunc, done <-chan error) {
+	t.Helper()
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("ServeHTTP final return (after cancel): %v", err)
+			t.Errorf("ServeHTTP returned %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("ServeHTTP did not exit within 2s of context cancellation")
-	}
-
-	// The terminal disconnect_reason MUST be client_context_done
-	// (from the ctx.Done() arm), not consumer_invalidated. The
-	// consumer_invalidated reason does not exist in the codebase
-	// until Batch B; if it appears we have a leak.
-	if hasLogField(obs, "disconnect_reason", "consumer_invalidated") {
-		t.Fatalf("found disconnect_reason=consumer_invalidated in logs — Batch B has leaked into Batch A code\nlogs: %#v", obs.All())
-	}
-	if !hasLogField(obs, "disconnect_reason", "client_context_done") {
-		t.Fatalf("expected disconnect_reason=client_context_done after explicit cancel, got: %#v", obs.All())
+	case <-time.After(3 * time.Second):
+		t.Fatal("ServeHTTP did not return within 3s of cancellation")
 	}
 }
 
-// waitForCounterValue polls a labelled counter until it exceeds
-// `before` or `timeout` elapses, returning the last observed value.
-// Used by the Batch A end-to-end tests where the time between
-// inducing a failure and the metric ticking is bounded but not
-// deterministic.
-func waitForCounterValue(t *testing.T, c *prometheus.CounterVec, label string, before float64, timeout time.Duration) float64 {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	var last float64
-	for time.Now().Before(deadline) {
-		last = counterValue(c, label)
-		if last > before {
-			return last
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return last
-}
-
-// waitForFirstConsumer polls the stream's consumer list until at
-// least one consumer name appears, returning the first name observed
-// or "" if the timeout elapses first. The functional matrix
-// (#M9-3) uses the same pattern for assertions on ConsumerInfo
-// shape.
-func waitForFirstConsumer(t *testing.T, js nats.JetStreamContext, stream string, timeout time.Duration) string {
+// waitForFirstConsumer polls the stream until a consumer exists and returns
+// its info, or nil when the timeout elapses first.
+func waitForFirstConsumer(t *testing.T, js jetstream.JetStream, stream string, timeout time.Duration) *jetstream.ConsumerInfo {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		for ci := range js.ConsumersInfo(stream) {
-			if ci != nil {
-				return ci.Name
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		var found *jetstream.ConsumerInfo
+		if s, err := js.Stream(ctx, stream); err == nil {
+			lister := s.ListConsumers(ctx)
+			for ci := range lister.Info() {
+				if found == nil {
+					found = ci
+				}
 			}
 		}
+		cancel()
+		if found != nil {
+			return found
+		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return ""
+	return nil
 }
 
-// TestHandler_IdleHeartbeat_DefaultOnAfterProvision is the end-to-end
-// gate for the M9 Batch A default-on contract. Provision normalises
-// NatsIdleHeartbeat == 0 to 10s; the subscribe call then propagates
-// that value to the JetStream server. Without this test, a regression
-// that broke the Provision normalisation OR the subscribe-time read
-// would still pass the unit tests in hardening_test.go that only
-// inspect the field value on the Handler struct.
-func TestHandler_IdleHeartbeat_DefaultOnAfterProvision(t *testing.T) {
+func TestHandler_MultiTopicStreamUsesServerSideFilterSubjects(t *testing.T) {
 	h, ns, nc := newProvisionedHandler(t)
 	defer ns.Shutdown()
 	defer nc.Close()
 	defer h.Cleanup()
+	js, _ := nc.JetStream()
+	admin, _ := jetstream.New(nc)
 
-	// newProvisionedHandler does not pass NatsIdleHeartbeat through —
-	// reach into h.Provision's normalisation path by re-running it. We
-	// cannot just leave it zero because newProvisionedHandler already
-	// went through Provision; re-set to 0 and re-normalise to mirror a
-	// fresh "operator wrote nothing" Provision.
-	h.NatsIdleHeartbeat = 0
-	if h.NatsIdleHeartbeat == 0 {
-		h.NatsIdleHeartbeat = 10 // mirror provision.go normalisation
+	rr, cancel, done := startSSE(t, h, "/events?topic=alpha&topic=beta", "")
+	defer stopSSE(t, cancel, done)
+
+	info := waitForFirstConsumer(t, admin, "EVENTS", 3*time.Second)
+	if info == nil {
+		t.Fatal("no consumer created for the multi-topic request")
+	}
+	if !reflect.DeepEqual(info.Config.FilterSubjects, []string{"events.alpha", "events.beta"}) {
+		t.Fatalf("FilterSubjects = %v, want [events.alpha events.beta]", info.Config.FilterSubjects)
+	}
+	if info.Config.AckPolicy != jetstream.AckNonePolicy {
+		t.Fatalf("AckPolicy = %v, want none", info.Config.AckPolicy)
+	}
+	if info.Config.DeliverPolicy != jetstream.DeliverByStartSequencePolicy || info.Config.OptStartSeq != 1 {
+		t.Fatalf("start = %v/%d, want an explicit start at sequence 1 on an empty stream", info.Config.DeliverPolicy, info.Config.OptStartSeq)
+	}
+	if !strings.HasPrefix(info.Name, consumerNamePrefix) {
+		t.Fatalf("consumer name %q lacks the %q prefix", info.Name, consumerNamePrefix)
 	}
 
-	plan := streamPlan{
-		Topics:       []string{"alpha"},
-		FullSubjects: []string{"events.alpha"},
-		Replay:       replayPlan{Mode: replayModeDeliverNew},
+	for _, subj := range []string{"events.alpha", "events.gamma", "events.beta"} {
+		if _, err := js.Publish(subj, []byte(`{"subject":"`+subj+`"}`)); err != nil {
+			t.Fatalf("publish %s: %v", subj, err)
+		}
 	}
+	if !waitForSSEBody(rr, `"subject":"events.beta"`, 3*time.Second) {
+		t.Fatalf("multi-topic stream missed events.beta; body=%q", rr.Body())
+	}
+	if strings.Contains(rr.Body(), "events.gamma") {
+		t.Fatalf("multi-topic stream delivered an unrequested subject; body=%q", rr.Body())
+	}
+	if got := parseSSEIDs(t, rr.Body()); !reflect.DeepEqual(got, []uint64{0, 1, 3}) {
+		t.Fatalf("ids = %v, want connected id 0 then stream sequences 1 and 3", got)
+	}
+}
 
-	sub, err := h.js.Subscribe("events.alpha", func(*nats.Msg) {}, h.subscriptionOptions(plan)...)
+// TestHandler_ConsumerDeletedMidStream_RecreatesAndResumes covers what M9
+// Batch B was meant to fix: a consumer lost on the server (reaped, deleted,
+// dropped with a leafnode route) used to leave the SSE stream open and silent.
+// The ordered consumer detects the missing heartbeats, recreates itself from
+// the last delivered sequence, and the stream continues without a gap.
+func TestHandler_ConsumerDeletedMidStream_RecreatesAndResumes(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+	h.NatsIdleHeartbeat = 1
+	h.HeartbeatInterval = 60
+	core, obs := observer.New(zap.InfoLevel)
+	h.logger = zap.New(core)
+	js, _ := nc.JetStream()
+	admin, _ := jetstream.New(nc)
+
+	rr, cancel, done := startSSE(t, h, "/events?topic=alpha", "")
+	if _, err := js.Publish("events.alpha", []byte(`{"n":1}`)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if !waitForSSEBody(rr, `{"n":1}`, 3*time.Second) {
+		t.Fatalf("first message not delivered; body=%q", rr.Body())
+	}
+	info := waitForFirstConsumer(t, admin, "EVENTS", time.Second)
+	if info == nil {
+		t.Fatal("no consumer to delete")
+	}
+	recreatedBefore := counterValue(metricsConsumerInvalidated, "recreated")
+	if err := admin.DeleteConsumer(context.Background(), "EVENTS", info.Name); err != nil {
+		t.Fatalf("DeleteConsumer: %v", err)
+	}
+	for _, n := range []string{"2", "3"} {
+		if _, err := js.Publish("events.alpha", []byte(`{"n":`+n+`}`)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+	if !waitForSSEBody(rr, `{"n":3}`, 10*time.Second) {
+		t.Fatalf("stream did not recover after the consumer was deleted; body=%q", rr.Body())
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("SSE handler exited (err=%v) instead of recovering", err)
+	default:
+	}
+	if got := parseSSEIDs(t, rr.Body()); !reflect.DeepEqual(got, []uint64{0, 1, 2, 3}) {
+		t.Fatalf("ids = %v, want contiguous [0 1 2 3]", got)
+	}
+	if got := counterValue(metricsConsumerInvalidated, "recreated"); got <= recreatedBefore {
+		t.Fatalf("nuts_consumer_invalidated_total{reason=recreated} = %v, want > %v", got, recreatedBefore)
+	}
+	if !hasLogField(obs, "previous_consumer", info.Name) {
+		t.Fatalf("no recreation log naming the deleted consumer %q; logs=%v", info.Name, obs.All())
+	}
+	stopSSE(t, cancel, done)
+}
+
+// TestHandler_Provision_IdleHeartbeatReachesPullOptions pins the
+// nats_idle_heartbeat contract end to end: the value Provision settles on is
+// the heartbeat every pull request asks JetStream for.
+func TestHandler_Provision_IdleHeartbeatReachesPullOptions(t *testing.T) {
+	ns := startJetStreamServer(t)
+	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
 	if err != nil {
-		t.Fatalf("js.Subscribe: %v", err)
+		t.Fatalf("connect: %v", err)
 	}
-	info, infoErr := sub.ConsumerInfo()
-	_ = sub.Unsubscribe()
-	if infoErr != nil {
-		t.Fatalf("ConsumerInfo: %v", infoErr)
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+
+	for _, c := range []struct {
+		name       string
+		configured int
+		want       time.Duration
+	}{
+		{name: "omitted uses the 10s default", configured: 0, want: 10 * time.Second},
+		{name: "explicit value is kept", configured: 5, want: 5 * time.Second},
+		{name: "disable sentinel leaves the library default", configured: natsIdleHeartbeatDisabledSentinel, want: 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := &Handler{NatsURL: ns.ClientURL(), StreamName: "EVENTS", NatsIdleHeartbeat: c.configured}
+			if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			defer h.Cleanup()
+			var got time.Duration
+			for _, opt := range h.pullOptions() {
+				if hb, ok := opt.(jetstream.PullHeartbeat); ok {
+					got = time.Duration(hb)
+				}
+			}
+			if got != c.want {
+				t.Fatalf("PullHeartbeat = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestHandler_NoCursorRequestStartsAfterLastSeq checks the explicit start
+// position of a request without a cursor: retained history is not replayed,
+// the connected event names the last retained sequence, and the next
+// published message arrives with the following id.
+func TestHandler_NoCursorRequestStartsAfterLastSeq(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+	js, _ := nc.JetStream()
+	for i := 1; i <= 3; i++ {
+		if _, err := js.Publish("events.alpha", []byte(`{"old":`+strconv.Itoa(i)+`}`)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
 	}
 
-	wantHeartbeat := 10 * time.Second
-	if info.Config.Heartbeat != wantHeartbeat {
-		t.Fatalf("ConsumerInfo.Config.Heartbeat = %v, want %v (Batch A default-on contract)", info.Config.Heartbeat, wantHeartbeat)
+	rr, cancel, done := startSSE(t, h, "/events?topic=alpha", "")
+	defer stopSSE(t, cancel, done)
+	if !strings.HasPrefix(rr.Body(), "id: 3\nevent: connected\n") {
+		t.Fatalf("connected event = %q, want it to carry id 3", rr.Body())
+	}
+	if _, err := js.Publish("events.alpha", []byte(`{"new":4}`)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if !waitForSSEBody(rr, `{"new":4}`, 3*time.Second) {
+		t.Fatalf("new message not delivered; body=%q", rr.Body())
+	}
+	if strings.Contains(rr.Body(), `"old"`) {
+		t.Fatalf("retained history was replayed to a request without a cursor; body=%q", rr.Body())
+	}
+	if got := parseSSEIDs(t, rr.Body()); !reflect.DeepEqual(got, []uint64{3, 4}) {
+		t.Fatalf("ids = %v, want [3 4]", got)
+	}
+}
+
+// TestHandler_ReconnectBeforeFirstMessageLosesNothing is the regression test
+// for #101: the connected event used to carry no id, so a client whose stream
+// ended before its first message reconnected without Last-Event-ID and lost
+// everything published in the gap.
+func TestHandler_ReconnectBeforeFirstMessageLosesNothing(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+	js, _ := nc.JetStream()
+
+	first, cancel, done := startSSE(t, h, "/events?topic=alpha", "")
+	ids := parseSSEIDs(t, first.Body())
+	stopSSE(t, cancel, done)
+	if len(ids) != 1 {
+		t.Fatalf("connected event ids = %v, want exactly one", ids)
+	}
+
+	for i := 1; i <= 3; i++ {
+		if _, err := js.Publish("events.alpha", []byte(`{"gap":`+strconv.Itoa(i)+`}`)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+
+	second, cancel2, done2 := startSSE(t, h, "/events?topic=alpha", strconv.FormatUint(ids[0], 10))
+	defer stopSSE(t, cancel2, done2)
+	if !waitForSSEBody(second, `{"gap":3}`, 3*time.Second) {
+		t.Fatalf("messages published during the reconnect gap were not delivered; body=%q", second.Body())
+	}
+	for i := 1; i <= 3; i++ {
+		if !strings.Contains(second.Body(), `{"gap":`+strconv.Itoa(i)+`}`) {
+			t.Fatalf("gap message %d missing; body=%q", i, second.Body())
+		}
+	}
+}
+
+// TestHandler_ServeHTTP_TopicOutsideStreamIsRejected covers the planning-time
+// rejection for a single topic the stream does not carry: a 503 naming the
+// topic, one nuts_subscription_errors_total tick, the
+// disconnect_reason=subscription_failed log field, and no consumer left
+// behind.
+func TestHandler_ServeHTTP_TopicOutsideStreamIsRejected(t *testing.T) {
+	h, ns, nc := newProvisionedHandler(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+	defer h.Cleanup()
+	h.TopicPrefix = ""
+	core, obs := observer.New(zap.WarnLevel)
+	h.logger = zap.New(core)
+	before := counterVal(t, metricsSubscriptionErrors)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/events?topic=orders", nil)
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), "Failed to subscribe to requested topics: orders") {
+		t.Fatalf("response = %d %q, want 503 naming the topic", rr.Code, rr.Body.String())
+	}
+	if got := counterVal(t, metricsSubscriptionErrors); got != before+1 {
+		t.Fatalf("subscription_errors_total = %v, want %v", got, before+1)
+	}
+	if !hasLogField(obs, "disconnect_reason", "subscription_failed") {
+		t.Fatalf("missing disconnect_reason=subscription_failed: %v", obs.All())
+	}
+	if got := consumerCount(mustJetStream(t, nc), "EVENTS"); got != 0 {
+		t.Fatalf("consumers after rejection = %d, want 0", got)
 	}
 }

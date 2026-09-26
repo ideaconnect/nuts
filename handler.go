@@ -14,6 +14,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )
 
@@ -125,18 +126,18 @@ type Handler struct {
 	// Default: 32.
 	MaxTopicsPerSubscription int `json:"max_topics_per_subscription,omitempty"`
 
-	// ClientBufferSize is the size of the per-connection NATS message buffer.
-	// 0 (or unset) uses the default.
-	// When the buffer fills, the slow client is disconnected to avoid drops.
-	// Default: 64.
+	// ClientBufferSize is how many messages each connection's pull consumer
+	// prefetches from JetStream. When the SSE writer falls behind, pulling
+	// stops and the backlog waits in the stream; it bounds per-connection
+	// memory at roughly ClientBufferSize × the largest message.
+	// 0 (or unset) uses the default. Default: 64.
 	ClientBufferSize int `json:"client_buffer_size,omitempty"`
 
-	// DispatchTimeout caps how long the NATS callback waits to signal a blocked
-	// SSE client after its queue is full. Value is in seconds; 0 leaves the
-	// wait unbounded (the callback parks until the SSE loop observes the
-	// slow-client signal or the connection tears down). Set a positive value
-	// to bound callback latency; on expiry the slow-client signal is dropped
-	// and nuts_dispatch_timeout_total is incremented.
+	// DispatchTimeout is deprecated and has no effect since the pull
+	// consumer replaced the push queue: nothing waits to hand a message to a
+	// full queue any more. Stalled clients are bounded by WriteTimeout.
+	// Setting it logs a deprecation warning; it will be removed in the next
+	// major release.
 	DispatchTimeout int `json:"dispatch_timeout,omitempty"`
 
 	// WriteTimeout caps each SSE frame write/flush. Value is in seconds; 0
@@ -149,29 +150,22 @@ type Handler struct {
 	// ReplayWindow caps replay by time in seconds. 0 preserves retained replay.
 	ReplayWindow int `json:"replay_window,omitempty"`
 
-	// NatsIdleHeartbeat is the interval in seconds at which the JetStream
-	// server emits IdleHeartbeat status messages on a push consumer.
-	// Without it, a server-side ephemeral reaped by InactiveThreshold
-	// during a network blip — or one lost during a leafnode route failover
-	// — stays attached to the SSE handler silently until the client
-	// reconnects for unrelated reasons (the SSE-layer heartbeat only
-	// proves the HTTP socket is open, not that the JetStream push path
-	// is live).
+	// NatsIdleHeartbeat is the heartbeat interval, in seconds, that every
+	// pull request asks JetStream for. When heartbeats stop arriving, the
+	// ordered consumer recreates itself from the last delivered sequence,
+	// so a consumer reaped during an outage or lost with a leafnode route
+	// does not leave the stream silently stuck.
 	//
-	// Default: 10 (seconds). Set to exactly -1 to disable. 0 (or unset)
-	// is normalised to the default during Provision; other negative
-	// values are rejected by Validate as likely typos (consistent with
-	// how heartbeat_interval and reconnect_wait reject negatives).
+	// Default: 10 (seconds). 0 (or unset) is normalised to the default
+	// during Provision. -1 is accepted for compatibility but no longer
+	// disables anything: the ordered consumer always uses heartbeats, so
+	// the library default (5s) applies and Validate logs a warning. Other
+	// negative values are rejected as likely typos.
 	//
 	// Constraint enforced by Validate when positive:
 	// NatsIdleHeartbeat < defaultConsumerInactiveThreshold/2 (currently
 	// 15 seconds) so two missed heartbeats are observable before the
 	// server reaps the consumer.
-	//
-	// M9 Batch A surfaces a missed heartbeat as
-	// nuts_nats_async_errors_total{kind="consumer_invalidated"}
-	// only; Batch B will terminate the affected SSE handler with
-	// disconnect_reason=consumer_invalidated.
 	NatsIdleHeartbeat int `json:"nats_idle_heartbeat,omitempty"`
 
 	// NatsTLSCA is a path to a PEM-encoded CA bundle used to verify the
@@ -193,8 +187,8 @@ type Handler struct {
 	// conn is opened during Provision and shared across HTTP requests.
 	conn *nats.Conn
 
-	// js is the JetStream context derived from conn.
-	js nats.JetStreamContext
+	// js is the JetStream API handle derived from conn.
+	js jetstream.JetStream
 
 	// logger is scoped to this handler instance.
 	logger *zap.Logger
