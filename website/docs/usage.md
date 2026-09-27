@@ -48,6 +48,7 @@ nuts {
     # Streaming behaviour
     heartbeat_interval <seconds>        # SSE keep-alive interval (0=default 30)
     reconnect_wait <seconds>            # NATS reconnect wait (0=default 2)
+    nats_ping_interval <seconds>        # NATS ping interval; two unanswered = stale (0=default 20)
     max_reconnects <count>              # Max NATS reconnects, 0=none, -1=infinite (default: -1)
     nats_idle_heartbeat <seconds>       # Pull-consumer heartbeat (0=default 10, must be < 15)
 

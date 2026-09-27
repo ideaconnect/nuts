@@ -28,11 +28,14 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				nats_tls_insecure_skip_verify true
 				heartbeat_interval 15
 				reconnect_wait 5
+				nats_ping_interval 7
+				nats_idle_heartbeat 7
 				max_reconnects 10
 				max_event_size 524288
 				max_connections 100
 				max_topics_per_subscription 8
 				client_buffer_size 128
+				shared_subscriptions
 				dispatch_timeout 2
 				write_timeout 3
 				replay_max_messages 25
@@ -57,11 +60,14 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				NatsTLSInsecureSkipVerify: true,
 				HeartbeatInterval:         15,
 				ReconnectWait:             5,
+				NatsPingInterval:          7,
+				NatsIdleHeartbeat:         7,
 				MaxReconnects:             intPtr(10),
 				MaxEventSize:              524288,
 				MaxConnections:            100,
 				MaxTopicsPerSubscription:  8,
 				ClientBufferSize:          128,
+				SharedSubscriptions:       true,
 				DispatchTimeout:           2,
 				WriteTimeout:              3,
 				ReplayMaxMessages:         25,
@@ -306,111 +312,10 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			// Check fields
-			if h.NatsURL != tt.expected.NatsURL {
-				t.Errorf("NatsURL: expected %q, got %q", tt.expected.NatsURL, h.NatsURL)
-			}
-			if h.StreamName != tt.expected.StreamName {
-				t.Errorf("StreamName: expected %q, got %q", tt.expected.StreamName, h.StreamName)
-			}
-			if h.TopicPrefix != tt.expected.TopicPrefix {
-				t.Errorf("TopicPrefix: expected %q, got %q", tt.expected.TopicPrefix, h.TopicPrefix)
-			}
-			if h.HeartbeatInterval != tt.expected.HeartbeatInterval {
-				t.Errorf("HeartbeatInterval: expected %d, got %d", tt.expected.HeartbeatInterval, h.HeartbeatInterval)
-			}
-			if h.ReconnectWait != tt.expected.ReconnectWait {
-				t.Errorf("ReconnectWait: expected %d, got %d", tt.expected.ReconnectWait, h.ReconnectWait)
-			}
-			switch {
-			case tt.expected.MaxReconnects == nil && h.MaxReconnects != nil:
-				t.Errorf("MaxReconnects: expected nil, got %d", *h.MaxReconnects)
-			case tt.expected.MaxReconnects != nil && h.MaxReconnects == nil:
-				t.Errorf("MaxReconnects: expected %d, got nil", *tt.expected.MaxReconnects)
-			case tt.expected.MaxReconnects != nil && h.MaxReconnects != nil && *tt.expected.MaxReconnects != *h.MaxReconnects:
-				t.Errorf("MaxReconnects: expected %d, got %d", *tt.expected.MaxReconnects, *h.MaxReconnects)
-			}
-			if h.NatsToken != tt.expected.NatsToken {
-				t.Errorf("NatsToken: expected %q, got %q", tt.expected.NatsToken, h.NatsToken)
-			}
-			if h.NatsUser != tt.expected.NatsUser {
-				t.Errorf("NatsUser: expected %q, got %q", tt.expected.NatsUser, h.NatsUser)
-			}
-			if h.NatsPassword != tt.expected.NatsPassword {
-				t.Errorf("NatsPassword: expected %q, got %q", tt.expected.NatsPassword, h.NatsPassword)
-			}
-			if h.NatsCredentials != tt.expected.NatsCredentials {
-				t.Errorf("NatsCredentials: expected %q, got %q", tt.expected.NatsCredentials, h.NatsCredentials)
-			}
-			if h.NatsTLSCA != tt.expected.NatsTLSCA {
-				t.Errorf("NatsTLSCA: expected %q, got %q", tt.expected.NatsTLSCA, h.NatsTLSCA)
-			}
-			if h.NatsTLSCert != tt.expected.NatsTLSCert {
-				t.Errorf("NatsTLSCert: expected %q, got %q", tt.expected.NatsTLSCert, h.NatsTLSCert)
-			}
-			if h.NatsTLSKey != tt.expected.NatsTLSKey {
-				t.Errorf("NatsTLSKey: expected %q, got %q", tt.expected.NatsTLSKey, h.NatsTLSKey)
-			}
-			if h.NatsTLSInsecureSkipVerify != tt.expected.NatsTLSInsecureSkipVerify {
-				t.Errorf("NatsTLSInsecureSkipVerify: expected %v, got %v", tt.expected.NatsTLSInsecureSkipVerify, h.NatsTLSInsecureSkipVerify)
-			}
-			if h.MaxEventSize != tt.expected.MaxEventSize {
-				t.Errorf("MaxEventSize: expected %d, got %d", tt.expected.MaxEventSize, h.MaxEventSize)
-			}
-			if h.MaxConnections != tt.expected.MaxConnections {
-				t.Errorf("MaxConnections: expected %d, got %d", tt.expected.MaxConnections, h.MaxConnections)
-			}
-			if h.MaxTopicsPerSubscription != tt.expected.MaxTopicsPerSubscription {
-				t.Errorf("MaxTopicsPerSubscription: expected %d, got %d", tt.expected.MaxTopicsPerSubscription, h.MaxTopicsPerSubscription)
-			}
-			if h.ClientBufferSize != tt.expected.ClientBufferSize {
-				t.Errorf("ClientBufferSize: expected %d, got %d", tt.expected.ClientBufferSize, h.ClientBufferSize)
-			}
-			if h.DispatchTimeout != tt.expected.DispatchTimeout {
-				t.Errorf("DispatchTimeout: expected %d, got %d", tt.expected.DispatchTimeout, h.DispatchTimeout)
-			}
-			if h.WriteTimeout != tt.expected.WriteTimeout {
-				t.Errorf("WriteTimeout: expected %d, got %d", tt.expected.WriteTimeout, h.WriteTimeout)
-			}
-			if h.ReplayMaxMessages != tt.expected.ReplayMaxMessages {
-				t.Errorf("ReplayMaxMessages: expected %d, got %d", tt.expected.ReplayMaxMessages, h.ReplayMaxMessages)
-			}
-			if h.ReplayWindow != tt.expected.ReplayWindow {
-				t.Errorf("ReplayWindow: expected %d, got %d", tt.expected.ReplayWindow, h.ReplayWindow)
-			}
-			if h.HealthPath != tt.expected.HealthPath {
-				t.Errorf("HealthPath: expected %q, got %q", tt.expected.HealthPath, h.HealthPath)
-			}
-			if h.HubURL != tt.expected.HubURL {
-				t.Errorf("HubURL: expected %q, got %q", tt.expected.HubURL, h.HubURL)
-			}
-			if h.SubscriberJWTKey != tt.expected.SubscriberJWTKey {
-				t.Errorf("SubscriberJWTKey: expected %q, got %q", tt.expected.SubscriberJWTKey, h.SubscriberJWTKey)
-			}
-			if h.SubscriberJWTCookie != tt.expected.SubscriberJWTCookie {
-				t.Errorf("SubscriberJWTCookie: expected %q, got %q", tt.expected.SubscriberJWTCookie, h.SubscriberJWTCookie)
-			}
-			if h.LivePath != tt.expected.LivePath {
-				t.Errorf("LivePath: expected %q, got %q", tt.expected.LivePath, h.LivePath)
-			}
-			if h.ReadyPath != tt.expected.ReadyPath {
-				t.Errorf("ReadyPath: expected %q, got %q", tt.expected.ReadyPath, h.ReadyPath)
-			}
-			if len(tt.expected.AllowedOrigins) > 0 {
-				if len(h.AllowedOrigins) != len(tt.expected.AllowedOrigins) {
-					t.Errorf("AllowedOrigins length: expected %d, got %d", len(tt.expected.AllowedOrigins), len(h.AllowedOrigins))
-				}
-				for i, origin := range tt.expected.AllowedOrigins {
-					if i < len(h.AllowedOrigins) && h.AllowedOrigins[i] != origin {
-						t.Errorf("AllowedOrigins[%d]: expected %q, got %q", i, origin, h.AllowedOrigins[i])
-					}
-				}
-			}
-			if len(tt.expected.AllowedHeaders) > 0 && !reflect.DeepEqual(h.AllowedHeaders, tt.expected.AllowedHeaders) {
-				t.Errorf("AllowedHeaders: expected %#v, got %#v", tt.expected.AllowedHeaders, h.AllowedHeaders)
-			}
-			if len(tt.expected.AllowedMethods) > 0 && !reflect.DeepEqual(h.AllowedMethods, tt.expected.AllowedMethods) {
-				t.Errorf("AllowedMethods: expected %#v, got %#v", tt.expected.AllowedMethods, h.AllowedMethods)
+			// The whole handler, so a directive that parses but is stored nowhere
+			// fails here even when nobody remembered to compare its field.
+			if !reflect.DeepEqual(&h, tt.expected) {
+				t.Errorf("parsed handler differs:\n got  %+v\n want %+v", &h, tt.expected)
 			}
 		})
 	}
@@ -474,6 +379,7 @@ func TestHandler_UnmarshalCaddyfile_MissingArgs(t *testing.T) {
 		{name: "missing topic_prefix arg", directive: "topic_prefix"},
 		{name: "missing heartbeat_interval arg", directive: "heartbeat_interval"},
 		{name: "missing reconnect_wait arg", directive: "reconnect_wait"},
+		{name: "missing nats_ping_interval arg", directive: "nats_ping_interval"},
 		{name: "missing max_reconnects arg", directive: "max_reconnects"},
 		{name: "missing max_event_size arg", directive: "max_event_size"},
 		{name: "missing dispatch_timeout arg", directive: "dispatch_timeout"},
@@ -575,6 +481,7 @@ func TestHandler_UnmarshalCaddyfile_RejectsNonNumericInt(t *testing.T) {
 	cases := []string{
 		"heartbeat_interval 123abc",
 		"reconnect_wait 9x",
+		"nats_ping_interval 20s",
 		"max_reconnects 1.5",
 		"max_event_size 1kb",
 		"max_connections twelve",
@@ -666,6 +573,11 @@ func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
 			name:    "negative reconnect wait at parse time",
 			line:    "reconnect_wait -1",
 			wantErr: "reconnect_wait must be >= 0",
+		},
+		{
+			name:    "negative ping interval at parse time",
+			line:    "nats_ping_interval -5",
+			wantErr: "nats_ping_interval must be >= 0",
 		},
 		{
 			name:    "topic cap below the -1 sentinel",

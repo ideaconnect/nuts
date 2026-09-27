@@ -610,14 +610,12 @@ These are carried over from the v0.4 burn-list (P2 product polish).
   modes). End such streams, for example when the stream's creation time
   changes, so clients reconnect and take the cursor-ahead fallback (#103).
   Documented in `docs/TROUBLESHOOTING.md` meanwhile.
-- [ ] P1 ([#134]): Notice a silently dead NATS server sooner. NUTS keeps nats.go's
-  two-minute ping interval, so after packets start being dropped it takes
-  minutes to declare the connection stale, and meanwhile each new request
-  waits about 7–10 s for JetStream timeouts before it is told to retry
-  (seen in the example stack with a paused NATS container). Set a shorter
-  `PingInterval` (for example 20 s with two outstanding) or add a
-  `nats_ping_interval` directive. Documented in `docs/TROUBLESHOOTING.md`
-  meanwhile.
+- [x] P1 ([#134]): Notice a silently dead NATS server sooner. NUTS kept nats.go's
+  two-minute ping interval, so a server that stopped answering took minutes
+  to declare stale, and meanwhile each new request waited about 7–10 s for
+  JetStream timeouts before it was told to retry (seen in the example stack
+  with a paused NATS container). Done: `nats_ping_interval`, 20 s by default
+  with two pings outstanding, so the outage is noticed within a minute.
 - [ ] P2: Optional event-type mapping from topic or metadata.
 - [ ] P2: Optional payload envelope customization for raw payload-only events.
 - [ ] P2: Expose the NATS server version and stream metadata in health or
@@ -662,7 +660,8 @@ These are carried over from the v0.4 burn-list (P2 product polish).
 - [x] The functional matrix is green on every supported server (per D3),
   including 2.15: 27 of 27 scenarios on 2.10, 2.12, 2.14 and 2.15.
 - [x] The unit package runs in 20 s or less, and no fixed sleep is used as
-  synchronisation. About 17 s (21.5 s under `-race`). The sleeps left are
+  synchronisation. About 20 s (25 s under `-race`) since the tests for #134
+  joined; it was 17 s. The sleeps left are
   assertions (the replay-window age, the window in which no late callback may
   run) or simulate a slow client.
 - [x] Statement mutants mA, mB, mE, mF, mI and mW are killed, and the gremlins

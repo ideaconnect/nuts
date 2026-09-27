@@ -50,6 +50,7 @@ type testContext struct {
 	clients        map[string]*clientContext
 	streamNames    map[string]struct{}
 	sseReadDone    chan struct{}
+	natsPaused     bool
 }
 
 type sseEvent struct {
@@ -1008,6 +1009,14 @@ func clientShouldNotHaveReceivedEventContaining(name, text string) error {
 func cleanupScenarioState() error {
 	var cleanupErrs []string
 
+	// A scenario that failed while NATS was paused must not leave it paused
+	// for the ones after it.
+	if tc.natsPaused {
+		if err := natsAnswersAgain(); err != nil {
+			cleanupErrs = append(cleanupErrs, err.Error())
+		}
+	}
+
 	if tc.cancelFunc != nil {
 		tc.cancelFunc()
 		tc.cancelFunc = nil
@@ -1146,6 +1155,9 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^I publish (\d+) messages to subject "([^"]*)"$`, iPublishNMessagesToSubject)
 	ctx.Step(`^I publish (\d+) messages to subject "([^"]*)" at once$`, iPublishNMessagesToSubjectAtOnce)
 	ctx.Step(`^NATS restarts$`, natsRestarts)
+	ctx.Step(`^NATS stops answering$`, natsStopsAnswering)
+	ctx.Step(`^NATS answers again$`, natsAnswersAgain)
+	ctx.Step(`^an EventSource request for SSE endpoint "([^"]*)" is told to retry within (\d+) seconds?$`, anEventSourceRequestIsToldToRetryWithin)
 	ctx.Step(`^the stream "([^"]*)" should have (\d+) consumers? for subject "([^"]*)"$`, theStreamShouldHaveConsumersForSubject)
 	ctx.Step(`^the received message event ids should be contiguous$`, theReceivedMessageEventIDsShouldBeContiguous)
 
@@ -1289,6 +1301,64 @@ func natsRestarts() error {
 		}
 		resp.Body.Close()
 		return resp.StatusCode == http.StatusOK, fmt.Sprintf("readyz answered %d", resp.StatusCode)
+	})
+}
+
+// natsStopsAnswering pauses the stack's NATS container: its connections stay
+// open but nothing is answered, like a VM that froze or a link that drops
+// every packet.
+func natsStopsAnswering() error {
+	container := getEnvOrDefault("TEST_NATS_CONTAINER", "nuts-nats")
+	if out, err := exec.Command("docker", "pause", container).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker pause %s: %v: %s", container, err, strings.TrimSpace(string(out)))
+	}
+	tc.natsPaused = true
+	return nil
+}
+
+// natsAnswersAgain unpauses the stack's NATS container and waits until NUTS
+// reports ready again.
+func natsAnswersAgain() error {
+	container := getEnvOrDefault("TEST_NATS_CONTAINER", "nuts-nats")
+	if out, err := exec.Command("docker", "unpause", container).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker unpause %s: %v: %s", container, err, strings.TrimSpace(string(out)))
+	}
+	tc.natsPaused = false
+	return waitUntil("NUTS ready after NATS answers again", 3*functionalWaitTimeout, func() (bool, string) {
+		resp, err := http.Get(tc.baseURL + "/events/readyz")
+		if err != nil {
+			return false, err.Error()
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK, fmt.Sprintf("readyz answered %d", resp.StatusCode)
+	})
+}
+
+// anEventSourceRequestIsToldToRetryWithin keeps sending EventSource-style
+// requests, each given a second, until one is answered with a retry: stream.
+// Before NUTS notices an outage, requests wait out their JetStream timeouts
+// and miss that second.
+func anEventSourceRequestIsToldToRetryWithin(endpoint string, seconds int) error {
+	client := &http.Client{Timeout: time.Second}
+	return waitUntil("a retry: answer from "+endpoint, time.Duration(seconds)*time.Second, func() (bool, string) {
+		req, err := http.NewRequest("GET", tc.baseURL+endpoint, nil)
+		if err != nil {
+			return false, err.Error()
+		}
+		req.Header.Set("Accept", "text/event-stream")
+		resp, err := client.Do(req)
+		if err != nil {
+			return false, err.Error()
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return false, err.Error()
+		}
+		if resp.StatusCode == http.StatusOK && strings.Contains(string(body), "retry:") {
+			return true, ""
+		}
+		return false, fmt.Sprintf("answered %d: %q", resp.StatusCode, body)
 	})
 }
 

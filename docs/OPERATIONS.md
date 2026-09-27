@@ -61,7 +61,11 @@ filters when correlating logs with alerts.
 - `/readyz` returns `503` with `"nats":"disconnected"`.
 - Blackbox readiness panel drops to `0` while `/livez` remains `200`.
 - Logs contain `disconnected from NATS`; later recovery logs contain
-  `reconnected to NATS`.
+  `reconnected to NATS`. A server that stopped answering without closing the
+  connection shows up as `stale connection`, two to three
+  `nats_ping_interval`s (40–60 s by default) after it went quiet; until then
+  new requests wait about 7 s for their JetStream timeouts before being
+  refused.
 - New stream requests are refused at once with
   `disconnect_reason=jetstream_unavailable`: plain clients get `503` with
   `Retry-After`, browsers a `retry:` stream, so `EventSource` keeps

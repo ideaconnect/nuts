@@ -24,6 +24,14 @@ import (
 // defaultMaxEventSize is the SSE event size cap applied when MaxEventSize is 0.
 const defaultMaxEventSize = 1048576 // 1 MiB
 
+// defaultNatsPingIntervalSeconds is how often NUTS pings the NATS server when
+// nats_ping_interval is 0. nats.go counts the connection stale once two pings
+// go unanswered, so a server that stops answering without closing the
+// connection is noticed within two to three intervals. With nats.go's own
+// interval, two minutes, that took four to six minutes, and every request
+// waited out its JetStream timeouts in the meantime (#134).
+const defaultNatsPingIntervalSeconds = 20
+
 // defaultClientBufferSize is the per-connection NATS message buffer length
 // used when ClientBufferSize is unset.
 const defaultClientBufferSize = 64
@@ -154,6 +162,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	if h.ReconnectWait <= 0 {
 		h.ReconnectWait = 2
+	}
+	if h.NatsPingInterval <= 0 {
+		h.NatsPingInterval = defaultNatsPingIntervalSeconds
 	}
 	// NatsIdleHeartbeat: 0 means "use default" (10s); the explicit
 	// operator-disable sentinel (-1) is preserved as-is so
@@ -454,6 +465,7 @@ func (h *Handler) connectNATS() error {
 		nats.Name("nuts-caddy"),
 		nats.ReconnectWait(time.Duration(h.ReconnectWait) * time.Second),
 		nats.MaxReconnects(maxReconnects),
+		nats.PingInterval(time.Duration(h.NatsPingInterval) * time.Second),
 
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			metricsNATSConnectionEvents.WithLabelValues("disconnect").Inc()
@@ -760,6 +772,9 @@ func (h *Handler) validateConfigValues() error {
 	}
 	if h.ReconnectWait < 0 {
 		return fmt.Errorf("reconnect_wait must be >= 0")
+	}
+	if h.NatsPingInterval < 0 {
+		return fmt.Errorf("nats_ping_interval must be >= 0")
 	}
 	// nats_idle_heartbeat upper bound: must leave room for at least two
 	// missed heartbeats before the server reaps the ephemeral via

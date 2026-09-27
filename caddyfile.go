@@ -178,6 +178,16 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.ReconnectWait = v
 
+			case "nats_ping_interval":
+				v, err := parseInt("nats_ping_interval")
+				if err != nil {
+					return err
+				}
+				if v < 0 {
+					return d.Errf("nats_ping_interval must be >= 0 (0 uses the default)")
+				}
+				h.NatsPingInterval = v
+
 			case "max_reconnects":
 				v, err := parseInt("max_reconnects")
 				if err != nil {

@@ -371,6 +371,7 @@ nuts {
     subscriber_jwt_cookie <name> # Optional JWT cookie for browser EventSource clients
     heartbeat_interval <seconds> # SSE keep-alive ticker interval (0=default 30)
     reconnect_wait <seconds>     # Reconnect wait time (0=default 2)
+    nats_ping_interval <seconds> # NATS ping interval; two unanswered = stale (0=default 20)
     nats_idle_heartbeat <seconds># Pull-consumer heartbeat: default 10, must be < 15
     max_reconnects <count>       # Max reconnects, 0=none, -1=infinite (default: -1)
     max_event_size <bytes>       # Max SSE event size (0=default 1 MiB, <0=unlimited)
@@ -432,7 +433,7 @@ listed as accepted are rejected when the configuration loads.
 | `max_reconnects` | Omitted: unlimited; `0`: never reconnect | `-1`: unlimited |
 | `write_timeout` | 30 s default | `-1`: no deadline |
 | `nats_idle_heartbeat` | 10 s default | `-1`: accepted, but the library's 5 s default applies (warning) |
-| `heartbeat_interval`, `reconnect_wait` | 30 s and 2 s defaults | None |
+| `heartbeat_interval`, `reconnect_wait`, `nats_ping_interval` | 30 s, 2 s and 20 s defaults | None |
 | `client_buffer_size` | 64 default | None |
 | `max_connections` | No cap | None |
 | `replay_max_messages`, `replay_window` | No limit | None |
@@ -503,6 +504,19 @@ normal write path.
 queue hand-off left to time out. Setting it logs a warning; it will be removed
 in the next major release.
 
+
+#### `nats_ping_interval`
+
+`nats_ping_interval <seconds>` sets how often NUTS pings the NATS server
+(20 seconds by default; `0` or omitted uses the default). After two
+unanswered pings the connection is stale: NUTS logs `disconnected from NATS`
+with `stale connection` and reconnects. A server that stops answering without
+closing the connection (packets dropped, a paused VM or container) is
+therefore noticed within two to three intervals. From then on new requests
+are told to retry at once; before that, each waits for its JetStream calls to
+time out, about 7 seconds. Open streams stay open either way and continue
+without a gap once NATS answers again. nats.go's own default, two minutes,
+took four to six minutes to notice such an outage.
 #### JetStream consumers
 
 Every SSE request gets its own ordered pull consumer, named

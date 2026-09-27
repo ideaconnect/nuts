@@ -70,6 +70,12 @@ type Handler struct {
 	// Default: 2.
 	ReconnectWait int `json:"reconnect_wait,omitempty"`
 
+	// NatsPingInterval is how often, in seconds, NUTS pings the NATS server.
+	// With two pings unanswered the connection is stale and NUTS reconnects,
+	// so a server that stops answering without closing the connection is
+	// noticed within two to three intervals. 0 uses the default. Default: 20.
+	NatsPingInterval int `json:"nats_ping_interval,omitempty"`
+
 	// MaxReconnects limits total NATS reconnection attempts.
 	// 0 means "no reconnects", -1 means "unlimited". Nil (omitted from
 	// Caddyfile or JSON) defaults to unlimited so the historical "retry

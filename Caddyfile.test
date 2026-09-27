@@ -25,6 +25,7 @@
 			topic_prefix {$TOPIC_PREFIX:events.}
 			heartbeat_interval 1
 			nats_idle_heartbeat 1
+			nats_ping_interval 1
 			allowed_origins *
 		}
 	}
@@ -38,6 +39,7 @@
 			topic_prefix {$TOPIC_PREFIX:events.}
 			heartbeat_interval 1
 			nats_idle_heartbeat 1
+			nats_ping_interval 1
 			allowed_origins *
 			shared_subscriptions
 		}
@@ -56,6 +58,7 @@
 			topic_prefix {$TOPIC_PREFIX:events.}
 			heartbeat_interval 1
 			nats_idle_heartbeat 1
+			nats_ping_interval 1
 			allowed_origins *
 		}
 	}

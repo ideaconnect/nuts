@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -295,6 +296,100 @@ func TestHandler_connectNATS_AsyncErrorsAreCountedAndLogged(t *testing.T) {
 	}
 	if !hasLogField(obs, "kind", "slow_consumer") || !hasLogField(obs, "subject", "flood") {
 		t.Errorf("async error logged without its kind or subject: %+v", obs.All())
+	}
+}
+
+// TestHandler_connectNATS_PingSettings: the connection pings the server every
+// nats_ping_interval seconds (20 by default) and counts it stale after two
+// unanswered pings. Two is nats.go's default; the documented detection time
+// of two to three intervals relies on it.
+func TestHandler_connectNATS_PingSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  int
+		want time.Duration
+	}{
+		{"default", 0, 20 * time.Second},
+		{"configured", 7, 7 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := provisionOnStream(t, jetstream.StreamConfig{Name: "EVENTS", Subjects: []string{"events.>"}}, func(h *Handler) {
+				h.NatsPingInterval = tc.set
+			})
+			h.mu.RLock()
+			opts := h.conn.Opts
+			h.mu.RUnlock()
+			if opts.PingInterval != tc.want || opts.MaxPingsOut != 2 {
+				t.Fatalf("PingInterval=%v MaxPingsOut=%d, want %v and 2", opts.PingInterval, opts.MaxPingsOut, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandler_connectNATS_NoticesAServerThatStopsAnswering covers #134: a
+// server that stops answering without closing the connection (the proxy
+// swallows all traffic, like a paused VM) is noticed after a few unanswered
+// pings, and from then on a request is told to retry at once instead of
+// waiting out its JetStream timeouts. With nats.go's two-minute default it
+// went unnoticed for minutes.
+func TestHandler_connectNATS_NoticesAServerThatStopsAnswering(t *testing.T) {
+	t.Parallel() // asserts no process-wide metric
+	ns := startJetStreamServer(t)
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	proxy := newBlackholeProxy(t, ns.Addr().String())
+	core, obs := observer.New(zap.WarnLevel)
+	h, srv := newContractServer(t, proxy.url(), func(h *Handler) {
+		h.NatsPingInterval = 1
+		h.logger = zap.New(core)
+	})
+
+	proxy.discard.Store(true)
+	stalled := time.Now()
+	for {
+		h.mu.RLock()
+		connected := h.conn.IsConnected()
+		h.mu.RUnlock()
+		if !connected {
+			break
+		}
+		// Two unanswered pings, one second apart, then the third tick.
+		if time.Since(stalled) > 5*time.Second {
+			t.Fatal("a server that stopped answering was not noticed within 5 s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Logf("noticed after %v", time.Since(stalled).Round(100*time.Millisecond))
+	if !waitForLogMessage(t, obs, "disconnected from NATS", 2*time.Second) {
+		t.Fatalf("no disconnect logged: %+v", obs.All())
+	}
+	stale := false
+	for _, entry := range obs.FilterMessage("disconnected from NATS").All() {
+		if err, ok := entry.ContextMap()["error"].(string); ok && strings.Contains(err, "stale connection") {
+			stale = true
+		}
+	}
+	if !stale {
+		t.Fatalf("the disconnect was not put down to a stale connection: %+v", obs.All())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/events?topic=a", nil)
+	req.Header.Set("Accept", "text/event-stream")
+	asked := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if took := time.Since(asked); resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "retry:") || took > time.Second {
+		t.Fatalf("answered %d after %v with %q, want the retry stream at once", resp.StatusCode, took, body)
 	}
 }
 
@@ -759,6 +854,11 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 			wantErr: "reconnect_wait",
 		},
 		{
+			name:    "negative ping interval",
+			mutate:  func(h *Handler) { h.NatsPingInterval = -1 },
+			wantErr: "nats_ping_interval",
+		},
+		{
 			name:    "nats_idle_heartbeat at boundary equals InactiveThreshold/2",
 			mutate:  func(h *Handler) { h.NatsIdleHeartbeat = 15 },
 			wantErr: "nats_idle_heartbeat",
@@ -881,6 +981,11 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			name:     "negative reconnect wait",
 			fragment: `"reconnect_wait": -2`,
 			wantErr:  "reconnect_wait",
+		},
+		{
+			name:     "negative ping interval",
+			fragment: `"nats_ping_interval": -1`,
+			wantErr:  "nats_ping_interval",
 		},
 		{
 			name:     "nats_idle_heartbeat at boundary equals InactiveThreshold/2",

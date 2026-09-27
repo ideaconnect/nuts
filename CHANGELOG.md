@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nats_ping_interval` sets how often NUTS pings the NATS server, 20 seconds
+  by default (#134). NUTS used nats.go's two-minute default, so a server that
+  stopped answering without closing the connection (packets dropped, a
+  paused VM or container) went unnoticed for four to six minutes, and every
+  new request waited about 7 to 10 seconds for its JetStream timeouts in the
+  meantime. After two unanswered pings the connection is now stale within
+  a minute, logged as `disconnected from NATS` with `stale connection`, and
+  requests are told to retry at once.
+
 ### Fixed
 - Release notes told users to `docker pull idcttech/nuts:<version>` without
   the `v` the image tags carry (`idcttech/nuts:v0.5.0`); the footer now uses
