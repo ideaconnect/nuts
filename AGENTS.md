@@ -33,6 +33,23 @@ to replace it.
   sequence after a NATS reconnect or consumer loss; a client whose writes
   stop completing is disconnected at `write_timeout` and resumes via
   `Last-Event-ID`.
+- `shared_subscriptions`: connections caught up with the live stream share
+  one consumer per topic set, and move to their own when they fall behind.
+- A stream watch: stream-info reads, on every stream request and every 10 s,
+  notice a JetStream stream recreated or restored under open SSE streams.
+  Those streams end with a `reset` event whose id, `0`, makes EventSource
+  replay the new stream (`stream_recreated`, `stream_rewound`).
+- NATS liveness: pings every `nats_ping_interval` (20 s) declare a server
+  that stopped answering stale within a minute. Until then, a stream-info
+  read that times out makes NUTS ping, and while the ping goes unanswered,
+  requests are told to retry at once.
+- Event shaping: `event_type` names events (`message`, `topic`, or
+  `header <name>`), `payload_format raw` sends the NATS payload itself, and
+  `event_id_format sequence_time` makes ids `<sequence>-<unix ns>`, so that
+  a cursor from a replaced stream is noticed.
+- Retry hints: `sse_retry` sends `retry:` with each handshake, and
+  `transient_retry` sets the average of the jittered delay NUTS asks for
+  after transient failures.
 - NATS authentication (credentials file, token, user/password) and TLS / mTLS
   to the NATS server.
 - Optional first-party subscriber JWT auth (`subscriber_jwt_key`,
@@ -44,10 +61,13 @@ to replace it.
 - Per-frame write deadlines (`write_timeout`, 30 s by default).
   `dispatch_timeout` is deprecated and has no effect.
 - Probes: `live_path` (`/livez`), `ready_path` (`/readyz`), and the legacy
-  `health_path` (`/healthz`).
+  `health_path` (`/healthz`); `health_details` adds the NATS server and the
+  stream's details to the readiness JSON.
 - Hub discovery via `Link: <url>; rel="nuts"` when `hub_url` is set.
 - Prometheus metrics (`nuts_*`) registered via `promauto`, surfaced through
   Caddy's `/metrics` handler.
+- A dependency-free JavaScript helper for replay-aware pages,
+  [example/nuts-client.js](example/nuts-client.js).
 
 A current and complete directive list with defaults, JSON field names,
 validation rules, and operational notes is in
@@ -82,7 +102,7 @@ Tests live alongside the source:
 | [serve_test.go](serve_test.go) | Request parsing, replay planning, formatting, and stream helper unit tests without live NATS. |
 | [serve_integration_test.go](serve_integration_test.go) | `ServeHTTP` end to end on an embedded JetStream server: streaming, replay cursors, write failures, probes, hub discovery, heartbeats, topic prefixes, NATS restarts. |
 | [hardening_test.go](hardening_test.go) | Request hardening: CORS, connection, topic and event-size limits, probe paths, replay caps and windows, oversized cursors. |
-| [consumer_test.go](consumer_test.go) | Feed unit tests (ordering, oversize drops, backpressure, failure and stop paths) with a fake iterator; recovery of a deleted consumer. |
+| [consumer_test.go](consumer_test.go) | Feed unit tests (ordering, oversize drops, backpressure, failure and stop paths) with a fake iterator; recovery of a deleted consumer; the stream watch (generations, recreation and rewind detection, the poll's continuity check) and the `reset` frame. |
 | [shared_test.go](shared_test.go) | Shared-subscription mechanics (ring, gap-free joins, fall-behind, lifecycle) and end-to-end behaviour; the delivery contract tests also run in shared mode. |
 | [helpers_test.go](helpers_test.go) | Helper edge cases: topic and cookie validation, JSON, URL redaction, SSE writes and deadlines, NATS error classification. |
 | [metrics_test.go](metrics_test.go) | Each metric moves with the event it counts; registration on Caddy's registry. |
@@ -92,7 +112,7 @@ Tests live alongside the source:
 | [caddy_integration_test.go](caddy_integration_test.go) | Caddy-in-the-loop tests via `caddy.Load` (access logs, HTTP metrics, the metrics endpoint). |
 | [performance_test.go](performance_test.go) | `TestPerformance_*` confidence tests and benchmarks. |
 | [fuzz_test.go](fuzz_test.go) | Fuzz targets holding the topic, filter and cookie validators to their contracts in both directions, and the subject matchers to a reference; the nightly Fuzz workflow runs every target. |
-| [docs_test.go](docs_test.go) | Keeps metric names in README, website, docs and ops files in step with `metrics.go`, and the nightly fuzz matrix in step with the `Fuzz` functions. |
+| [docs_test.go](docs_test.go) | Keeps metric names in README, website, docs and ops files in step with `metrics.go`, the defaults documented in `docs/CONFIGURATION.md` in step with `Provision`, and the nightly fuzz matrix in step with the `Fuzz` functions. |
 | [testutil_test.go](testutil_test.go) | Helpers shared by more than one test file, by theme: embedded NATS servers (and restarts on the same port), handler set-up, response writers, SSE stream readers and assertions, fakes for the stream path, metric and log readers, subscriber JWTs. A helper used by one file lives in that file. |
 | [functional_test/](functional_test/) | [Godog](https://github.com/cucumber/godog) BDD tests against a real Docker Compose stack. |
 | [features/](features/) | Gherkin `.feature` files driving the Godog suite. |
@@ -265,17 +285,27 @@ that gap before review starts, instead of leaking it into review load.
 
 ## CI and release surfaces
 
-CI is GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml),
-[.github/workflows/release.yml](.github/workflows/release.yml),
-[.github/workflows/website.yml](.github/workflows/website.yml)).
+CI is GitHub Actions:
+
+| Workflow | Runs on |
+| --- | --- |
+| [ci.yml](.github/workflows/ci.yml) | Every pull request and every push to `main`/`master` or a `v*` tag. |
+| [release.yml](.github/workflows/release.yml) | `v*` tags. |
+| [website.yml](.github/workflows/website.yml) | `v*` tags, and `workflow_dispatch` for a manual redeploy. |
+| [fuzz.yml](.github/workflows/fuzz.yml) | Nightly at 04:00 UTC: every fuzz target. |
+| [mutation.yml](.github/workflows/mutation.yml) | Weekly on Sunday at 03:00 UTC: the full gremlins run. |
+
+Actions are pinned by major version (`@v7`), and Dependabot proposes the
+bumps.
 
 PRs run, in this order:
 
 1. `gofmt`, `go mod tidy` diff check, golangci-lint, unit tests with coverage,
-   focused race tests, `go vet`, the example JavaScript client's tests,
-   `govulncheck`.
+   the whole unit package under `-race`, `go vet`, the example JavaScript
+   client's tests (`make test-js`), `govulncheck`.
 2. Functional test matrix (`nats:2.10-alpine`, `nats:2.12-alpine`,
-   `nats:2.14-alpine`, `nats:2.15-alpine`) and a 3× functional stress pass.
+   `nats:2.14-alpine`, `nats:2.15-alpine`), a 3× functional stress pass, and
+   one functional pass under `-race`.
 3. Coverage upload to Codecov.
 4. Production Docker image build + `caddy adapt` validation + Trivy scan +
    SBOM (SPDX JSON) artifact.
@@ -283,17 +313,24 @@ PRs run, in this order:
    change ([.goreleaser.yml](.goreleaser.yml), workflows, `Makefile`,
    `Dockerfile`).
 
-Pushes to `main`/`master` and `v*` tags additionally:
+Pushes to `main`/`master` additionally build the multi-arch (`linux/amd64`,
+`linux/arm64`) image, scan it with Trivy before and after the push, and push
+it as `idcttech/nuts:latest` with provenance and SBOM attestations.
 
-1. Build and push the multi-arch (`linux/amd64`, `linux/arm64`)
-   `idcttech/nuts` image with provenance and SBOM attestations.
-2. On tag: scan the pushed image by digest with Trivy and sign all tags
-   keyless via Cosign + GitHub OIDC.
-3. Update the Docker Hub description from [DOCKERHUB_README.md](DOCKERHUB_README.md).
-4. GoReleaser publishes archives and SBOMs for the tag.
-5. Build the [website/](website/) Jekyll site and deploy it to Cloudflare at
-   `https://idct.tech/nuts` ([website.yml](.github/workflows/website.yml); also
-   runnable on demand via `workflow_dispatch`).
+`v*` tags additionally:
+
+1. Build, scan and push the image the same way as `idcttech/nuts:<tag>`
+   (a tag never moves `latest`), then sign it keylessly via Cosign + GitHub
+   OIDC.
+2. Once CI has passed on the tagged commit, GoReleaser publishes the GitHub
+   release: archives, their SBOMs, and `checksums.txt` signed with Cosign
+   (`checksums.txt.sig`, `checksums.txt.pem`).
+3. Build the [website/](website/) Jekyll site and deploy it to Cloudflare at
+   `https://idct.tech/nuts`. Docs changes merged to `main` go live with the
+   next tag.
+
+No workflow updates the Docker Hub description; its text is in
+[DOCKERHUB_README.md](DOCKERHUB_README.md).
 
 Release surfaces and verification commands are documented in
 [docs/RELEASE.md](docs/RELEASE.md). Operator-facing release notes follow the
@@ -306,7 +343,8 @@ The published artefact set:
 - `idcttech/nuts:<version>` Docker image (multi-arch, non-root uid 10001,
   Cosign-signed, SBOM-attested for tag releases). `:latest` is mutable — pin
   to a concrete tag in production.
-- GitHub release archives with SHA-256 checksums and SBOMs.
+- GitHub release archives with SBOMs, and SHA-256 checksums signed with
+  Cosign.
 - Source build via `go build ./cmd/caddy` or `xcaddy build --with
   github.com/ideaconnect/nuts`.
 

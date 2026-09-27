@@ -60,9 +60,22 @@ cosign verify idcttech/nuts:<version> \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-GitHub release archives are covered by SHA-256 checksums and release SBOMs.
-Checksum signing can be added later with Cosign `sign-blob` if downstream
-consumers require detached signatures for archive artifacts.
+GitHub release archives are covered by release SBOMs and by SHA-256 checksums
+in `checksums.txt`, which the release workflow signs keylessly with Cosign
+`sign-blob` (`checksums.txt.sig`, `checksums.txt.pem`). Verify the checksums'
+signature, then an archive against them:
+
+```bash
+cosign verify-blob checksums.txt \
+  --signature checksums.txt.sig \
+  --certificate checksums.txt.pem \
+  --certificate-identity-regexp 'https://github.com/ideaconnect/nuts/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+sha256sum --ignore-missing -c checksums.txt
+```
+
+Both workflows pin Cosign itself (`cosign-release: v2.6.3`): Cosign v3's
+`sign-blob` writes a bundle instead, which changes these files.
 
 ## Dependency Updates
 
