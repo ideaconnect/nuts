@@ -45,6 +45,22 @@
 		}
 	}
 
+	# The same stream with event ids that carry the message's time, for the
+	# recreated-stream scenarios in features/consumer_recovery.feature.
+	handle /checked* {
+		uri strip_prefix /checked
+		nuts {
+			nats_url {$NATS_URL:nats://localhost:4222}
+			stream_name {$STREAM_NAME:EVENTS}
+			topic_prefix {$TOPIC_PREFIX:events.}
+			heartbeat_interval 1
+			nats_idle_heartbeat 1
+			nats_ping_interval 1
+			allowed_origins *
+			event_id_format sequence_time
+		}
+	}
+
 	handle /example* {
 		root * /srv/example
 		uri strip_prefix /example

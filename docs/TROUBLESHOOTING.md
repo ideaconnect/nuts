@@ -202,10 +202,13 @@ Limits:
   still holds the message it last checked, which is at most 10 seconds old.
   If the stream's limits (`max_msgs`, `max_age`, `max_bytes`) remove messages
   within 10 seconds, such a rewind can go unnoticed.
-- A client that was disconnected while the stream was recreated reconnects
-  with a cursor from the old stream. While the cursor is ahead of the new
-  stream it gets the retained replay; once the new stream has passed it, the
-  client resumes after it and misses the new stream's messages before it.
+- A client that was disconnected while the stream was recreated or restored
+  reconnects with a cursor from the old stream. While the cursor is ahead of
+  the new stream it gets the retained replay; once the new stream has passed
+  it, the client resumes after it and misses the new stream's messages before
+  it. With `event_id_format sequence_time` NUTS notices such a cursor and
+  replays the stream from its start instead (#138): see README
+  "`event_id_format`".
 
 ## Docker Image Starts But Config Looks Wrong
 

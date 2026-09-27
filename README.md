@@ -382,6 +382,7 @@ nuts {
     write_timeout <seconds>      # Deadline for each SSE write/flush (0=default 30, -1=disabled)
     replay_max_messages <count>  # Cap replayed messages per reconnect (default: 0 = unlimited)
     replay_window <seconds>      # Time-bound replay to the last N seconds (default: 0 = all retained)
+    event_id_format <format>     # Event ids: sequence (default) or sequence_time (sequence and message time)
     health_path <path>           # Legacy readiness endpoint (empty/default: /healthz)
     live_path <path>             # Process liveness endpoint (empty/default: /livez)
     ready_path <path>            # NATS/stream readiness endpoint (empty/default: /readyz)
@@ -621,6 +622,37 @@ compatibility mode rather than a production recommendation for large retained
 streams. Pick bounds that match the largest replay you are willing to serve to
 one client, then size JetStream retention, `max_connections`, and edge
 rate-limits around that budget.
+
+#### `event_id_format`
+
+`event_id_format sequence_time` makes each event's id carry the stored time
+of its message as well as its stream sequence: `id: 42-1790513389663997004`,
+the time in Unix nanoseconds. The default, `sequence`, keeps the bare
+sequence (`id: 42`).
+
+A bare sequence cannot tell which stream it came from. When a stream is
+deleted and created again, or restored from a backup, it gives the sequences
+after its start or its backup's end to other messages. A client that was away
+at the time comes back with a cursor from the old stream. Once the new stream
+has passed that cursor, NUTS resumes after it, and the client misses the new
+stream's messages up to there.
+
+With `sequence_time`, NUTS reads the message the stream holds at the cursor's
+sequence. If its time differs, the stream is not the one the cursor came
+from, and the client replays the retained stream from its start (bounded by
+`replay_max_messages` and `replay_window`), logged as
+`replay_fallback_reason="cursor from another stream"`. A cursor whose message
+the stream no longer holds, trimmed by its limits or deleted, resumes after
+it as before. Connected clients do not need it: NUTS resets their cursors
+when it notices the change
+([TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#streams-close-after-the-stream-was-recreated-or-restored)).
+
+Both forms are accepted as `Last-Event-ID` and `?last-id=` whatever the
+setting, so it can be changed while clients are connected. Turn it on only if
+your clients treat event ids as opaque strings: code that parses them as
+integers needs to take the part before the `-`. Each resume from a timed
+cursor costs one extra message read (Direct Get on a stream with
+`allow_direct`).
 
 #### CORS and `allowed_origins`
 
@@ -1165,11 +1197,14 @@ The highest accepted cursor is `2^64 − 3`. NUTS adds `1` to the cursor to
 get the JetStream start sequence, and `2^64 − 1` is reserved as a "no
 sequence" sentinel, so `2^64 − 2` is rejected too: its start sequence would
 land on the sentinel. No real stream comes near these values, but an explicit
-cap matters for fuzz tests and for clients that synthesize cursors. Inputs
-longer than 20 digits (the length of the largest `uint64`) are rejected
-before parsing, as a guard against multi-megabyte numeric strings: they are
-answered with `"Invalid last-id value: too long"` (400) for `?last-id=` and
-logged as `"ignoring oversized Last-Event-ID header"` for the header.
+cap matters for fuzz tests and for clients that synthesize cursors. A cursor
+may also carry a time, `<sequence>-<unix ns>` (see
+[`event_id_format`](#event_id_format)); the time must be a positive integer.
+A sequence or a time longer than 20 digits (the length of the largest
+`uint64`) is rejected before parsing, as a guard against multi-megabyte
+numeric strings: it is answered with `"Invalid last-id value: too long"`
+(400) for `?last-id=` and logged as `"ignoring oversized Last-Event-ID
+header"` for the header.
 
 ### Message Format
 
@@ -1181,7 +1216,7 @@ data: {"topic":"my-topic","payload":{"your":"data"},"time":"2024-01-01T12:00:00Z
 id: 12345
 ```
 
-The `id` field contains the JetStream sequence number, which can be used with `last-id` or `Last-Event-ID` for replay. It is the last line of each event: SSE allows the fields in any order, and some clients (for example `@microsoft/fetch-event-source`) record an id as soon as they read it, so with the id last a frame cut off mid-write cannot make them resume after a message they never received.
+The `id` field contains the JetStream sequence number, which can be used with `last-id` or `Last-Event-ID` for replay. With [`event_id_format sequence_time`](#event_id_format) it also carries the stored time of the message: `id: 12345-1790513389663997004`. It is the last line of each event: SSE allows the fields in any order, and some clients (for example `@microsoft/fetch-event-source`) record an id as soon as they read it, so with the id last a frame cut off mid-write cannot make them resume after a message they never received.
 
 The first frame of every stream is the handshake event:
 

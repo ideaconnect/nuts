@@ -44,6 +44,7 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				live_path /live
 				ready_path /ready
 				hub_url https://example.com/events
+				event_id_format sequence_time
 				subscriber_jwt_key secret-key
 				subscriber_jwt_cookie nuts_session
 				allowed_origins https://example.com https://other.com
@@ -76,6 +77,7 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				LivePath:                  "/live",
 				ReadyPath:                 "/ready",
 				HubURL:                    "https://example.com/events",
+				EventIDFormat:             "sequence_time",
 				SubscriberJWTKey:          "secret-key",
 				SubscriberJWTCookie:       "nuts_session",
 				AllowedOrigins:            []string{"https://example.com", "https://other.com"},
@@ -380,6 +382,7 @@ func TestHandler_UnmarshalCaddyfile_MissingArgs(t *testing.T) {
 		{name: "missing heartbeat_interval arg", directive: "heartbeat_interval"},
 		{name: "missing reconnect_wait arg", directive: "reconnect_wait"},
 		{name: "missing nats_ping_interval arg", directive: "nats_ping_interval"},
+		{name: "missing event_id_format arg", directive: "event_id_format"},
 		{name: "missing max_reconnects arg", directive: "max_reconnects"},
 		{name: "missing max_event_size arg", directive: "max_event_size"},
 		{name: "missing dispatch_timeout arg", directive: "dispatch_timeout"},

@@ -864,6 +864,11 @@ func TestHandler_Validate_RejectsInvalidOptionalConfig(t *testing.T) {
 			wantErr: "nats_ping_interval",
 		},
 		{
+			name:    "unknown event id format",
+			mutate:  func(h *Handler) { h.EventIDFormat = "sequence-time" },
+			wantErr: "event_id_format",
+		},
+		{
 			name:    "nats_idle_heartbeat at boundary equals InactiveThreshold/2",
 			mutate:  func(h *Handler) { h.NatsIdleHeartbeat = 15 },
 			wantErr: "nats_idle_heartbeat",
@@ -991,6 +996,11 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			name:     "negative ping interval",
 			fragment: `"nats_ping_interval": -1`,
 			wantErr:  "nats_ping_interval",
+		},
+		{
+			name:     "unknown event id format",
+			fragment: `"event_id_format": "timestamp"`,
+			wantErr:  "event_id_format",
 		},
 		{
 			name:     "nats_idle_heartbeat at boundary equals InactiveThreshold/2",

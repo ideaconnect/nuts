@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -342,6 +343,57 @@ func waitForWatchedSequence(t *testing.T, h *Handler, lastSeq uint64) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// TestDeliveryContract_TimedCursorFromAnotherStreamReplaysIt covers #138: a
+// client that was away while its stream was recreated comes back with a
+// cursor from the old stream. A bare sequence cannot tell, and once the new
+// stream has passed it, NUTS resumes after it, skipping the new stream's
+// messages up to there. In the sequence_time format the cursor names its
+// message; the new stream holds another one at that sequence, and the client
+// replays the new stream from its start instead.
+func TestDeliveryContract_TimedCursorFromAnotherStreamReplaysIt(t *testing.T) {
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns := startJetStreamServer(t)
+		nc, err := nats.Connect(ns.ClientURL())
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(nc.Close)
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		js, _ := nc.JetStream()
+		_, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) {
+			h.EventIDFormat = eventIDSequenceTime
+			mode(h)
+		})
+
+		away := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
+		away.collectIDs(1, 3*time.Second)
+		publishRange(t, js, "events.alpha", 1, 3)
+		assertContiguousIDs(t, away.collectIDs(3, 3*time.Second), 1, 3)
+		cursor := away.lastID()
+		if seq, at, timed := strings.Cut(cursor, "-"); seq != "3" || !timed || at == "" {
+			t.Fatalf("last id = %q, want 3 with the message's time", cursor)
+		}
+		_ = away.resp.Body.Close()
+
+		if err := mustJetStream(t, nc).DeleteStream(context.Background(), "EVENTS"); err != nil {
+			t.Fatalf("DeleteStream: %v", err)
+		}
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		publishRange(t, js, "events.alpha", 1, 5) // past the client's 3
+
+		back := openSSEStream(t, srv.URL+"/events?topic=alpha", cursor)
+		assertContiguousIDs(t, back.collectIDs(5, 3*time.Second), 1, 5)
+
+		// A cursor that names the message the stream holds resumes after it.
+		again := openSSEStream(t, srv.URL+"/events?topic=alpha", back.lastID())
+		if connected := again.collectIDs(1, 3*time.Second); len(connected) != 1 || connected[0] != 5 {
+			t.Fatalf("connected id = %v, want the cursor 5", connected)
+		}
+		publishRange(t, js, "events.alpha", 6, 6)
+		assertContiguousIDs(t, again.collectIDs(1, 3*time.Second), 6, 6)
+	})
 }
 
 // TestDeliveryContract_LinkLossBeforeFirstMessageNeitherReplaysNorSkips: an

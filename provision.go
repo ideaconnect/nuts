@@ -206,6 +206,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.WriteTimeout == 0 {
 		h.WriteTimeout = defaultWriteTimeoutSeconds
 	}
+	if h.EventIDFormat == "" {
+		h.EventIDFormat = eventIDSequence
+	}
 	if h.HealthPath == "" {
 		h.HealthPath = defaultHealthPath
 	}
@@ -758,6 +761,11 @@ func (h *Handler) validateConfigValues() error {
 	}
 	if h.ReplayWindow < 0 {
 		return fmt.Errorf("replay_window must be >= 0")
+	}
+	switch h.EventIDFormat {
+	case "", eventIDSequence, eventIDSequenceTime:
+	default:
+		return fmt.Errorf("event_id_format must be %q or %q, not %q", eventIDSequence, eventIDSequenceTime, h.EventIDFormat)
 	}
 	if h.MaxTopicsPerSubscription < maxTopicsDisabledSentinel {
 		return fmt.Errorf("max_topics_per_subscription (%d) is invalid: the only accepted negative value is -1 (no limit); other negatives are rejected as typos",

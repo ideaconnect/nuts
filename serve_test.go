@@ -483,13 +483,115 @@ func TestConnectedEventID(t *testing.T) {
 }
 
 func TestFormatConnectedEvent(t *testing.T) {
-	withID := formatConnectedEvent(streamPlan{Topics: []string{"a", "b"}, Replay: replayPlan{Mode: replayModeDeliverNew, StartSequence: 43}})
+	h := &Handler{}
+	timed := replayPlan{Mode: replayModeDeliverNew, StartSequence: 43, PositionTime: 1790513389663997004, HasPositionTime: true}
+	withID := h.formatConnectedEvent(streamPlan{Topics: []string{"a", "b"}, Replay: timed})
 	if withID != "event: connected\ndata: {\"topics\":[\"a\",\"b\"]}\nid: 42\n\n" {
 		t.Fatalf("connected event with id = %q", withID)
 	}
-	withoutID := formatConnectedEvent(streamPlan{Topics: []string{"a"}, Replay: replayPlan{Mode: replayModeDeliverNew}})
+	withoutID := h.formatConnectedEvent(streamPlan{Topics: []string{"a"}, Replay: replayPlan{Mode: replayModeDeliverNew}})
 	if withoutID != "event: connected\ndata: {\"topics\":[\"a\"]}\n\n" {
 		t.Fatalf("connected event without id = %q", withoutID)
+	}
+
+	// #138: in the sequence_time format the id carries the time of the
+	// message it names, when known; position 0 names no message.
+	h.EventIDFormat = eventIDSequenceTime
+	if got := h.formatConnectedEvent(streamPlan{Topics: []string{"a"}, Replay: timed}); got != "event: connected\ndata: {\"topics\":[\"a\"]}\nid: 42-1790513389663997004\n\n" {
+		t.Fatalf("timed connected event = %q", got)
+	}
+	untimed := timed
+	untimed.HasPositionTime = false
+	if got := h.formatConnectedEvent(streamPlan{Topics: []string{"a"}, Replay: untimed}); got != "event: connected\ndata: {\"topics\":[\"a\"]}\nid: 42\n\n" {
+		t.Fatalf("connected event without a known time = %q", got)
+	}
+	start := replayPlan{Mode: replayModeDeliverNew, StartSequence: 1, PositionTime: 5, HasPositionTime: true}
+	if got := h.formatConnectedEvent(streamPlan{Topics: []string{"a"}, Replay: start}); got != "event: connected\ndata: {\"topics\":[\"a\"]}\nid: 0\n\n" {
+		t.Fatalf("connected event at position 0 = %q", got)
+	}
+}
+
+// TestHandler_PlanSubscriptionChecksTheCursorsMessage covers #138: a cursor
+// in the sequence_time format names the message it was written for. The
+// same message at that sequence resumes after it; another one means the
+// stream was recreated or restored since, and the request replays the
+// retained stream instead. A message the stream no longer holds cannot be
+// checked and resumes as before.
+func TestHandler_PlanSubscriptionChecksTheCursorsMessage(t *testing.T) {
+	h := &Handler{}
+	at := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	cursor := streamPlan{FullSubjects: []string{"events.alpha"}, Replay: replayPlan{
+		HasLastID: true, Mode: replayModeStartSequence, StartSequence: 6, PositionTime: at.UnixNano(), HasPositionTime: true,
+	}}
+	snapshot := streamInfoSnapshot{HasSnapshot: true, FirstSeq: 1, LastSeq: 9, Subjects: []string{"events.>"}}
+
+	same := snapshot
+	same.PositionMessageTime, same.HasPositionMessage = at, true
+	if got := h.planSubscription(cursor, same).Replay; got.Mode != replayModeStartSequence || got.StartSequence != 6 {
+		t.Fatalf("the same message: replay %+v, want to resume at 6", got)
+	}
+	other := snapshot
+	other.PositionMessageTime, other.HasPositionMessage = at.Add(time.Nanosecond), true
+	if got := h.planSubscription(cursor, other).Replay; got.Mode != replayModeFallbackDeliverAll || got.FallbackReason != "cursor from another stream" {
+		t.Fatalf("another message: replay %+v, want the deliver-all fallback", got)
+	}
+	if got := h.planSubscription(cursor, snapshot).Replay; got.Mode != replayModeStartSequence || got.StartSequence != 6 {
+		t.Fatalf("no message to check: replay %+v, want to resume at 6", got)
+	}
+
+	fresh := streamPlan{FullSubjects: []string{"events.alpha"}, Replay: replayPlan{Mode: replayModeDeliverNew}}
+	timed := snapshot
+	timed.LastTime = at
+	if got := h.planSubscription(fresh, timed).Replay; got.StartSequence != 10 || !got.HasPositionTime || got.PositionTime != at.UnixNano() {
+		t.Fatalf("a request without a cursor: replay %+v, want to start after 9 at %d", got, at.UnixNano())
+	}
+	if got := h.planSubscription(fresh, snapshot).Replay; got.HasPositionTime {
+		t.Fatalf("a stream without a last message time: replay %+v, want no position time", got)
+	}
+	empty := streamInfoSnapshot{HasSnapshot: true, LastTime: at}
+	if got := h.planSubscription(fresh, empty).Replay; got.HasPositionTime {
+		t.Fatalf("an empty stream: replay %+v, want no position time", got)
+	}
+}
+
+// TestHandler_ReadStreamSnapshot_ReadsTheCursorsMessage: the message at a
+// timed cursor is read only when the stream can hold it (#138).
+func TestHandler_ReadStreamSnapshot_ReadsTheCursorsMessage(t *testing.T) {
+	h := &Handler{StreamName: "EVENTS", logger: zap.NewNop()}
+	stored := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	stream := &continuityStream{
+		info: &jetstream.StreamInfo{State: jetstream.StreamState{FirstSeq: 3, LastSeq: 9}},
+		msg:  &jetstream.RawStreamMsg{Sequence: 5, Time: stored},
+	}
+	read := func(startSequence uint64, timed bool) streamInfoSnapshot {
+		stream.calls = 0
+		plan := streamPlan{Replay: replayPlan{HasLastID: true, StartSequence: startSequence, PositionTime: 1, HasPositionTime: timed}}
+		return h.readStreamSnapshot(context.Background(), fakeStreamLookup{stream: stream}, plan)
+	}
+	if got := read(6, true); !got.HasPositionMessage || !got.PositionMessageTime.Equal(stored) || stream.calls != 1 {
+		t.Fatalf("timed cursor at 5: message=%v at %v after %d reads, want it read once", got.HasPositionMessage, got.PositionMessageTime, stream.calls)
+	}
+	for _, c := range []struct {
+		name  string
+		start uint64
+		timed bool
+	}{
+		{"a cursor without a time", 6, false},
+		{"a cursor at 0", 1, true},
+		{"below the stream's first message", 3, true},
+		{"at the first message", 4, true},
+		{"at the last message", 10, true},
+		{"past the last message", 11, true},
+	} {
+		got := read(c.start, c.timed)
+		want := c.name == "at the first message" || c.name == "at the last message"
+		if got.HasPositionMessage != want || stream.calls != btoi(want) {
+			t.Fatalf("%s: message read %v (%d reads), want %v", c.name, got.HasPositionMessage, stream.calls, want)
+		}
+	}
+	stream.msg, stream.err = nil, jetstream.ErrMsgNotFound
+	if got := read(6, true); got.HasPositionMessage {
+		t.Fatal("a deleted message was recorded")
 	}
 }
 
@@ -1075,28 +1177,41 @@ func TestServeStream_ReplayCapHoldsWithoutSnapshot(t *testing.T) {
 	}
 }
 
+// TestParseReplayCursor: a cursor is a stream sequence, optionally followed
+// by the stored time of that message in the sequence_time format (#138).
+// Both are accepted whatever the handler writes.
 func TestParseReplayCursor(t *testing.T) {
 	cases := []struct {
 		value   string
-		want    uint64
+		want    replayCursor
 		problem cursorProblem
 	}{
 		{value: "", problem: cursorAbsent},
-		{value: "0", want: 0, problem: cursorValid},
-		{value: "41", want: 41, problem: cursorValid},
-		{value: strconv.FormatUint(maxReplayCursor-2, 10), want: maxReplayCursor - 2, problem: cursorValid},
+		{value: "0", want: replayCursor{seq: 0}, problem: cursorValid},
+		{value: "41", want: replayCursor{seq: 41}, problem: cursorValid},
+		{value: strconv.FormatUint(maxReplayCursor-2, 10), want: replayCursor{seq: maxReplayCursor - 2}, problem: cursorValid},
 		{value: strconv.FormatUint(maxReplayCursor-1, 10), problem: cursorInvalid},
 		{value: strconv.FormatUint(maxReplayCursor, 10), problem: cursorInvalid},
 		{value: "abc", problem: cursorInvalid},
 		{value: "-1", problem: cursorInvalid},
 		{value: strings.Repeat("9", 20), problem: cursorInvalid},
 		{value: strings.Repeat("1", 21), problem: cursorTooLong},
+		{value: "41-1790513389663997004", want: replayCursor{seq: 41, time: 1790513389663997004, hasTime: true}, problem: cursorValid},
+		{value: "0-1", want: replayCursor{seq: 0, time: 1, hasTime: true}, problem: cursorValid},
+		{value: "41-", problem: cursorInvalid},
+		{value: "41-0", problem: cursorInvalid},
+		{value: "41--5", problem: cursorInvalid},
+		{value: "41-5-6", problem: cursorInvalid},
+		{value: "41-x", problem: cursorInvalid},
+		{value: "41-" + strings.Repeat("9", 19), problem: cursorInvalid},
+		{value: "41-" + strings.Repeat("1", 21), problem: cursorTooLong},
+		{value: strings.Repeat("1", 21) + "-5", problem: cursorTooLong},
 	}
 	for _, c := range cases {
 		t.Run(c.value, func(t *testing.T) {
 			got, problem, _ := parseReplayCursor(c.value)
 			if got != c.want || problem != c.problem {
-				t.Fatalf("parseReplayCursor(%q) = %d, %v; want %d, %v", c.value, got, problem, c.want, c.problem)
+				t.Fatalf("parseReplayCursor(%q) = %+v, %v; want %+v, %v", c.value, got, problem, c.want, c.problem)
 			}
 		})
 	}

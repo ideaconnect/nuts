@@ -91,6 +91,13 @@ type Handler struct {
 	// Default: 1048576 (1 MB).
 	MaxEventSize int `json:"max_event_size,omitempty"`
 
+	// EventIDFormat is what an SSE event's id holds: "sequence" (the
+	// default), the message's JetStream stream sequence; or "sequence_time",
+	// the sequence and the stored time of the message, "<seq>-<unix ns>". A
+	// client that resumes with the latter from a stream that was since
+	// recreated or restored replays the stream from its start (#138).
+	EventIDFormat string `json:"event_id_format,omitempty"`
+
 	// HubURL is the URL advertised in the Link header for hub discovery.
 	// When set, SSE responses include a Link: <url>; rel="nuts" header
 	// so that clients and upstream APIs can discover the event hub automatically.

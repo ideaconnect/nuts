@@ -296,6 +296,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.HubURL = d.Val()
 
+			case "event_id_format":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.EventIDFormat = d.Val()
+
 			default:
 				return d.Errf("unrecognized option: %s", d.Val())
 			}

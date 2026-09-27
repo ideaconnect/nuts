@@ -618,11 +618,23 @@ func parseSSEIDs(t *testing.T, body string) []uint64 {
 // v0.4 push-consumer pipeline violated. Each one publishes through a separate
 // NATS connection and reads the stream over real HTTP.
 
-// sseReader reads `id:` values from a live SSE response.
+// sseReader reads `id:` values from a live SSE response: the sequence of
+// each id, and the last id as written, which may also carry a time
+// (event_id_format sequence_time).
 type sseReader struct {
 	resp   *http.Response
 	ids    chan uint64
 	closed chan struct{}
+
+	mu      sync.Mutex
+	lastRaw string
+}
+
+// lastID returns the last id the stream sent, as written.
+func (r *sseReader) lastID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastRaw
 }
 
 // collectIDs reads ids until `want` of them arrived, the stream closed or the
@@ -667,7 +679,11 @@ func openSSEStream(t *testing.T, url, lastEventID string) *sseReader {
 		for sc.Scan() {
 			// The connected event's id arrives first; callers account for it.
 			if v, ok := strings.CutPrefix(sc.Text(), "id: "); ok {
-				id, _ := strconv.ParseUint(v, 10, 64)
+				r.mu.Lock()
+				r.lastRaw = v
+				r.mu.Unlock()
+				seq, _, _ := strings.Cut(v, "-")
+				id, _ := strconv.ParseUint(seq, 10, 64)
 				r.ids <- id
 			}
 		}

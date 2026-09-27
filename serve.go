@@ -66,6 +66,12 @@ const (
 	// equal to math.MaxUint64 cannot be incremented for StartSequence without
 	// wrapping, so we reject it up-front and fall back to DeliverNew.
 	maxReplayCursor = ^uint64(0)
+
+	// Values of event_id_format: an event's id is the message's stream
+	// sequence, or the sequence and the stored time of the message in Unix
+	// nanoseconds, "<seq>-<time>" (#138).
+	eventIDSequence     = "sequence"
+	eventIDSequenceTime = "sequence_time"
 )
 
 // replayMode describes how a JetStream subscription should position itself
@@ -129,6 +135,14 @@ type replayPlan struct {
 	// before this instant are filtered out client-side as well to defend
 	// against server clock skew.
 	StartTime time.Time
+	// PositionTime is the stored time, in Unix nanoseconds, of the message
+	// at StartSequence-1, the position the stream starts after: from the
+	// client's cursor in the sequence_time format, or from the snapshot for
+	// a request without a cursor. HasPositionTime tells whether it is known.
+	// A cursor's time is checked against the stream (#138), and the
+	// connected event's id carries it in the sequence_time format.
+	PositionTime    int64
+	HasPositionTime bool
 	// CapSequence is the highest sequence considered "historical replay"
 	// at the moment the subscription opens. Anything above it is live
 	// traffic and does not count toward replay_max_messages.
@@ -233,6 +247,14 @@ type streamInfoSnapshot struct {
 	StartSequenceTime time.Time
 	// HasStartSequenceTime distinguishes a missing timestamp from a zero one.
 	HasStartSequenceTime bool
+	// LastTime is the stored time of the message at LastSeq.
+	LastTime time.Time
+	// PositionMessageTime is the stored time of the message the stream
+	// holds at the cursor's sequence, read when the cursor carries a time
+	// (#138). HasPositionMessage is false when the stream no longer holds a
+	// message there, or the read failed.
+	PositionMessageTime time.Time
+	HasPositionMessage  bool
 	// Generation is the stream generation of the read (see streamWatch), or
 	// of the latest read when this one failed.
 	Generation *streamGeneration
@@ -598,9 +620,11 @@ func (h *Handler) parseStreamRequest(r *http.Request) (streamPlan, *streamReques
 
 	if hasCursor {
 		plan.Replay = replayPlan{
-			HasLastID:     true,
-			Mode:          replayModeStartSequence,
-			StartSequence: cursor + 1,
+			HasLastID:       true,
+			Mode:            replayModeStartSequence,
+			StartSequence:   cursor.seq + 1,
+			PositionTime:    cursor.time,
+			HasPositionTime: cursor.hasTime,
 		}
 		metricsReplayRequests.Inc()
 	}
@@ -617,27 +641,48 @@ const (
 	cursorInvalid
 )
 
-// parseReplayCursor parses a last-id / Last-Event-ID value. The returned
-// error, if any, is strconv's reason for an invalid value.
-func parseReplayCursor(value string) (uint64, cursorProblem, error) {
+// replayCursor is a parsed last-id or Last-Event-ID: the stream sequence of
+// the client's last event and, from an id in the sequence_time format, the
+// stored time of that message in Unix nanoseconds.
+type replayCursor struct {
+	seq     uint64
+	time    int64
+	hasTime bool
+}
+
+// parseReplayCursor parses a last-id / Last-Event-ID value in either
+// event_id_format, "<seq>" or "<seq>-<unix ns>", whichever the handler
+// writes: a client may keep an id from before the format changed. The
+// returned error, if any, is strconv's reason for an invalid value.
+func parseReplayCursor(value string) (replayCursor, cursorProblem, error) {
 	if value == "" {
-		return 0, cursorAbsent, nil
+		return replayCursor{}, cursorAbsent, nil
 	}
-	// Cap the input length before strconv.ParseUint so a multi-MB numeric
-	// string can't cause large allocations. uint64 max is 20 digits.
-	if len(value) > 20 {
-		return 0, cursorTooLong, nil
+	seqText, timeText, hasTime := strings.Cut(value, "-")
+	// Cap each part before strconv parses it, so a multi-MB numeric string
+	// can't cause large allocations. uint64 max is 20 digits, and so is
+	// every int64 time.
+	if len(seqText) > 20 || len(timeText) > 20 {
+		return replayCursor{}, cursorTooLong, nil
 	}
-	id, err := strconv.ParseUint(value, 10, 64)
+	id, err := strconv.ParseUint(seqText, 10, 64)
 	// id+1 is the JetStream start sequence. When id == maxReplayCursor-1
 	// that addition lands on maxReplayCursor itself, the reserved "invalid"
 	// sentinel, and JetStream would park the consumer at a sequence that
 	// never arrives, so the off-by-one is rejected along with the
 	// == maxReplayCursor case.
 	if err != nil || id >= maxReplayCursor-1 {
-		return 0, cursorInvalid, err
+		return replayCursor{}, cursorInvalid, err
 	}
-	return id, cursorValid, nil
+	cursor := replayCursor{seq: id}
+	if hasTime {
+		t, err := strconv.ParseInt(timeText, 10, 64)
+		if err != nil || t <= 0 {
+			return replayCursor{}, cursorInvalid, err
+		}
+		cursor.time, cursor.hasTime = t, true
+	}
+	return cursor, cursorValid, nil
 }
 
 // currentStreamRuntime takes a single locked snapshot of the handler's
@@ -690,6 +735,19 @@ func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan 
 		Subjects:              info.Config.Subjects,
 		ConsumerInactiveLimit: info.Config.ConsumerLimits.InactiveThreshold,
 		Generation:            gen,
+		LastTime:              info.State.LastTime,
+	}
+	// A cursor with a time names the message it was written for. If the
+	// stream holds another message at that sequence, it was recreated or
+	// restored since (#138).
+	if cursor := plan.Replay.StartSequence - 1; plan.Replay.HasPositionTime && cursor > 0 && cursor >= info.State.FirstSeq && cursor <= info.State.LastSeq {
+		if msg, err := stream.GetMsg(readCtx, cursor); err == nil {
+			snapshot.PositionMessageTime, snapshot.HasPositionMessage = msg.Time, true
+		} else if !errors.Is(err, jetstream.ErrMsgNotFound) {
+			h.log().Debug("failed to read the message at the replay cursor",
+				appendStreamLogFields(plan, zap.Error(err))...,
+			)
+		}
 	}
 	if plan.Replay.HasLastID && h.ReplayWindow > 0 && plan.Replay.StartSequence >= info.State.FirstSeq {
 		msg, err := stream.GetMsg(readCtx, plan.Replay.StartSequence)
@@ -806,6 +864,9 @@ func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot)
 		// before its first message still resumes without a gap.
 		if snapshot.HasSnapshot {
 			plan.Replay.StartSequence = snapshot.LastSeq + 1
+			if snapshot.LastSeq > 0 && !snapshot.LastTime.IsZero() {
+				plan.Replay.PositionTime, plan.Replay.HasPositionTime = snapshot.LastTime.UnixNano(), true
+			}
 		}
 		return plan
 	}
@@ -829,6 +890,11 @@ func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot)
 		// returns no error, so this branch exists to apply replay_window and
 		// to log and count the fallback, not to avoid a failed subscribe.
 		plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence below retention")
+	case snapshot.HasPositionMessage && snapshot.PositionMessageTime.UnixNano() != plan.Replay.PositionTime:
+		// The stream holds another message at the cursor: it was recreated
+		// or restored since the client's last event, and resuming after the
+		// cursor would skip what the stream now holds before it (#138).
+		plan.Replay = h.fallbackReplayPlan(plan.Replay, "cursor from another stream")
 	case h.shouldUseReplayWindow(plan.Replay, snapshot):
 		plan.Replay = h.fallbackReplayPlan(plan.Replay, "sequence outside replay window")
 	}
@@ -927,7 +993,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 	// the call here is harmless (idempotent) but unnecessary.
 	h.setSSEHeaders(w)
 
-	if err := writeSSEChunkWithTimeout(w, rc, formatConnectedEvent(plan), writeTimeout); err != nil {
+	if err := writeSSEChunkWithTimeout(w, rc, h.formatConnectedEvent(plan), writeTimeout); err != nil {
 		h.recordWriteDisconnect(plan, "connected", err)
 		return nil
 	}
@@ -1161,7 +1227,7 @@ func (r *replayHistory) isHistory(formatted formattedMessageEvent) bool {
 // authorization-driven topic filtering). It carries the stream position the
 // consumer starts after as its id, so a client that reconnects before its
 // first message resumes from there instead of from "now".
-func formatConnectedEvent(plan streamPlan) string {
+func (h *Handler) formatConnectedEvent(plan streamPlan) string {
 	var event strings.Builder
 	event.WriteString("event: connected\ndata: {\"topics\":")
 	event.WriteString(toJSON(plan.Topics))
@@ -1169,6 +1235,10 @@ func formatConnectedEvent(plan streamPlan) string {
 	if id, ok := connectedEventID(plan); ok {
 		event.WriteString("id: ")
 		event.WriteString(strconv.FormatUint(id, 10))
+		if h.EventIDFormat == eventIDSequenceTime && plan.Replay.HasPositionTime && id > 0 {
+			event.WriteByte('-')
+			event.WriteString(strconv.FormatInt(plan.Replay.PositionTime, 10))
+		}
 		event.WriteString("\n")
 	}
 	event.WriteString("\n")
@@ -1250,6 +1320,10 @@ func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formatted
 	if msg.HasMetadata {
 		event.WriteString("id: ")
 		event.Write(strconv.AppendUint(scratch[:0], msg.StreamSequence, 10))
+		if h.EventIDFormat == eventIDSequenceTime {
+			event.WriteByte('-')
+			event.Write(strconv.AppendInt(scratch[:0], msg.Timestamp.UnixNano(), 10))
+		}
 		event.WriteByte('\n')
 	}
 	event.WriteByte('\n')

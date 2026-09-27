@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `event_id_format sequence_time` makes each event's id carry the stored time
+  of its message with its stream sequence, `<sequence>-<unix ns>` (#138). A
+  client that was away while its stream was recreated or restored comes back
+  with a cursor from the old stream; a bare sequence cannot tell, and once
+  the new stream has passed it the client missed the new stream's messages
+  up to there. With the time, NUTS finds another message at that sequence
+  and replays the stream from its start instead
+  (`replay_fallback_reason="cursor from another stream"`). Both forms are
+  accepted as cursors whatever the setting; the default, `sequence`, keeps
+  bare sequences.
 - `nats_ping_interval` sets how often NUTS pings the NATS server, 20 seconds
   by default (#134). NUTS used nats.go's two-minute default, so a server that
   stopped answering without closing the connection (packets dropped, a

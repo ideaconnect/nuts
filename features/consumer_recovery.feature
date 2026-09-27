@@ -70,3 +70,19 @@ Feature: JetStream consumer recovery
       | endpoint               |
       | /events?topic=recreate |
       | /shared?topic=recreate |
+
+  # A client away while its stream is recreated comes back with a cursor from
+  # the old stream. A bare sequence cannot tell: once the new stream has
+  # passed it, NUTS resumes after it and the client misses the new stream's
+  # first messages. With event_id_format sequence_time (the /checked route)
+  # the cursor names the message it was written for; the new stream holds
+  # another one at that sequence, so the client replays it instead (#138).
+  Scenario: A client away while the stream is recreated replays the new stream
+    Given client "A" is connected to SSE endpoint "/checked?topic=away"
+    When I publish 3 messages to subject "events.away"
+    Then client "A" should have received 3 messages
+    When client "A" disconnects
+    And the stream "EVENTS" is deleted and created again with subjects "events.>"
+    And I publish 5 messages to subject "events.away"
+    And client "A" reconnects to SSE endpoint "/checked?topic=away" with its last event ID
+    Then client "A" should have received 5 messages

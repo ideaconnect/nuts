@@ -32,6 +32,9 @@ func referenceMessageFrame(h *Handler, msg streamMessage, now time.Time) string 
 	if msg.HasMetadata {
 		event.WriteString("id: ")
 		event.WriteString(strconv.FormatUint(msg.StreamSequence, 10))
+		if h.EventIDFormat == eventIDSequenceTime {
+			event.WriteString("-" + strconv.FormatInt(msg.Timestamp.UnixNano(), 10))
+		}
 		event.WriteString("\n")
 	}
 	event.WriteString("\n")
@@ -80,14 +83,16 @@ var formatterEdgeCases = []string{
 }
 
 func TestFormatMessageEvent_MatchesTheReferenceFormatter(t *testing.T) {
-	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
-	for i, data := range formatterEdgeCases {
-		for _, hasMeta := range []bool{true, false} {
-			msg := streamMessage{Subject: "events.orders", Data: []byte(data), HasMetadata: hasMeta, StreamSequence: 42, Timestamp: now.Add(-time.Hour)}
-			want := referenceMessageFrame(h, msg, now)
-			if got := h.formatMessageEvent(msg, now).Frame; got != want {
-				t.Errorf("case %d (%q, metadata=%v):\n got %q\nwant %q", i, data, hasMeta, got, want)
+	for _, format := range []string{eventIDSequence, eventIDSequenceTime} {
+		h := &Handler{TopicPrefix: "events.", MaxEventSize: -1, EventIDFormat: format}
+		for i, data := range formatterEdgeCases {
+			for _, hasMeta := range []bool{true, false} {
+				msg := streamMessage{Subject: "events.orders", Data: []byte(data), HasMetadata: hasMeta, StreamSequence: 42, Timestamp: now.Add(-time.Hour)}
+				want := referenceMessageFrame(h, msg, now)
+				if got := h.formatMessageEvent(msg, now).Frame; got != want {
+					t.Errorf("%s case %d (%q, metadata=%v):\n got %q\nwant %q", format, i, data, hasMeta, got, want)
+				}
 			}
 		}
 	}
@@ -95,11 +100,15 @@ func TestFormatMessageEvent_MatchesTheReferenceFormatter(t *testing.T) {
 
 func FuzzFormatMessageEventMatchesReference(f *testing.F) {
 	for _, data := range formatterEdgeCases {
-		f.Add([]byte(data), "orders", uint64(42), true)
+		f.Add([]byte(data), "orders", uint64(42), true, false)
+		f.Add([]byte(data), "orders", uint64(42), true, true)
 	}
-	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
-	f.Fuzz(func(t *testing.T, data []byte, topic string, seq uint64, hasMeta bool) {
+	f.Fuzz(func(t *testing.T, data []byte, topic string, seq uint64, hasMeta, timedIDs bool) {
+		h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
+		if timedIDs {
+			h.EventIDFormat = eventIDSequenceTime
+		}
 		msg := streamMessage{Subject: "events." + topic, Data: data, HasMetadata: hasMeta, StreamSequence: seq, Timestamp: now.Add(-time.Minute)}
 		want := referenceMessageFrame(h, msg, now)
 		if got := h.formatMessageEvent(msg, now).Frame; got != want {
