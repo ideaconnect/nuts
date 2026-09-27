@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests are told to retry at once.
 
 ### Fixed
+- While a NATS server that stopped answering without closing the connection
+  was not yet declared stale (two to three `nats_ping_interval`s, 40–60
+  seconds by default), every new SSE request waited about 7 seconds for its
+  JetStream timeouts before it was told to retry, holding a Caddy handler and
+  a `max_connections` slot (#139). Now the first request whose stream-info
+  read times out makes NUTS ping the server; if the ping goes unanswered
+  within a second, that request and every new one are told to retry at once
+  (`NATS server stopped answering`), until a ping NUTS keeps sending is
+  answered (`NATS server answers again`). A server that answers the ping is
+  only slow, and requests go on as before.
 - **A stream recreated or restored under open SSE streams no longer leaves
   them silent** (#133, #137). Each one's consumer resumed after the last
   sequence it delivered, a position the new stream had not reached, so it

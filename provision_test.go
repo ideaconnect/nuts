@@ -1,6 +1,7 @@
 package nuts
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -18,7 +19,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -395,6 +398,190 @@ func TestHandler_connectNATS_NoticesAServerThatStopsAnswering(t *testing.T) {
 	resp.Body.Close()
 	if took := time.Since(asked); resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "retry:") || took > time.Second {
 		t.Fatalf("answered %d after %v with %q, want the retry stream at once", resp.StatusCode, took, body)
+	}
+}
+
+// fakePinger answers pings after delay when answer is set; otherwise each
+// ping waits out its timeout, like a server that stopped answering.
+type fakePinger struct {
+	mu     sync.Mutex
+	answer bool
+	delay  time.Duration
+	pings  int
+}
+
+func (p *fakePinger) FlushTimeout(timeout time.Duration) error {
+	p.mu.Lock()
+	p.pings++
+	answer, delay := p.answer, p.delay
+	p.mu.Unlock()
+	if !answer {
+		time.Sleep(timeout)
+		return nats.ErrTimeout
+	}
+	time.Sleep(delay)
+	return nil
+}
+
+func (p *fakePinger) set(answer bool) {
+	p.mu.Lock()
+	p.answer = answer
+	p.mu.Unlock()
+}
+
+func (p *fakePinger) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pings
+}
+
+// TestHandler_NATSAnswers covers #139: after a JetStream request timed out, a
+// ping tells a slow JetStream from a server that stopped answering.
+// Concurrent callers share one ping. An unanswered ping marks the connection
+// unresponsive, so later callers are refused without pinging, until the
+// prober's ping is answered; the prober stops with the handler.
+func TestHandler_NATSAnswers(t *testing.T) {
+	t.Run("an answering server is left alone", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := &Handler{logger: zap.NewNop()}
+			conn := &fakePinger{answer: true, delay: 100 * time.Millisecond}
+			shutdown := make(chan struct{})
+			defer close(shutdown)
+			var wg sync.WaitGroup
+			for range 5 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if !h.natsAnswers(conn, shutdown) {
+						t.Error("an answering server was reported silent")
+					}
+				}()
+			}
+			wg.Wait()
+			if conn.count() != 1 || h.natsUnresponsive() {
+				t.Fatalf("pings = %d, unresponsive = %v; want one shared ping and no mark", conn.count(), h.natsUnresponsive())
+			}
+			synctest.Wait() // no prober left running
+		})
+	})
+
+	t.Run("a silent server is refused until it answers", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			core, obs := observer.New(zap.InfoLevel)
+			h := &Handler{logger: zap.New(core)}
+			conn := &fakePinger{}
+			shutdown := make(chan struct{})
+			start := time.Now()
+			if h.natsAnswers(conn, shutdown) {
+				t.Fatal("a silent server was reported answering")
+			}
+			if took := time.Since(start); took != natsCheckTimeout || !h.natsUnresponsive() {
+				t.Fatalf("check took %v, unresponsive = %v; want %v and the mark", took, h.natsUnresponsive(), natsCheckTimeout)
+			}
+			if obs.FilterMessageSnippet("NATS server stopped answering").Len() != 1 {
+				t.Fatalf("the silence was not logged once: %+v", obs.All())
+			}
+			pings := conn.count()
+			if h.natsAnswers(conn, shutdown) || conn.count() != pings {
+				t.Fatal("a caller while the mark is set was not refused at once")
+			}
+
+			// The prober pings every natsCheckTimeout and waits out each
+			// unanswered ping.
+			time.Sleep(5 * natsCheckTimeout)
+			synctest.Wait()
+			if !h.natsUnresponsive() || conn.count() < pings+2 {
+				t.Fatalf("after 5 s of silence: unresponsive = %v, pings = %d (from %d)", h.natsUnresponsive(), conn.count(), pings)
+			}
+			conn.set(true)
+			time.Sleep(3 * natsCheckTimeout)
+			synctest.Wait()
+			if h.natsUnresponsive() {
+				t.Fatal("the mark stayed after the server answered again")
+			}
+			if obs.FilterMessageSnippet("NATS server answers again").Len() != 1 {
+				t.Fatalf("the recovery was not logged once: %+v", obs.All())
+			}
+			if !h.natsAnswers(conn, shutdown) {
+				t.Fatal("a check after the recovery failed")
+			}
+			close(shutdown)
+		})
+	})
+
+	t.Run("the prober stops with the handler", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := &Handler{logger: zap.NewNop()}
+			conn := &fakePinger{}
+			shutdown := make(chan struct{})
+			h.natsAnswers(conn, shutdown)
+			close(shutdown)
+			synctest.Wait() // the prober returned: the bubble has no goroutine left
+			if !h.natsUnresponsive() {
+				t.Fatal("shutting down cleared the mark")
+			}
+		})
+	})
+}
+
+// TestHandler_RefusesStreamsWhileNATSDoesNotAnswer covers #139 end to end: a
+// server that stops answering without closing the connection, with nats.go's
+// ping interval long enough not to notice. The first request runs into the
+// stream-info timeout and a ping, then gets the retry answer; the next is
+// refused at once; once NATS answers again, streams open.
+func TestHandler_RefusesStreamsWhileNATSDoesNotAnswer(t *testing.T) {
+	t.Parallel() // asserts no process-wide metric
+	ns := startJetStreamServer(t)
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	proxy := newBlackholeProxy(t, ns.Addr().String())
+	_, srv := newContractServer(t, proxy.url(), func(h *Handler) {
+		h.NatsPingInterval = 60
+	})
+	ask := func() (time.Duration, int, string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/events?topic=a", nil)
+		req.Header.Set("Accept", "text/event-stream")
+		asked := time.Now()
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		line, _ := bufio.NewReader(resp.Body).ReadString('\n')
+		return time.Since(asked), resp.StatusCode, line
+	}
+
+	proxy.discard.Store(true)
+	took, status, first := ask()
+	if status != http.StatusOK || !strings.HasPrefix(first, ": JetStream not available") || took > 4*time.Second {
+		t.Fatalf("first request: %d after %v with %q, want the retry stream within the 2 s read timeout and a 1 s ping", status, took, first)
+	}
+	t.Logf("first request answered after %v", took.Round(100*time.Millisecond))
+	if took, status, first = ask(); status != http.StatusOK || !strings.HasPrefix(first, ": JetStream not available") || took > 500*time.Millisecond {
+		t.Fatalf("second request: %d after %v with %q, want the retry stream at once", status, took, first)
+	}
+
+	// The discarded bytes broke the connection's protocol stream, so the link
+	// comes back as a new connection, as after a network partition heals:
+	// NUTS reconnects, and the prober's next ping is answered.
+	proxy.discard.Store(false)
+	proxy.cut()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, status, first = ask(); status == http.StatusOK && strings.HasPrefix(first, "event: connected") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("streams did not open again once NATS answered; last answer %d %q", status, first)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 

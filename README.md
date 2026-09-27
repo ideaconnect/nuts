@@ -514,10 +514,14 @@ unanswered pings the connection is stale: NUTS logs `disconnected from NATS`
 with `stale connection` and reconnects. A server that stops answering without
 closing the connection (packets dropped, a paused VM or container) is
 therefore noticed within two to three intervals. From then on new requests
-are told to retry at once; before that, each waits for its JetStream calls to
-time out, about 7 seconds. Open streams stay open either way and continue
-without a gap once NATS answers again. nats.go's own default, two minutes,
-took four to six minutes to notice such an outage.
+are told to retry at once. Before that, the first request to time out
+reading the stream's info (2 seconds) makes NUTS ping the server itself: if
+the ping goes unanswered within a second, that request and every new one are
+told to retry at once, logged as `NATS server stopped answering`, until the
+server answers again (`NATS server answers again`). A server that does answer
+the ping is only slow, and the request goes on. Open streams stay open either
+way and continue without a gap once NATS answers again. nats.go's own
+default, two minutes, took four to six minutes to notice such an outage.
 #### JetStream consumers
 
 Every SSE request gets its own ordered pull consumer, named

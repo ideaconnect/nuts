@@ -63,9 +63,10 @@ filters when correlating logs with alerts.
 - Logs contain `disconnected from NATS`; later recovery logs contain
   `reconnected to NATS`. A server that stopped answering without closing the
   connection shows up as `stale connection`, two to three
-  `nats_ping_interval`s (40–60 s by default) after it went quiet; until then
-  new requests wait about 7 s for their JetStream timeouts before being
-  refused.
+  `nats_ping_interval`s (40–60 s by default) after it went quiet. Before
+  that, the first new request runs into a 2 s JetStream timeout and a 1 s
+  ping, and NUTS logs `NATS server stopped answering`; from then on new
+  requests are refused at once until it logs `NATS server answers again`.
 - New stream requests are refused at once with
   `disconnect_reason=jetstream_unavailable`: plain clients get `503` with
   `Retry-After`, browsers a `retry:` stream, so `EventSource` keeps

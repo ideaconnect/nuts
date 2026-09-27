@@ -99,11 +99,13 @@ own. Only the topic error stays a `503`, since retrying cannot fix it.
 When NATS stops answering without closing the connection (packets dropped, a
 paused VM or container), NUTS learns that it is disconnected once two pings
 go unanswered: within two to three `nats_ping_interval`s, 40 to 60 seconds by
-default, when it logs `disconnected from NATS` with `stale connection`. Until
-then each new request waits for its JetStream calls to time out, about 7 to
-10 seconds, before it gets one of the answers above; lower
-`nats_ping_interval` to shorten that window. Streams that are already open
-stay open and continue without a gap once NATS answers again.
+default, when it logs `disconnected from NATS` with `stale connection`.
+Sooner than that, the first request to time out reading the stream's info
+(2 seconds) makes NUTS ping the server; if the ping goes unanswered within a
+second, NUTS logs `NATS server stopped answering`, and that request and every
+new one get the retry answer at once until the server answers again (#139).
+Streams that are already open stay open and continue without a gap once NATS
+answers again.
 
 Metrics that help narrow this down include
 `nuts_connections_rejected_total{reason}` and

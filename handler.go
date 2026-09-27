@@ -223,6 +223,10 @@ type Handler struct {
 	// streamReads coalesces the stream-info reads of concurrent requests.
 	streamReads streamReads
 
+	// connCheck records whether the NATS connection answers, between
+	// nats.go's own pings (#139).
+	connCheck connectionCheck
+
 	// watch follows the configured stream across reads and ends the SSE
 	// streams positioned on it once it is recreated or rewound (#133).
 	watch *streamWatch

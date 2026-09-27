@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -456,6 +457,102 @@ func (h *Handler) logStreamLimits(info *jetstream.StreamInfo) {
 			zap.Int("max_consumers", maxConsumers),
 			zap.Int("max_connections", h.MaxConnections),
 		)
+	}
+}
+
+// natsCheckTimeout bounds the round trip that tells a JetStream request that
+// timed out apart from a NATS server that stopped answering (#139), and
+// spaces the pings that wait for such a server to answer again.
+const natsCheckTimeout = time.Second
+
+// pinger is the part of a NATS connection that checks the server answers.
+type pinger interface {
+	FlushTimeout(timeout time.Duration) error
+}
+
+// connectionCheck records whether the NATS server answers, between nats.go's
+// own pings (#139).
+type connectionCheck struct {
+	mu sync.Mutex
+	// running is the round trip under way, which callers share.
+	running *roundTrip
+	// unresponsive is set when a round trip went unanswered, until a ping
+	// of the prober is answered.
+	unresponsive bool
+}
+
+// roundTrip is one ping and the callers waiting for its answer. answered is
+// set before done is closed.
+type roundTrip struct {
+	done     chan struct{}
+	answered bool
+}
+
+// natsUnresponsive reports whether the NATS server was found not to answer
+// and has not answered since.
+func (h *Handler) natsUnresponsive() bool {
+	h.connCheck.mu.Lock()
+	defer h.connCheck.mu.Unlock()
+	return h.connCheck.unresponsive
+}
+
+// natsAnswers is called after a JetStream request timed out. It pings the
+// NATS server and reports whether it answered within natsCheckTimeout. If it
+// did, JetStream is just slow, and the request goes on. If not, the server
+// stopped answering without closing the connection, which nats.go's pings
+// notice only after two or three nats_ping_interval. The connection is then
+// marked unresponsive, and new streams are refused at once instead of each
+// waiting for its JetStream timeouts, until a ping of the prober started
+// here is answered. Concurrent callers share one ping.
+func (h *Handler) natsAnswers(conn pinger, shutdown <-chan struct{}) bool {
+	c := &h.connCheck
+	c.mu.Lock()
+	if c.unresponsive {
+		c.mu.Unlock()
+		return false
+	}
+	if trip := c.running; trip != nil {
+		c.mu.Unlock()
+		<-trip.done
+		return trip.answered
+	}
+	trip := &roundTrip{done: make(chan struct{})}
+	c.running = trip
+	c.mu.Unlock()
+
+	trip.answered = conn.FlushTimeout(natsCheckTimeout) == nil
+
+	c.mu.Lock()
+	c.running = nil
+	c.unresponsive = !trip.answered
+	c.mu.Unlock()
+	close(trip.done)
+	if !trip.answered {
+		h.log().Warn("NATS server stopped answering: a JetStream request timed out and a ping went unanswered; refusing new SSE streams until it answers again")
+		go h.probeNATS(conn, shutdown)
+	}
+	return trip.answered
+}
+
+// probeNATS pings an unresponsive NATS server every natsCheckTimeout until
+// it answers, then lets new streams in again, or until the handler shuts
+// down.
+func (h *Handler) probeNATS(conn pinger, shutdown <-chan struct{}) {
+	ticker := time.NewTicker(natsCheckTimeout)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-shutdown:
+			return
+		case <-ticker.C:
+		}
+		if conn.FlushTimeout(natsCheckTimeout) == nil {
+			h.connCheck.mu.Lock()
+			h.connCheck.unresponsive = false
+			h.connCheck.mu.Unlock()
+			h.log().Info("NATS server answers again; accepting new SSE streams")
+			return
+		}
 	}
 }
 

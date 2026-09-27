@@ -835,6 +835,25 @@ func TestHandler_ReadStreamSnapshot_StreamInfoErrorReturnsEmptySnapshot(t *testi
 	}
 }
 
+// TestHandler_ReadStreamSnapshot_FlagsATimedOutRead: only a read that ran
+// out of time makes the request ping the NATS server (#139).
+func TestHandler_ReadStreamSnapshot_FlagsATimedOutRead(t *testing.T) {
+	h := &Handler{StreamName: "EVENTS", logger: zap.NewNop()}
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{context.DeadlineExceeded, true},
+		{fmt.Errorf("stream info: %w", nats.ErrTimeout), true},
+		{jetstream.ErrStreamNotFound, false},
+		{errors.New("boom"), false},
+	} {
+		if got := h.readStreamSnapshot(context.Background(), fakeStreamLookup{err: c.err}, streamPlan{}); got.ReadTimedOut != c.want {
+			t.Errorf("read error %v: ReadTimedOut = %v, want %v", c.err, got.ReadTimedOut, c.want)
+		}
+	}
+}
+
 func TestHandler_ReadStreamSnapshot_ReadsStateForEveryRequest(t *testing.T) {
 	h := &Handler{StreamName: "EVENTS", logger: zap.NewNop()}
 	stream := fakeStream{info: &jetstream.StreamInfo{

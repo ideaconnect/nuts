@@ -258,13 +258,18 @@ type streamInfoSnapshot struct {
 	// Generation is the stream generation of the read (see streamWatch), or
 	// of the latest read when this one failed.
 	Generation *streamGeneration
+	// ReadTimedOut is set when the read failed because it ran out of time.
+	ReadTimedOut bool
 }
 
 // streamRuntime is a snapshot of the handler's NATS-level state under the
 // handler mutex. Captured once per request so the streaming loop can run
 // without re-locking on every message.
 type streamRuntime struct {
-	js       jetstream.JetStream
+	js jetstream.JetStream
+	// conn is the NATS connection under js, pinged when a JetStream request
+	// times out (#139).
+	conn     *nats.Conn
 	shutdown <-chan struct{}
 	// disconnected is true while the NATS connection is down and
 	// reconnecting, when every JetStream call could only time out.
@@ -358,14 +363,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
-	// While NATS is reconnecting, answer at once instead of letting the
-	// stream-info read and the consumer create each run into their timeout.
+	// While NATS is reconnecting, or the server was found not to answer,
+	// answer at once instead of letting the stream-info read and the
+	// consumer create each run into their timeout.
 	runtime := h.currentStreamRuntime()
-	if runtime.js == nil || runtime.disconnected {
-		h.log().Warn("JetStream not available for SSE stream",
-			appendStreamLogFields(plan, zap.String("disconnect_reason", "jetstream_unavailable"))...,
-		)
-		h.rejectTransient(w, r, http.StatusServiceUnavailable, "JetStream not available")
+	if runtime.js == nil || runtime.disconnected || h.natsUnresponsive() {
+		h.rejectUnavailable(w, r, plan)
 		return nil
 	}
 
@@ -393,6 +396,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	snapshot := h.readStreamSnapshot(r.Context(), runtime.js, plan)
+	// A stream-info read that ran out of time may be a slow JetStream or a
+	// server that stopped answering; a ping tells them apart (#139).
+	if snapshot.ReadTimedOut && runtime.conn != nil && !h.natsAnswers(runtime.conn, runtime.shutdown) {
+		h.rejectUnavailable(w, r, plan)
+		return nil
+	}
 	plan = h.planSubscription(plan, snapshot)
 	if len(plan.FailedTopics) > 0 {
 		metricsSubscriptionErrors.Inc()
@@ -456,6 +465,15 @@ func (h *Handler) rejectTransient(w http.ResponseWriter, r *http.Request, status
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(int((delay+time.Second-1)/time.Second)))
 	http.Error(w, message, status)
+}
+
+// rejectUnavailable answers a stream request while JetStream cannot serve it:
+// NATS is reconnecting, or the server does not answer.
+func (h *Handler) rejectUnavailable(w http.ResponseWriter, r *http.Request, plan streamPlan) {
+	h.log().Warn("JetStream not available for SSE stream",
+		appendStreamLogFields(plan, zap.String("disconnect_reason", "jetstream_unavailable"))...,
+	)
+	h.rejectTransient(w, r, http.StatusServiceUnavailable, "JetStream not available")
 }
 
 // rejectConsumerFailure answers a request whose JetStream consumer could not
@@ -693,6 +711,7 @@ func (h *Handler) currentStreamRuntime() streamRuntime {
 	h.mu.RLock()
 	runtime := streamRuntime{
 		js:           h.js,
+		conn:         h.conn,
 		shutdown:     h.shutdown,
 		disconnected: h.conn != nil && !h.conn.IsConnected(),
 	}
@@ -725,7 +744,10 @@ func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan 
 		h.log().Warn("failed to read JetStream stream info for request planning",
 			appendStreamLogFields(plan, zap.Error(err))...,
 		)
-		return streamInfoSnapshot{Generation: h.watch.current()}
+		return streamInfoSnapshot{
+			Generation:   h.watch.current(),
+			ReadTimedOut: errors.Is(err, context.DeadlineExceeded) || errors.Is(err, nats.ErrTimeout),
+		}
 	}
 	info := stream.CachedInfo()
 	snapshot := streamInfoSnapshot{
