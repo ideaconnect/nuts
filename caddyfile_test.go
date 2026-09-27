@@ -17,6 +17,13 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 		expectError bool
 	}{
 		{
+			name: "health_details with an explicit value",
+			caddyfile: `nuts {
+				health_details true
+			}`,
+			expected: &Handler{HealthDetails: true},
+		},
+		{
 			name: "full configuration",
 			caddyfile: `nuts {
 				nats_url nats://localhost:4222
@@ -47,6 +54,7 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				event_id_format sequence_time
 				event_type header Event-Type
 				payload_format raw
+				health_details
 				subscriber_jwt_key secret-key
 				subscriber_jwt_cookie nuts_session
 				allowed_origins https://example.com https://other.com
@@ -83,6 +91,7 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				EventType:                 "header",
 				EventTypeHeader:           "Event-Type",
 				PayloadFormat:             "raw",
+				HealthDetails:             true,
 				SubscriberJWTKey:          "secret-key",
 				SubscriberJWTCookie:       "nuts_session",
 				AllowedOrigins:            []string{"https://example.com", "https://other.com"},
@@ -598,6 +607,11 @@ func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
 			name:    "event_type with an extra argument",
 			line:    "event_type topic extra",
 			wantErr: "argument",
+		},
+		{
+			name:    "health_details that is not a boolean",
+			line:    "health_details sometimes",
+			wantErr: "invalid health_details",
 		},
 		{
 			name:        "unknown payload_format",

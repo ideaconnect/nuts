@@ -706,6 +706,13 @@ func theResponseShouldContain(text string) error {
 	return nil
 }
 
+func theResponseShouldNotContain(text string) error {
+	if strings.Contains(tc.httpBody, text) {
+		return fmt.Errorf("response contains %q: %s", text, tc.httpBody)
+	}
+	return nil
+}
+
 func iSendOPTIONSRequestToWithOrigin(endpoint, origin string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1194,6 +1201,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the connected event should list topic "([^"]*)"$`, theConnectedEventShouldListTopic)
 	ctx.Step(`^I should receive HTTP status (\d+)$`, iShouldReceiveHTTPStatus)
 	ctx.Step(`^the response should contain "([^"]*)"$`, theResponseShouldContain)
+	ctx.Step(`^the response should not contain "([^"]*)"$`, theResponseShouldNotContain)
 	ctx.Step(`^the response header "([^"]*)" should be "([^"]*)"$`, theResponseHeaderShouldBe)
 	ctx.Step(`^the SSE response header "([^"]*)" should be "([^"]*)"$`, theSSEResponseHeaderShouldBe)
 	ctx.Step(`^I should receive a heartbeat comment$`, iShouldReceiveAHeartbeatComment)

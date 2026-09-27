@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `health_details` adds the NATS server the handler is connected to
+  (version, name, cluster, domain) and the stream as the probe read it
+  (subjects, storage, replicas, message and byte counts, first and last
+  sequence, consumers, limits, creation time) to the readiness probes' JSON
+  (#144). Off by default: probe paths are often public, and the details name
+  servers, clusters and limits.
 - `payload_format raw` sends the NATS payload itself as each event's data,
   without the JSON envelope: a `data:` line per line of it, which
   EventSource joins back (#143). A payload SSE cannot carry, not UTF-8 text

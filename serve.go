@@ -1691,11 +1691,65 @@ func (h *Handler) serveLiveCheck(w http.ResponseWriter) error {
 }
 
 // serveReadinessCheck responds with NATS / stream readiness status.
+// natsServerDetails is the NATS server a handler is connected to, reported
+// by the readiness probes with health_details (#144).
+type natsServerDetails struct {
+	Version string `json:"version"`
+	Name    string `json:"name,omitempty"`
+	Cluster string `json:"cluster,omitempty"`
+	Domain  string `json:"domain,omitempty"`
+}
+
+// streamDetails is the configured stream as the readiness probe read it,
+// reported with health_details (#144). Zero limits mean none.
+type streamDetails struct {
+	Name          string                `json:"name"`
+	Subjects      []string              `json:"subjects"`
+	Storage       jetstream.StorageType `json:"storage"`
+	Replicas      int                   `json:"replicas"`
+	Messages      uint64                `json:"messages"`
+	Bytes         uint64                `json:"bytes"`
+	FirstSeq      uint64                `json:"first_seq"`
+	LastSeq       uint64                `json:"last_seq"`
+	Consumers     int                   `json:"consumers"`
+	MaxMsgs       int64                 `json:"max_msgs"`
+	MaxBytes      int64                 `json:"max_bytes"`
+	MaxAgeSeconds int64                 `json:"max_age_seconds"`
+	MaxConsumers  int                   `json:"max_consumers"`
+	Created       time.Time             `json:"created"`
+}
+
+func newStreamDetails(info *jetstream.StreamInfo) *streamDetails {
+	if info == nil {
+		return nil
+	}
+	return &streamDetails{
+		Name:          info.Config.Name,
+		Subjects:      info.Config.Subjects,
+		Storage:       info.Config.Storage,
+		Replicas:      info.Config.Replicas,
+		Messages:      info.State.Msgs,
+		Bytes:         info.State.Bytes,
+		FirstSeq:      info.State.FirstSeq,
+		LastSeq:       info.State.LastSeq,
+		Consumers:     info.State.Consumers,
+		MaxMsgs:       info.Config.MaxMsgs,
+		MaxBytes:      info.Config.MaxBytes,
+		MaxAgeSeconds: int64(info.Config.MaxAge / time.Second),
+		MaxConsumers:  info.Config.MaxConsumers,
+		Created:       info.Created,
+	}
+}
+
 func (h *Handler) serveReadinessCheck(w http.ResponseWriter) error {
 	type healthResponse struct {
 		Status string `json:"status"`
 		NATS   string `json:"nats"`
 		Stream string `json:"stream"`
+		// With health_details (#144): the server NATS is connected to, and
+		// the stream as the probe read it.
+		NATSServer *natsServerDetails `json:"nats_server,omitempty"`
+		StreamInfo *streamDetails     `json:"stream_info,omitempty"`
 	}
 
 	resp := healthResponse{
@@ -1743,13 +1797,23 @@ func (h *Handler) serveReadinessCheck(w http.ResponseWriter) error {
 		// the probe past the orchestrator's readiness budget. See
 		// defaultReadinessProbeTimeout for rationale.
 		ctx, cancel := context.WithTimeout(context.Background(), defaultReadinessProbeTimeout)
-		_, err := js.Stream(ctx, h.StreamName)
+		stream, err := js.Stream(ctx, h.StreamName)
 		cancel()
 		if err != nil {
 			resp.Status = "degraded"
 			resp.Stream = "unavailable"
 			statusCode = http.StatusServiceUnavailable
 			recordFailure("stream_info_error", zap.Error(err))
+		} else if h.HealthDetails {
+			resp.StreamInfo = newStreamDetails(stream.CachedInfo())
+		}
+	}
+	if h.HealthDetails && conn != nil && conn.IsConnected() {
+		resp.NATSServer = &natsServerDetails{
+			Version: conn.ConnectedServerVersion(),
+			Name:    conn.ConnectedServerName(),
+			Cluster: conn.ConnectedClusterName(),
+			Domain:  conn.ConnectedDomain(),
 		}
 	}
 

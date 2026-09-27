@@ -11,11 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/nats-io/nats.go"
@@ -1622,5 +1625,90 @@ func TestHandler_RawPayloadFormat(t *testing.T) {
 	}
 	if got := nextData(); got != `{"after":"the drop"}` {
 		t.Fatalf("the event after the unsendable payload = %q", got)
+	}
+}
+
+// TestHandler_HealthDetails covers #144: with health_details the readiness
+// probes add the NATS server and the stream as the probe read it. Without
+// it they stay as they were, a stream that cannot be read has no details,
+// and a disconnected handler names no server.
+func TestHandler_HealthDetails(t *testing.T) {
+	ns := startJetStreamServer(t, func(o *natsserver.Options) {
+		o.JetStreamDomain = "hub"
+		o.Cluster.Name = "east" // named, without a cluster listener
+	})
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	if _, err := mustJetStream(t, nc).CreateStream(context.Background(), jetstream.StreamConfig{
+		Name: "DETAILS", Subjects: []string{"events.>"}, Storage: jetstream.MemoryStorage,
+		MaxMsgs: 1000, MaxAge: time.Hour, MaxConsumers: 50,
+	}); err != nil {
+		t.Fatalf("CreateStream: %v", err)
+	}
+	js, _ := nc.JetStream()
+	publishRange(t, js, "events.a", 1, 3)
+	if _, err := mustJetStream(t, nc).CreateOrUpdateConsumer(context.Background(), "DETAILS", jetstream.ConsumerConfig{Durable: "reader"}); err != nil {
+		t.Fatalf("CreateOrUpdateConsumer: %v", err)
+	}
+
+	probe := func(t *testing.T, h *Handler) (int, map[string]json.RawMessage) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		if err := h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/events/readyz", nil), nil); err != nil {
+			t.Fatalf("ServeHTTP: %v", err)
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatalf("body %q: %v", rr.Body.String(), err)
+		}
+		return rr.Code, body
+	}
+	handler := func(t *testing.T, stream string, details bool) *Handler {
+		h := &Handler{NatsURL: ns.ClientURL(), StreamName: stream, HealthDetails: details, logger: zap.NewNop()}
+		connectHandler(t, h)
+		return h
+	}
+
+	code, body := probe(t, handler(t, "DETAILS", true))
+	var server natsServerDetails
+	var stream streamDetails
+	if err := json.Unmarshal(body["nats_server"], &server); err != nil || code != http.StatusOK {
+		t.Fatalf("status %d, nats_server %s: %v", code, body["nats_server"], err)
+	}
+	if server.Version != natsserver.VERSION || server.Name != ns.Name() || server.Cluster != "east" || server.Domain != "hub" {
+		t.Fatalf("nats_server = %+v, want version %s, name %s, cluster east, domain hub", server, natsserver.VERSION, ns.Name())
+	}
+	if err := json.Unmarshal(body["stream_info"], &stream); err != nil {
+		t.Fatalf("stream_info %s: %v", body["stream_info"], err)
+	}
+	if stream.Name != "DETAILS" || !slices.Equal(stream.Subjects, []string{"events.>"}) || stream.Storage != jetstream.MemoryStorage ||
+		stream.Messages != 3 || stream.Bytes == 0 || stream.Consumers != 1 || stream.FirstSeq != 1 || stream.LastSeq != 3 || stream.MaxMsgs != 1000 ||
+		stream.MaxBytes != -1 || stream.MaxAgeSeconds != 3600 || stream.MaxConsumers != 50 || stream.Replicas != 1 || stream.Created.IsZero() {
+		t.Fatalf("stream_info = %+v", stream)
+	}
+	if !strings.Contains(string(body["stream_info"]), `"storage":"memory"`) {
+		t.Fatalf("storage is not written as a name: %s", body["stream_info"])
+	}
+
+	if _, body := probe(t, handler(t, "DETAILS", false)); body["nats_server"] != nil || body["stream_info"] != nil {
+		t.Fatalf("details without health_details: %v", body)
+	}
+	if code, body := probe(t, handler(t, "MISSING", true)); code != http.StatusServiceUnavailable || body["stream_info"] != nil || body["nats_server"] == nil {
+		t.Fatalf("a stream that cannot be read: status %d, body %v; want 503 with the server and no stream", code, body)
+	}
+
+	h := handler(t, "DETAILS", true)
+	ns.Shutdown()
+	for h.conn.IsConnected() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if code, body := probe(t, h); code != http.StatusServiceUnavailable || body["nats_server"] != nil {
+		t.Fatalf("disconnected: status %d, body %v; want 503 without a server", code, body)
+	}
+	if newStreamDetails(nil) != nil {
+		t.Fatal("details of no stream info")
 	}
 }

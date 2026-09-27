@@ -302,6 +302,17 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.EventIDFormat = d.Val()
 
+			case "health_details":
+				if d.NextArg() {
+					b, err := strconv.ParseBool(d.Val())
+					if err != nil {
+						return d.Errf("invalid health_details: %v", err)
+					}
+					h.HealthDetails = b
+				} else {
+					h.HealthDetails = true
+				}
+
 			case "payload_format":
 				if !d.NextArg() {
 					return d.ArgErr()

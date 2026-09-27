@@ -65,6 +65,7 @@ nuts {
     event_id_format <format>            # Event ids: sequence (default) or sequence_time
     event_type <source> [name]          # Event names: message (default), topic, or header <name>
     payload_format <format>             # Event data: envelope (default) or raw
+    health_details [true|false]         # Readiness probes add NATS server and stream details
 
     # Health probes
     live_path  <path>                   # Liveness probe (default: /livez)

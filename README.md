@@ -385,6 +385,7 @@ nuts {
     event_id_format <format>     # Event ids: sequence (default) or sequence_time (sequence and message time)
     event_type <source> [name]   # Event names: message (default), topic, or header <name>
     payload_format <format>      # Event data: envelope (default) or raw (the NATS payload itself)
+    health_details [true|false]  # Readiness probes add the NATS server and stream details (default: off)
     health_path <path>           # Legacy readiness endpoint (empty/default: /healthz)
     live_path <path>             # Process liveness endpoint (empty/default: /livez)
     ready_path <path>            # NATS/stream readiness endpoint (empty/default: /readyz)
@@ -936,6 +937,25 @@ availability:
 ```json
 {"status":"degraded","nats":"disconnected","stream":"unavailable"}
 ```
+
+With `health_details`, the readiness and legacy health endpoints also report
+the NATS server the handler is connected to and the stream as the probe read
+it, which helps triage without querying NATS separately (#144):
+
+```json
+{"status":"ok","nats":"connected","stream":"available",
+ "nats_server":{"version":"2.15.0","name":"nats-1","cluster":"east"},
+ "stream_info":{"name":"EVENTS","subjects":["events.>"],"storage":"file",
+  "replicas":3,"messages":1523,"bytes":210432,"first_seq":1,"last_seq":1523,
+  "consumers":12,"max_msgs":10000,"max_bytes":-1,"max_age_seconds":3600,
+  "max_consumers":-1,"created":"2026-09-27T10:00:00Z"}}
+```
+
+`nats_server` is left out while NATS is disconnected, and `stream_info` when
+the stream cannot be read. The details are off by default: probe paths are
+often reachable by load balancers or the public, and they name servers,
+clusters and limits. Turn them on for routes that only trusted callers reach,
+or restrict the probe paths with Caddy matchers.
 
 Operational runbooks and Kubernetes probe examples are in
 [docs/OPERATIONS.md](docs/OPERATIONS.md).

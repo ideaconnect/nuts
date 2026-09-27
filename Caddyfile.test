@@ -93,6 +93,22 @@
 		}
 	}
 
+	# The same stream whose readiness probes add the NATS server and the
+	# stream's details, for features/sse_streaming.feature.
+	handle /details* {
+		uri strip_prefix /details
+		nuts {
+			nats_url {$NATS_URL:nats://localhost:4222}
+			stream_name {$STREAM_NAME:EVENTS}
+			topic_prefix {$TOPIC_PREFIX:events.}
+			heartbeat_interval 1
+			nats_idle_heartbeat 1
+			nats_ping_interval 1
+			allowed_origins *
+			health_details
+		}
+	}
+
 	handle /example* {
 		root * /srv/example
 		uri strip_prefix /example

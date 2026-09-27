@@ -69,6 +69,19 @@ Feature: SSE Streaming with JetStream
       | /events/readyz/  | available |
       | /events/healthz/ | connected |
 
+  # health_details adds the NATS server and the stream's details to the
+  # readiness probes (#144); without it they stay terse.
+  Scenario: Readiness details are opt-in
+    When I request SSE endpoint "/details/readyz"
+    Then I should receive HTTP status 200
+    And the response should contain "nats_server"
+    And the response should contain "version"
+    And the response should contain "stream_info"
+    And the response should contain "EVENTS"
+    When I request SSE endpoint "/events/readyz"
+    Then I should receive HTTP status 200
+    And the response should not contain "nats_server"
+
   Scenario: A backlog larger than the prefetch replays on one connection
     # client_buffer_size is 64 by default; the stream stops pulling while the
     # client catches up instead of disconnecting it.

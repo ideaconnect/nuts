@@ -114,6 +114,13 @@ type Handler struct {
 	// dropped (#143).
 	PayloadFormat string `json:"payload_format,omitempty"`
 
+	// HealthDetails adds the NATS server's version and names and the
+	// stream's configuration and state to the readiness probes' JSON
+	// (health_path, ready_path). Off by default: probe paths are often
+	// reachable by load balancers or the public, and the details name
+	// servers, clusters and limits (#144).
+	HealthDetails bool `json:"health_details,omitempty"`
+
 	// HubURL is the URL advertised in the Link header for hub discovery.
 	// When set, SSE responses include a Link: <url>; rel="nuts" header
 	// so that clients and upstream APIs can discover the event hub automatically.
