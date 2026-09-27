@@ -82,12 +82,13 @@ flowchart LR
   request keeps the generation of the read it was planned from. A read that
   finds a new creation time (the stream was recreated), or a last sequence
   below the highest seen that a read at least 5 seconds earlier also found
-  (restored from a backup that kept the creation time), ends the generation. Its SSE streams close with
-  `disconnect_reason=stream_recreated` or `stream_rewound`, because their
-  consumers would wait at a position the stream no longer has. A recreated
-  stream's last frame sets the client's last event ID to `0`. Shared
-  subscriptions are kept per generation. The handler reads the stream every
-  10 seconds when no request does.
+  (restored from a backup that kept the creation time), ends the
+  generation. Its SSE streams close with `disconnect_reason=stream_recreated`
+  or `stream_rewound`, because their consumers would wait at a position the
+  stream no longer has. A recreated stream's last frame is a `reset` event
+  that sets the client's last event ID to `0`. Shared subscriptions are kept
+  per generation. The handler reads the stream every 10 seconds when no
+  request does.
 - **Start positions.** Requests without a cursor start at an explicit
   `LastSeq + 1` rather than `DeliverNew`: an ordered consumer that resets
   before its first message re-applies its original deliver policy, and

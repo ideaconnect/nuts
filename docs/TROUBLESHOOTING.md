@@ -163,9 +163,10 @@ every 10 seconds, and closes the SSE streams positioned on the old stream
 - **Recreated**: the stream's creation time changed. It was deleted and
   created again, or restored with `nats stream restore` on nats-server 2.15,
   which gives a restored stream a new creation time. The SSE streams close
-  with `disconnect_reason=stream_recreated`, and their last frame sets the
-  client's last event ID to `0`, so EventSource reconnects and replays the
-  stream from its start.
+  with `disconnect_reason=stream_recreated`. Their last frame is a `reset`
+  event that sets the client's last event ID to `0`, so EventSource
+  reconnects and replays the stream from its start. Pages that keep the last
+  event ID across reloads must take it from `reset` events too.
 - **Rewound**: the creation time is the same but the last sequence went back,
   and a read at least 5 seconds later still finds it back. The stream was
   restored with `nats stream restore` on nats-server 2.14 or earlier, which

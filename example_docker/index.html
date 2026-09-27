@@ -217,6 +217,11 @@
                     if (e.lastEventId) { lastEventId = e.lastEventId; }
                     handler(JSON.parse(e.data));
                 });
+                // The stream was recreated: its messages start again from 1,
+                // so a new EventSource must resume from the start as well.
+                es.addEventListener('reset', function(e) {
+                    lastEventId = e.lastEventId;
+                });
                 es.onerror = function() {
                     if (es.readyState === EventSource.CLOSED) {
                         setDot(name, 'err');

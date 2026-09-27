@@ -25,9 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   healthy. NUTS now reads the stream's info on every stream request and
   every 10 seconds. When the stream's creation time changes (a stream
   created again, or restored on nats-server 2.15), it closes the SSE
-  streams opened on the old stream with `disconnect_reason=stream_recreated`
-  and sets their clients' last event ID to `0`, so EventSource reconnects
-  from the start of the new stream. When the creation time stays but the
+  streams opened on the old stream with `disconnect_reason=stream_recreated`.
+  Their last frame is a `reset` event that sets their clients' last event
+  ID to `0`, so EventSource reconnects from the start of the new stream;
+  pages that keep the last event ID across reloads can take it from the
+  event. When the creation time stays but the
   last sequence goes back, on two reads at least 5 seconds apart (a restore
   on nats-server 2.14 or earlier, which keep the creation time), they close
   with `disconnect_reason=stream_rewound` and keep their cursors, which fall

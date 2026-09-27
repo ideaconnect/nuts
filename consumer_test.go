@@ -504,15 +504,16 @@ func TestHandler_WatchStreamReadsEveryIntervalUntilShutdown(t *testing.T) {
 }
 
 // TestHandler_EndGenerationResetsTheCursorOnlyForANewStream: a stream closed
-// because the stream was recreated tells EventSource to reconnect from the
-// start of the new stream (id 0); one closed after a rewind keeps its cursor.
-// Both spread their reconnects with a jittered retry.
+// because the stream was recreated ends with a reset event whose id, 0, makes
+// EventSource reconnect from the start of the new stream; it is an event so
+// that pages keeping the cursor see it. One closed after a rewind keeps its
+// cursor. Both spread their reconnects with a jittered retry.
 func TestHandler_EndGenerationResetsTheCursorOnlyForANewStream(t *testing.T) {
 	for _, tt := range []struct {
 		reason string
 		frame  string
 	}{
-		{streamRecreated, "id: 0\n\n"},
+		{streamRecreated, "event: reset\ndata: {\"reason\":\"stream_recreated\"}\nid: 0\n\n"},
 		{streamRewound, "\n"},
 	} {
 		t.Run(tt.reason, func(t *testing.T) {

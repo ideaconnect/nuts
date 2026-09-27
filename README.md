@@ -1030,22 +1030,30 @@ const url = lastId
     : '/events?topic=notifications';
 const events = new EventSource(url);
 
+// Store the last event ID for replay after a page reload. The handshake and
+// every message carry one, and a reset (the stream was recreated) sets it
+// back to 0.
+function remember(e) {
+    if (e.lastEventId) {
+        localStorage.setItem('lastEventId', e.lastEventId);
+    }
+}
+
 // Handle connection
 events.addEventListener('connected', (e) => {
     const { topics } = JSON.parse(e.data);
     console.log('Connected to:', topics);
+    remember(e);
 });
 
-// Handle messages and track last ID for replay
+// Handle messages
 events.addEventListener('message', (e) => {
     const { topic, payload, time } = JSON.parse(e.data);
     console.log(`[${topic}] at ${time}:`, payload);
-
-    // Store last event ID for reconnection replay
-    if (e.lastEventId) {
-        localStorage.setItem('lastEventId', e.lastEventId);
-    }
+    remember(e);
 });
+
+events.addEventListener('reset', remember);
 
 // Handle errors and reconnect with replay
 events.onerror = (e) => {
@@ -1190,18 +1198,21 @@ starts in a fallback replay mode, in which case the client keeps its previous
 cursor.
 
 When the JetStream stream is deleted and created again under an open
-stream, NUTS ends the stream with a frame that carries no event:
+stream, NUTS ends the stream with a `reset` event:
 
 ```
 : stream_recreated
 retry: 4180
+event: reset
+data: {"reason":"stream_recreated"}
 id: 0
 ```
 
-The new stream numbers its messages from 1, so the frame sets the client's
-last event ID to `0` and EventSource reconnects from the start of the new
-stream after the `retry` delay. A custom client should do the same: take the
-`id` of a frame even when it has no `data`. See
+The new stream numbers its messages from 1, so the event sets the client's
+last event ID to `0`, and EventSource reconnects from the start of the new
+stream after the `retry` delay. A page that keeps the last event ID across
+page reloads must take it from `reset` events too, as the
+[JavaScript example](#javascript-eventsource) does. See
 [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#streams-close-after-the-stream-was-recreated-or-restored).
 
 #### Response headers

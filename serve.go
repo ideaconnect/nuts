@@ -1005,12 +1005,15 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 // endGeneration closes an SSE stream whose stream generation ended: its
 // consumer is positioned on a stream that was recreated or rewound (#133).
 // The last frame spreads the reconnects of the streams closed together over
-// retryDelay. After a recreation it also sets the client's last event ID to
-// 0: every message of the new stream is one the client has not seen, and a
-// cursor from the old stream would skip as many of them as it is high once
-// the new stream reaches it. After a rewind the client keeps its cursor: the
-// stream still holds the messages up to where it went back, and a cursor
-// ahead of the stream falls back to the retained replay (#103).
+// retryDelay. After a recreation it is also a reset event with id 0, which
+// sets the client's last event ID to 0: every message of the new stream is
+// one the client has not seen, and a cursor from the old stream would skip as
+// many of them as it is high once the new stream reaches it. It is an event,
+// not a bare id line, because EventSource dispatches nothing for a frame
+// without data, and a page that keeps the cursor across reloads has to see
+// the reset. After a rewind the client keeps its cursor: the stream still
+// holds the messages up to where it went back, and a cursor ahead of the
+// stream falls back to the retained replay (#103).
 func (h *Handler) endGeneration(w http.ResponseWriter, rc *http.ResponseController, plan streamPlan, writeTimeout time.Duration) {
 	reason := plan.Generation.reason
 	metricsConsumerInvalidated.WithLabelValues(reason).Inc()
@@ -1019,7 +1022,7 @@ func (h *Handler) endGeneration(w http.ResponseWriter, rc *http.ResponseControll
 	)
 	frame := fmt.Sprintf(": %s\nretry: %d\n", reason, retryDelay().Milliseconds())
 	if reason == streamRecreated {
-		frame += "id: 0\n"
+		frame += "event: reset\ndata: {\"reason\":\"" + reason + "\"}\nid: 0\n"
 	}
 	// Best effort: the stream closes either way, and a client that misses
 	// the frame reconnects with its old cursor.

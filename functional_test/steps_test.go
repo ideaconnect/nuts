@@ -903,6 +903,24 @@ func theSSEStreamOfClientShouldEndWithin(name string, seconds int) error {
 	return nil
 }
 
+// clientShouldHaveReceivedAnEvent waits for an event of the given type on
+// the client's current stream.
+func clientShouldHaveReceivedAnEvent(name, eventType string) error {
+	cc, ok := tc.clients[name]
+	if !ok {
+		return fmt.Errorf("client %q not found", name)
+	}
+	return waitUntil(fmt.Sprintf("client %q %s event", name, eventType), functionalWaitTimeout, func() (bool, string) {
+		events := clientEventsSnapshot(cc, false)
+		for _, event := range events {
+			if event.Event == eventType {
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("events=%+v", events)
+	})
+}
+
 func theLastEventIDOfClientShouldBe(name, want string) error {
 	cc, ok := tc.clients[name]
 	if !ok {
@@ -1208,6 +1226,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the stream "([^"]*)" is deleted and created again with subjects "([^"]*)"$`, theStreamIsDeletedAndCreatedAgain)
 	ctx.Step(`^the SSE stream of client "([^"]*)" should end within (\d+) seconds?$`, theSSEStreamOfClientShouldEndWithin)
 	ctx.Step(`^the last event ID of client "([^"]*)" should be "([^"]*)"$`, theLastEventIDOfClientShouldBe)
+	ctx.Step(`^client "([^"]*)" should have received a "([^"]*)" event$`, clientShouldHaveReceivedAnEvent)
 }
 
 // theStreamShouldHaveConsumersForSubject waits until exactly want of the
