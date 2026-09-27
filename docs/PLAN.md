@@ -141,12 +141,11 @@ metrics, and a published Docker image.
   - [x] Clear the flagged modules (grpc, x/text, otel), preferably through a
     Caddy patch bump, otherwise with explicit `require` lines; then run
     `go mod tidy`.
-  - [~] `govulncheck ./...` is clean locally, and CI is green on `main`.
-    Clean locally; CI runs once the branch is pushed.
+  - [x] `govulncheck ./...` is clean locally, and CI is green on `main`.
   - [x] Gate `release.yml` on CI success for the tag commit, so a red tag
     can't publish archives.
-  - [ ] Rebase or supersede Dependabot [#92] and [#96]. Superseded by
-    e74b5da; close them after the push.
+  - [x] Rebase or supersede Dependabot [#92] and [#96]. Superseded by
+    e74b5da; closed after the push.
 - [x] **[#114] Streaming behind Caddy access logs and HTTP metrics.**
   *critical · S*
   - [x] Replace the `w.(http.Flusher)` check in `ServeHTTP` with
@@ -164,13 +163,15 @@ metrics, and a published Docker image.
 - [x] **[#109] Module bumps.** *minor · S*
   - [x] nats.go → v1.54.0; embedded nats-server → v2.15.0 (at least 2.14.7).
   - [x] Run `govulncheck -test ./...` in CI, or add a separate test-scope job.
-- [~] **Release v0.4.3.** *S*
+- [x] **Release v0.4.3.** *S*
   - [x] CHANGELOG:
     - *Fixed*: [#114];
     - *Security*: the toolchain and module bumps;
     - a note that v0.4.2 has no Docker image and was built with Go 1.26.4.
-  - [ ] Walk the `docs/RELEASE.md` checklist: `idcttech/nuts:v0.4.3` on Docker
-    Hub, cosign signature, SBOM, release archives. Waits for the tag.
+  - [x] Walk the `docs/RELEASE.md` checklist: `idcttech/nuts:v0.4.3` on Docker
+    Hub (amd64, arm64), its Cosign signature (verified against
+    `ci.yml@refs/tags/v0.4.3`), release archives with SBOMs and a signed
+    checksum file. Tagged 2026-09-27.
 
 ## Phase 2: Test foundation
 
@@ -603,13 +604,13 @@ Several of these are good first issues.
 
 These are carried over from the v0.4 burn-list (P2 product polish).
 
-- [ ] P1: Detect a stream recreated under live connections. Their consumers
+- [ ] P1 ([#133]): Detect a stream recreated under live connections. Their consumers
   resume after the old last sequence and stay silent until the new stream
   passes it, skipping everything before (reproduced in both subscription
   modes). End such streams, for example when the stream's creation time
   changes, so clients reconnect and take the cursor-ahead fallback (#103).
   Documented in `docs/TROUBLESHOOTING.md` meanwhile.
-- [ ] P1: Notice a silently dead NATS server sooner. NUTS keeps nats.go's
+- [ ] P1 ([#134]): Notice a silently dead NATS server sooner. NUTS keeps nats.go's
   two-minute ping interval, so after packets start being dropped it takes
   minutes to declare the connection stale, and meanwhile each new request
   waits about 7–10 s for JetStream timeouts before it is told to retry
@@ -628,16 +629,17 @@ These are carried over from the v0.4 burn-list (P2 product polish).
 
 ## Exit criteria
 
-- [~] Every critical and major issue in M9, M10 and M11 is closed, or rejected
-  with the rationale recorded in the issue. Every open one is named in a
-  `Closes #N` on `v1-remediation` and closes when the branch merges.
-- [ ] CI is green on `main`. Waits for the push.
+- [x] Every critical and major issue in M9, M10 and M11 is closed, or rejected
+  with the rationale recorded in the issue: all closed when the branch
+  merged (#132, 2026-09-27).
+- [x] CI is green on `main`.
 - [x] `govulncheck ./...` and `govulncheck -test ./...` are clean (exit 0).
   Uncalled findings remain in Caddy's dependencies: cel-go 0.30.0, which
   fixes one, does not build with Caddy 2.11.4, and grpc's fix is not yet in
   a release.
-- [ ] Every release tag has a published, signed Docker image. Waits for the
-  v0.4.3 and major-release tags.
+- [x] Every release tag has a published, signed Docker image: `v0.4.3` and
+  `v0.5.0` (amd64, arm64), each verified with the `cosign verify` command in
+  `docs/RELEASE.md`.
 - [x] The delivery-contract suite passes these scenarios:
   - [x] contiguous ids across a NATS link loss
     (`TestDeliveryContract_NATSLinkLossLeavesNoHole`; a server restart too:
@@ -758,3 +760,5 @@ is split between Phases 1 and 5.
 [#129]: https://github.com/ideaconnect/nuts/issues/129
 [#130]: https://github.com/ideaconnect/nuts/issues/130
 [#131]: https://github.com/ideaconnect/nuts/issues/131
+[#133]: https://github.com/ideaconnect/nuts/issues/133
+[#134]: https://github.com/ideaconnect/nuts/issues/134

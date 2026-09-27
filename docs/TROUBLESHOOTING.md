@@ -102,7 +102,8 @@ pings go unanswered, which takes several minutes with nats.go's default
 two-minute ping interval. Until then each new request waits for its JetStream
 calls to time out, about 7 to 10 seconds, before it gets one of the answers
 above. Streams that are already open stay open and continue without a gap
-once NATS answers again.
+once NATS answers again. Noticing sooner is tracked in
+[#134](https://github.com/ideaconnect/nuts/issues/134).
 
 Metrics that help narrow this down include
 `nuts_connections_rejected_total{reason}` and
@@ -168,7 +169,8 @@ After recreating a stream under live traffic, reload Caddy with
 restart it. Every stream closes, clients reconnect with their last event ID,
 and each one takes the fallback above. Operations that keep the stream,
 such as `nats stream purge`, do not reset its sequence numbers and need
-nothing.
+nothing. A fix is tracked in
+[#133](https://github.com/ideaconnect/nuts/issues/133).
 
 ## Docker Image Starts But Config Looks Wrong
 
