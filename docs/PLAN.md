@@ -608,24 +608,45 @@ These are carried over from the v0.4 burn-list (P2 product polish).
   resume after the old last sequence and stay silent until the new stream
   passes it, skipping everything before (reproduced in both subscription
   modes). Done: stream-info reads, on requests and every 10 s, end a stream
-  generation when the creation time changes (`stream_recreated`; the last
-  frame resets the client's cursor to 0) or the last sequence is behind on
-  two reads at least 5 s apart (`stream_rewound`; the cursor falls back to
-  the retained replay).
+  generation when the creation time changes (`stream_recreated`) or the last
+  sequence is behind on two reads at least 5 s apart (`stream_rewound`).
+  Both end with a `reset` event whose id, 0, makes EventSource replay the
+  stream ([#147], [#137]); a poll also checks the stored time of the message
+  at the sequence it last saw, for a rewound stream that caught up ([#137]).
 - [x] P1 ([#134]): Notice a silently dead NATS server sooner. NUTS kept nats.go's
   two-minute ping interval, so a server that stopped answering took minutes
   to declare stale, and meanwhile each new request waited about 7–10 s for
   JetStream timeouts before it was told to retry (seen in the example stack
   with a paused NATS container). Done: `nats_ping_interval`, 20 s by default
   with two pings outstanding, so the outage is noticed within a minute.
-- [ ] P2: Optional event-type mapping from topic or metadata.
-- [ ] P2: Optional payload envelope customization for raw payload-only events.
-- [ ] P2: Expose the NATS server version and stream metadata in health or
-  debug output, gated appropriately.
-- [ ] P2: Configurable retry hints in SSE output. [#105] and Phase 4 deliver
-  part of this.
-- [ ] P2: A sample JavaScript client helper for replay-aware subscriptions,
-  paired with [#102] and [#105].
+- [x] P1 ([#138]): A client away while its stream was replaced comes back
+  with a cursor from the old stream. Done: `event_id_format sequence_time`
+  adds the message's stored time to each id, and a cursor whose time does
+  not match replays the stream from its start.
+- [x] P1 ([#139]): Requests waited about 7 s each on a NATS server that
+  stopped answering, until it was declared stale. Done: a stream-info read
+  that times out makes NUTS ping the server, and while the ping goes
+  unanswered, requests are told to retry at once.
+- [x] ([#141]): `make mutate-pkg` failed scoped runs on gremlins' mutant
+  coverage. Done: it gates on efficacy.
+- [ ] ([#140]): Uncalled vulnerable modules in Caddy's dependency tree. chi is
+  bumped; grpc and cel-go wait on upstream releases.
+- [x] P2 ([#142]): Optional event-type mapping from topic or metadata. Done:
+  `event_type topic` and `event_type header <name>`.
+- [x] P2 ([#143]): Optional payload envelope customization for raw
+  payload-only events. Done: `payload_format raw`.
+- [x] P2 ([#144]): Expose the NATS server version and stream metadata in
+  health or debug output, gated appropriately. Done: `health_details`, off
+  by default.
+- [x] P2 ([#145]): Configurable retry hints in SSE output. Done: `sse_retry`
+  and `transient_retry`.
+- [x] P2 ([#146]): A sample JavaScript client helper for replay-aware
+  subscriptions, paired with [#102] and [#105]. Done:
+  `example/nuts-client.js`, tested by `make test-js`.
+- [ ] Optional gap signal (D4e, from [#107]): opt-in by decision; no client
+  has asked for it.
+
+All of the above shipped in v0.6.0 except the open items.
 
 ## Exit criteria
 
@@ -656,7 +677,7 @@ These are carried over from the v0.4 burn-list (P2 product polish).
     (`TestDeliveryContract_EventSourceReconnectWithURLCursorMakesProgress`);
   - [x] a recreated stream resumes correctly for a client that reconnects
     (`TestDeliveryContract_CursorFromARecreatedStreamStillDelivers`); open
-    streams across a recreation are a known limitation, see the backlog;
+    streams across a recreation end with a `reset` since [#133];
   - [x] a consumer deleted mid-stream is recovered
     (`TestHandler_ConsumerDeletedMidStream_RecreatesAndResumes`).
 - [x] The functional matrix is green on every supported server (per D3),
@@ -763,3 +784,14 @@ is split between Phases 1 and 5.
 [#131]: https://github.com/ideaconnect/nuts/issues/131
 [#133]: https://github.com/ideaconnect/nuts/issues/133
 [#134]: https://github.com/ideaconnect/nuts/issues/134
+[#137]: https://github.com/ideaconnect/nuts/issues/137
+[#138]: https://github.com/ideaconnect/nuts/issues/138
+[#139]: https://github.com/ideaconnect/nuts/issues/139
+[#140]: https://github.com/ideaconnect/nuts/issues/140
+[#141]: https://github.com/ideaconnect/nuts/issues/141
+[#142]: https://github.com/ideaconnect/nuts/issues/142
+[#143]: https://github.com/ideaconnect/nuts/issues/143
+[#144]: https://github.com/ideaconnect/nuts/issues/144
+[#145]: https://github.com/ideaconnect/nuts/issues/145
+[#146]: https://github.com/ideaconnect/nuts/issues/146
+[#147]: https://github.com/ideaconnect/nuts/issues/147

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-28
+
+A development release on the 0.x line. SSE streams on a JetStream stream that
+was recreated or restored no longer go silent, and requests no longer wait on
+a NATS server that stopped answering. New optional directives name events,
+send raw payloads, put the message's time in event IDs, add readiness details
+and set the retry hints, and `example/nuts-client.js` gives pages
+replay-aware subscriptions. Nothing in an existing configuration has to
+change.
+
+### Upgrading
+
+**Operator impact.** Upgrade urgency: **high** if you recreate or restore
+JetStream streams while NUTS serves them. Open SSE streams skipped the
+replaced stream's messages until it passed their old position, while
+heartbeats kept them looking healthy (#133). **Medium** otherwise.
+
+- **Config changes:** none required. Every new directive is optional, and
+  its default keeps 0.5.0's behaviour. Two changes you may notice:
+  - NUTS pings the NATS server every 20 seconds (`nats_ping_interval`)
+    instead of every two minutes, so a server that stops answering is
+    declared stale within a minute (`disconnected from NATS`,
+    `stale connection`).
+  - SSE streams on a replaced stream end with a `reset` event, and
+    EventSource replays the new stream from its start. Bound those replays
+    with `replay_max_messages` or `replay_window`; the
+    `NutsStreamReplacedUnderClients` rule in `ops/prometheus-alerts.yml`
+    alerts on them.
+- **Deployment checks:** each handler reads its stream's info every 10
+  seconds. The readiness JSON names servers, clusters and limits only with
+  `health_details`, which public probe paths should leave off.
+- **Rollback:** back to 0.5.0 is safe unless `event_id_format
+  sequence_time` was on. 0.5.0 does not parse `<sequence>-<unix ns>`
+  cursors: it answers such a `?last-id=` with `400` and ignores such a
+  `Last-Event-ID`, so those clients start from new messages.
+
+**Compatibility.** Caddy 2.11.x (built with v2.11.4), Go 1.26.8,
+nats-server 2.10 or newer (2.14.7 or newer for multi-topic subscriptions),
+as in 0.5.0.
+
 ### Added
 - `example/nuts-client.js`, a dependency-free ES module wrapping
   EventSource for replay-aware pages (#146). It keeps the cursor of every
