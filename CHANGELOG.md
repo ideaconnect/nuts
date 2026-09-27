@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a minute, logged as `disconnected from NATS` with `stale connection`, and
   requests are told to retry at once.
 
+### Security
+- `github.com/go-chi/chi/v5`, which Caddy's ACME server pulls in, is bumped
+  from v5.2.5 to v5.3.2 for GO-2026-5774, GO-2026-5775 and GO-2026-5777 (IP
+  spoofing in `middleware.RealIP`, a package the NUTS binary does not import)
+  (#140). The uncalled grpc and cel-go findings wait on upstream releases:
+  grpc has no release with the fix yet, and cel-go's fix does not build with
+  Caddy v2.11.4.
+
 ### Fixed
 - While a NATS server that stopped answering without closing the connection
   was not yet declared stale (two to three `nats_ping_interval`s, 40–60
