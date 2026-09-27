@@ -45,6 +45,7 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				ready_path /ready
 				hub_url https://example.com/events
 				event_id_format sequence_time
+				event_type header Event-Type
 				subscriber_jwt_key secret-key
 				subscriber_jwt_cookie nuts_session
 				allowed_origins https://example.com https://other.com
@@ -78,6 +79,8 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				ReadyPath:                 "/ready",
 				HubURL:                    "https://example.com/events",
 				EventIDFormat:             "sequence_time",
+				EventType:                 "header",
+				EventTypeHeader:           "Event-Type",
 				SubscriberJWTKey:          "secret-key",
 				SubscriberJWTCookie:       "nuts_session",
 				AllowedOrigins:            []string{"https://example.com", "https://other.com"},
@@ -383,6 +386,7 @@ func TestHandler_UnmarshalCaddyfile_MissingArgs(t *testing.T) {
 		{name: "missing reconnect_wait arg", directive: "reconnect_wait"},
 		{name: "missing nats_ping_interval arg", directive: "nats_ping_interval"},
 		{name: "missing event_id_format arg", directive: "event_id_format"},
+		{name: "missing event_type arg", directive: "event_type"},
 		{name: "missing max_reconnects arg", directive: "max_reconnects"},
 		{name: "missing max_event_size arg", directive: "max_event_size"},
 		{name: "missing dispatch_timeout arg", directive: "dispatch_timeout"},
@@ -581,6 +585,28 @@ func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
 			name:    "negative ping interval at parse time",
 			line:    "nats_ping_interval -5",
 			wantErr: "nats_ping_interval must be >= 0",
+		},
+		{
+			name:    "event_type header without a name",
+			line:    "event_type header",
+			wantErr: "event_type header needs the header's name",
+		},
+		{
+			name:    "event_type with an extra argument",
+			line:    "event_type topic extra",
+			wantErr: "argument",
+		},
+		{
+			name:        "unknown event_type",
+			line:        "event_type category",
+			wantErr:     "event_type must be",
+			validateErr: true,
+		},
+		{
+			name:        "event_type header with a colon in the name",
+			line:        "event_type header Event:Type",
+			wantErr:     "header name",
+			validateErr: true,
 		},
 		{
 			name:    "topic cap below the -1 sentinel",

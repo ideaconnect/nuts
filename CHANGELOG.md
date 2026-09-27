@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `event_type topic` and `event_type header <name>` name each message's SSE
+  event after its topic or a header of the NATS message, so a page can add
+  one `addEventListener` per kind of event instead of routing every
+  `message` itself (#142). Names outside `[A-Za-z0-9._:-]{1,100}`, the
+  reserved `connected`, `reset`, `open` and `error`, and messages without the
+  header fall back to `message`, the default.
 - `event_id_format sequence_time` makes each event's id carry the stored time
   of its message with its stream sequence, `<sequence>-<unix ns>` (#138). A
   client that was away while its stream was recreated or restored comes back

@@ -98,6 +98,15 @@ type Handler struct {
 	// recreated or restored replays the stream from its start (#138).
 	EventIDFormat string `json:"event_id_format,omitempty"`
 
+	// EventType sets the SSE event name of each message: "message" (the
+	// default); "topic", the message's topic without topic_prefix; or
+	// "header", the value of the message header EventTypeHeader names. A name
+	// that is empty, reserved (connected, reset, open, error) or not made of
+	// [A-Za-z0-9._:-] falls back to "message" (#142).
+	EventType string `json:"event_type,omitempty"`
+	// EventTypeHeader is the header EventType "header" reads.
+	EventTypeHeader string `json:"event_type_header,omitempty"`
+
 	// HubURL is the URL advertised in the Link header for hub discovery.
 	// When set, SSE responses include a Link: <url>; rel="nuts" header
 	// so that clients and upstream APIs can discover the event hub automatically.

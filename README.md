@@ -383,6 +383,7 @@ nuts {
     replay_max_messages <count>  # Cap replayed messages per reconnect (default: 0 = unlimited)
     replay_window <seconds>      # Time-bound replay to the last N seconds (default: 0 = all retained)
     event_id_format <format>     # Event ids: sequence (default) or sequence_time (sequence and message time)
+    event_type <source> [name]   # Event names: message (default), topic, or header <name>
     health_path <path>           # Legacy readiness endpoint (empty/default: /healthz)
     live_path <path>             # Process liveness endpoint (empty/default: /livez)
     ready_path <path>            # NATS/stream readiness endpoint (empty/default: /readyz)
@@ -626,6 +627,26 @@ compatibility mode rather than a production recommendation for large retained
 streams. Pick bounds that match the largest replay you are willing to serve to
 one client, then size JetStream retention, `max_connections`, and edge
 rate-limits around that budget.
+
+#### `event_type`
+
+Every message is sent as `event: message` by default, with its topic in the
+JSON data, so a page handles all of them in one `message` listener.
+`event_type` names each event after something of the message instead:
+
+- `event_type topic`: the topic, without `topic_prefix`. A page subscribed to
+  several topics can add one listener per topic:
+  `events.addEventListener('orders', …)`.
+- `event_type header <name>`: the value of that header of the NATS message,
+  for example `event_type header Event-Type` with publishers that set
+  `Event-Type: order_created`. Header names are case-sensitive in NATS.
+
+A name must be 1 to 100 characters of `A-Z a-z 0-9 . _ : -`, and it must not
+be `connected`, `reset`, `open` or `error`: NUTS and EventSource use those
+names themselves, and an event named `error` would reach the page's
+`onerror` handler as if the connection had failed. Otherwise, and for a
+message without the header, the event is named `message`. The JSON data is
+the same in every case. The event name counts towards `max_event_size`.
 
 #### `event_id_format`
 
@@ -1220,7 +1241,7 @@ data: {"topic":"my-topic","payload":{"your":"data"},"time":"2024-01-01T12:00:00Z
 id: 12345
 ```
 
-The `id` field contains the JetStream sequence number, which can be used with `last-id` or `Last-Event-ID` for replay. With [`event_id_format sequence_time`](#event_id_format) it also carries the stored time of the message: `id: 12345-1790513389663997004`. It is the last line of each event: SSE allows the fields in any order, and some clients (for example `@microsoft/fetch-event-source`) record an id as soon as they read it, so with the id last a frame cut off mid-write cannot make them resume after a message they never received.
+The event is named `message` unless [`event_type`](#event_type) names it after its topic or a header. The `id` field contains the JetStream sequence number, which can be used with `last-id` or `Last-Event-ID` for replay. With [`event_id_format sequence_time`](#event_id_format) it also carries the stored time of the message: `id: 12345-1790513389663997004`. It is the last line of each event: SSE allows the fields in any order, and some clients (for example `@microsoft/fetch-event-source`) record an id as soon as they read it, so with the id last a frame cut off mid-write cannot make them resume after a message they never received.
 
 The first frame of every stream is the handshake event:
 

@@ -396,3 +396,51 @@ func TestWriteSSEChunkWithTimeout_SetsAndClearsDeadline(t *testing.T) {
 		t.Fatalf("second deadline = %v, want zero reset", rr.deadlines[1])
 	}
 }
+
+// TestIsUsableEventName: a message's SSE event name taken from a topic or a
+// header must be a plain token that no one else uses (#142).
+func TestIsUsableEventName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"orders":                 true,
+		"orders.created":         true,
+		"Order_Created-v2:eu":    true,
+		strings.Repeat("a", 100): true,
+		strings.Repeat("a", 101): false,
+		"":                       false,
+		"connected":              false,
+		"reset":                  false,
+		"open":                   false,
+		"error":                  false,
+		"message":                true,
+		"has space":              false,
+		"line\nbreak":            false,
+		"carriage\rreturn":       false,
+		"slash/and$dollar":       false,
+		"zażółć":                 false,
+		"tab\there":              false,
+	} {
+		if got := isUsableEventName(name); got != want {
+			t.Errorf("isUsableEventName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestIsValidHeaderName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"Event-Type":             true,
+		"Nats-Msg-Id":            true,
+		"x_custom.type!":         true,
+		strings.Repeat("h", 256): true,
+		strings.Repeat("h", 257): false,
+		"":                       false,
+		"has space":              false,
+		"colon:inside":           false,
+		"tab\t":                  false,
+		"del\x7f":                false,
+		"non-ascii-ł":            false,
+	} {
+		if got := isValidHeaderName(name); got != want {
+			t.Errorf("isValidHeaderName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}

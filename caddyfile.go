@@ -302,6 +302,21 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.EventIDFormat = d.Val()
 
+			case "event_type":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.EventType = d.Val()
+				if h.EventType == eventTypeHeader {
+					if !d.NextArg() {
+						return d.Errf("event_type header needs the header's name")
+					}
+					h.EventTypeHeader = d.Val()
+				}
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+
 			default:
 				return d.Errf("unrecognized option: %s", d.Val())
 			}

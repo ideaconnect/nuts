@@ -258,6 +258,43 @@ func isAllowedTopicByte(c byte) bool {
 		c == '.' || c == '-' || c == '_'
 }
 
+// maxEventNameLen bounds an event name taken from a topic or a header.
+const maxEventNameLen = 100
+
+// isUsableEventName reports whether name can be a message's SSE event name
+// (#142): 1 to maxEventNameLen bytes of [A-Za-z0-9._:-], and not a name NUTS
+// or EventSource uses for something else. An event named error would reach
+// the page's onerror handler as if the connection had failed.
+func isUsableEventName(name string) bool {
+	if name == "" || len(name) > maxEventNameLen {
+		return false
+	}
+	switch name {
+	case "connected", "reset", "open", "error":
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; !isAllowedTopicByte(c) && c != ':' {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidHeaderName accepts a NATS header name: 1 to 256 bytes of printable
+// ASCII without spaces or colons.
+func isValidHeaderName(name string) bool {
+	if name == "" || len(name) > 256 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c <= ' ' || c > '~' || c == ':' {
+			return false
+		}
+	}
+	return true
+}
+
 // isValidTopic rejects topic names that would be problematic as NATS
 // subjects. Accepted character set: ASCII letters, digits, dot, dash,
 // underscore. Rejects wildcards (* and >), the system prefix ($),

@@ -72,6 +72,12 @@ const (
 	// nanoseconds, "<seq>-<time>" (#138).
 	eventIDSequence     = "sequence"
 	eventIDSequenceTime = "sequence_time"
+
+	// Values of event_type: where a message's SSE event name comes from
+	// (#142).
+	eventTypeMessage = "message"
+	eventTypeTopic   = "topic"
+	eventTypeHeader  = "header"
 )
 
 // replayMode describes how a JetStream subscription should position itself
@@ -1243,6 +1249,24 @@ func (r *replayHistory) isHistory(formatted formattedMessageEvent) bool {
 	return true
 }
 
+// eventName is a message's SSE event name: "message", unless event_type
+// takes it from the topic or a header and that gives a usable name (#142).
+func (h *Handler) eventName(msg streamMessage) string {
+	var name string
+	switch h.EventType {
+	case eventTypeTopic:
+		name = strings.TrimPrefix(msg.Subject, h.TopicPrefix)
+	case eventTypeHeader:
+		name = msg.Header.Get(h.EventTypeHeader)
+	default:
+		return eventTypeMessage
+	}
+	if !isUsableEventName(name) {
+		return eventTypeMessage
+	}
+	return name
+}
+
 // formatConnectedEvent renders the SSE handshake event sent immediately
 // after headers. Useful for clients that want to confirm the subscription
 // landed on the topics they expected (after path-shorthand expansion or
@@ -1324,7 +1348,9 @@ func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formatted
 	var event strings.Builder
 	event.Grow(len(msg.Data) + 128)
 	var scratch [64]byte
-	event.WriteString("event: message\ndata: {\"topic\":")
+	event.WriteString("event: ")
+	event.WriteString(h.eventName(msg))
+	event.WriteString("\ndata: {\"topic\":")
 	writeJSONString(&event, strings.TrimPrefix(msg.Subject, h.TopicPrefix))
 	event.WriteString(`,"payload":`)
 	writeJSONPayload(&event, msg.Data)

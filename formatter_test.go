@@ -3,10 +3,13 @@ package nuts
 import (
 	"bytes"
 	"encoding/json"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 // referenceMessageFrame renders a message frame the way formatMessageEvent
@@ -25,7 +28,7 @@ func referenceMessageFrame(h *Handler, msg streamMessage, now time.Time) string 
 		payload.Time = now.UTC().Format(time.RFC3339)
 	}
 	var event strings.Builder
-	event.WriteString("event: message\n")
+	event.WriteString("event: " + referenceEventName(h, msg) + "\n")
 	event.WriteString("data: ")
 	event.WriteString(toJSON(payload))
 	event.WriteString("\n")
@@ -39,6 +42,27 @@ func referenceMessageFrame(h *Handler, msg streamMessage, now time.Time) string 
 	}
 	event.WriteString("\n")
 	return event.String()
+}
+
+// referenceEventName is the reference formatter's event_type step, written
+// with a regular expression rather than the handler's byte loop.
+var referenceEventNamePattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,100}$`)
+
+func referenceEventName(h *Handler, msg streamMessage) string {
+	var name string
+	switch h.EventType {
+	case "topic":
+		name = strings.TrimPrefix(msg.Subject, h.TopicPrefix)
+	case "header":
+		name = msg.Header.Get(h.EventTypeHeader)
+	default:
+		return "message"
+	}
+	switch {
+	case !referenceEventNamePattern.MatchString(name), name == "connected", name == "reset", name == "open", name == "error":
+		return "message"
+	}
+	return name
 }
 
 // tryParseJSON is the reference formatter's payload step: valid JSON is
@@ -100,16 +124,25 @@ func TestFormatMessageEvent_MatchesTheReferenceFormatter(t *testing.T) {
 
 func FuzzFormatMessageEventMatchesReference(f *testing.F) {
 	for _, data := range formatterEdgeCases {
-		f.Add([]byte(data), "orders", uint64(42), true, false)
-		f.Add([]byte(data), "orders", uint64(42), true, true)
+		f.Add([]byte(data), "orders", uint64(42), true, false, uint8(0), "")
+		f.Add([]byte(data), "orders", uint64(42), true, true, uint8(1), "")
+		f.Add([]byte(data), "orders", uint64(42), true, false, uint8(2), "order.created")
 	}
+	f.Add([]byte(`{}`), "reset", uint64(1), true, false, uint8(1), "")
+	f.Add([]byte(`{}`), "orders", uint64(1), true, false, uint8(2), "has space")
 	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
-	f.Fuzz(func(t *testing.T, data []byte, topic string, seq uint64, hasMeta, timedIDs bool) {
+	f.Fuzz(func(t *testing.T, data []byte, topic string, seq uint64, hasMeta, timedIDs bool, eventType uint8, header string) {
 		h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 		if timedIDs {
 			h.EventIDFormat = eventIDSequenceTime
 		}
-		msg := streamMessage{Subject: "events." + topic, Data: data, HasMetadata: hasMeta, StreamSequence: seq, Timestamp: now.Add(-time.Minute)}
+		switch eventType % 3 {
+		case 1:
+			h.EventType = eventTypeTopic
+		case 2:
+			h.EventType, h.EventTypeHeader = eventTypeHeader, "Event-Type"
+		}
+		msg := streamMessage{Subject: "events." + topic, Data: data, Header: nats.Header{"Event-Type": []string{header}}, HasMetadata: hasMeta, StreamSequence: seq, Timestamp: now.Add(-time.Minute)}
 		want := referenceMessageFrame(h, msg, now)
 		if got := h.formatMessageEvent(msg, now).Frame; got != want {
 			t.Fatalf("frame differs for data=%q topic=%q:\n got %q\nwant %q", data, topic, got, want)
@@ -194,5 +227,46 @@ func BenchmarkWriteJSONPayload(b *testing.B) {
 				writeJSONPayload(&out, tc.data)
 			}
 		})
+	}
+}
+
+// TestHandler_EventName: event_type takes a message's SSE event name from
+// its topic or a header, and falls back to "message" when that gives no
+// usable name (#142).
+func TestHandler_EventName(t *testing.T) {
+	msg := func(subject, header string) streamMessage {
+		m := streamMessage{Subject: subject}
+		if header != "-" {
+			m.Header = nats.Header{"Event-Type": []string{header}}
+		}
+		return m
+	}
+	topic := &Handler{TopicPrefix: "events.", EventType: eventTypeTopic}
+	header := &Handler{TopicPrefix: "events.", EventType: eventTypeHeader, EventTypeHeader: "Event-Type"}
+	for _, c := range []struct {
+		name string
+		h    *Handler
+		msg  streamMessage
+		want string
+	}{
+		{"default", &Handler{TopicPrefix: "events."}, msg("events.orders", "created"), "message"},
+		{"message", &Handler{TopicPrefix: "events.", EventType: eventTypeMessage}, msg("events.orders", "created"), "message"},
+		{"topic", topic, msg("events.orders.created", "x"), "orders.created"},
+		{"topic without the prefix", topic, msg("other.orders", "x"), "other.orders"},
+		{"topic that is reserved", topic, msg("events.error", "x"), "message"},
+		{"header", header, msg("events.orders", "order:created"), "order:created"},
+		{"header missing", header, msg("events.orders", "-"), "message"},
+		{"header empty", header, msg("events.orders", ""), "message"},
+		{"header with a line break", header, msg("events.orders", "a\nevent: forged"), "message"},
+		{"header reserved", header, msg("events.orders", "connected"), "message"},
+		{"header of another case", &Handler{EventType: eventTypeHeader, EventTypeHeader: "event-type"}, msg("events.orders", "created"), "message"},
+	} {
+		if got := c.h.eventName(c.msg); got != c.want {
+			t.Errorf("%s: eventName = %q, want %q", c.name, got, c.want)
+		}
+	}
+	frame := topic.formatMessageEvent(streamMessage{Subject: "events.orders", Data: []byte(`{}`)}, time.Date(2026, 9, 27, 0, 0, 0, 0, time.UTC)).Frame
+	if !strings.HasPrefix(frame, "event: orders\ndata: ") {
+		t.Fatalf("frame = %q, want the orders event", frame)
 	}
 }

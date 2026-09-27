@@ -63,6 +63,7 @@ nuts {
     replay_max_messages <count>         # Cap replayed messages per reconnect (default: 0 = unlimited)
     replay_window <seconds>             # Time-bound replay window (default: 0 = all retained)
     event_id_format <format>            # Event ids: sequence (default) or sequence_time
+    event_type <source> [name]          # Event names: message (default), topic, or header <name>
 
     # Health probes
     live_path  <path>                   # Liveness probe (default: /livez)

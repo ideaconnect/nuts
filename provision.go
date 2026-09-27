@@ -210,6 +210,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.EventIDFormat == "" {
 		h.EventIDFormat = eventIDSequence
 	}
+	if h.EventType == "" {
+		h.EventType = eventTypeMessage
+	}
 	if h.HealthPath == "" {
 		h.HealthPath = defaultHealthPath
 	}
@@ -863,6 +866,18 @@ func (h *Handler) validateConfigValues() error {
 	case "", eventIDSequence, eventIDSequenceTime:
 	default:
 		return fmt.Errorf("event_id_format must be %q or %q, not %q", eventIDSequence, eventIDSequenceTime, h.EventIDFormat)
+	}
+	switch h.EventType {
+	case "", eventTypeMessage, eventTypeTopic:
+		if h.EventTypeHeader != "" {
+			return fmt.Errorf("event_type_header is only read with event_type header")
+		}
+	case eventTypeHeader:
+		if !isValidHeaderName(h.EventTypeHeader) {
+			return fmt.Errorf("event_type header needs a header name of printable ASCII without spaces or colons, not %q", h.EventTypeHeader)
+		}
+	default:
+		return fmt.Errorf("event_type must be %q, %q or %q, not %q", eventTypeMessage, eventTypeTopic, eventTypeHeader, h.EventType)
 	}
 	if h.MaxTopicsPerSubscription < maxTopicsDisabledSentinel {
 		return fmt.Errorf("max_topics_per_subscription (%d) is invalid: the only accepted negative value is -1 (no limit); other negatives are rejected as typos",

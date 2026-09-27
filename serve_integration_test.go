@@ -4,6 +4,7 @@
 package nuts
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1505,5 +1506,65 @@ func TestHandler_ServeHTTP_TopicOutsideStreamIsRejected(t *testing.T) {
 	}
 	if got := consumerCount(mustJetStream(t, nc), "EVENTS"); got != 0 {
 		t.Fatalf("consumers after rejection = %d, want 0", got)
+	}
+}
+
+// TestHandler_EventTypeFromTheTopicOrAHeader: with event_type, each
+// message's SSE event name comes from its topic or from a header of the
+// published message, and falls back to "message" without one (#142).
+func TestHandler_EventTypeFromTheTopicOrAHeader(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		configure func(*Handler)
+		want      []string
+	}{
+		{"topic", func(h *Handler) { h.EventType = eventTypeTopic }, []string{"orders", "orders"}},
+		{"header", func(h *Handler) { h.EventType, h.EventTypeHeader = eventTypeHeader, "Event-Type" }, []string{"order_created", "message"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ns := startJetStreamServer(t)
+			nc, err := nats.Connect(ns.ClientURL())
+			if err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+			t.Cleanup(nc.Close)
+			createTestStream(t, nc, "EVENTS", []string{"events.>"})
+			_, srv := newContractServer(t, ns.ClientURL(), c.configure)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/events?topic=orders", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+			lines := bufio.NewScanner(resp.Body)
+			nextEvent := func() string {
+				t.Helper()
+				for lines.Scan() {
+					if name, ok := strings.CutPrefix(lines.Text(), "event: "); ok {
+						return name
+					}
+				}
+				t.Fatalf("stream ended: %v", lines.Err())
+				return ""
+			}
+			if first := nextEvent(); first != "connected" {
+				t.Fatalf("first event = %q, want connected", first)
+			}
+			js, _ := nc.JetStream()
+			if _, err := js.PublishMsg(&nats.Msg{Subject: "events.orders", Header: nats.Header{"Event-Type": []string{"order_created"}}, Data: []byte(`{"n":1}`)}); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			if _, err := js.Publish("events.orders", []byte(`{"n":2}`)); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			for i, want := range c.want {
+				if got := nextEvent(); got != want {
+					t.Fatalf("message %d: event %q, want %q", i+1, got, want)
+				}
+			}
+		})
 	}
 }

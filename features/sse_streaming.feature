@@ -14,6 +14,14 @@ Feature: SSE Streaming with JetStream
     And the event payload should contain "alert"
     And the event should have an ID
 
+  # event_type topic names each event after its topic (#142), so a page can
+  # add one listener per topic instead of routing every message itself.
+  Scenario: Events are named after their topic
+    Given I am connected to SSE endpoint "/typed?topic=orders"
+    When I publish message '{"id": 1}' to subject "events.orders"
+    Then I should receive a "orders" event
+    And I should not receive an SSE event with topic "notifications"
+
   Scenario: Receive messages from multiple topics
     Given I am connected to SSE endpoint "/events?topic=alerts&topic=updates"
     When I publish message '{"type": "alert"}' to subject "events.alerts"

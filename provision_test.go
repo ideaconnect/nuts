@@ -1190,6 +1190,21 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			wantErr:  "event_id_format",
 		},
 		{
+			name:     "unknown event type",
+			fragment: `"event_type": "category"`,
+			wantErr:  "event_type must be",
+		},
+		{
+			name:     "event type header without header mode",
+			fragment: `"event_type": "topic", "event_type_header": "Event-Type"`,
+			wantErr:  "event_type_header",
+		},
+		{
+			name:     "event type header mode without a name",
+			fragment: `"event_type": "header"`,
+			wantErr:  "header name",
+		},
+		{
 			name:     "nats_idle_heartbeat at boundary equals InactiveThreshold/2",
 			fragment: `"nats_idle_heartbeat": 15`,
 			wantErr:  "nats_idle_heartbeat",
