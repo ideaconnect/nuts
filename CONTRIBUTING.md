@@ -117,7 +117,8 @@ Targets per file and the survivor-review policy are in
 ### When mutation testing is required
 
 Any PR that adds or modifies code in `auth.go`, `helpers.go`, `handler.go`,
-`serve.go`, `caddyfile.go`, or `provision.go` must:
+`serve.go`, `consumer.go`, `shared.go`, `caddyfile.go`, or `provision.go`
+must:
 
 1. Run `make mutate-pkg PKG=<changed-file>` locally and report the MSI in
    the PR description.
@@ -128,7 +129,12 @@ Any PR that adds or modifies code in `auth.go`, `helpers.go`, `handler.go`,
 
 The full-module run (`make mutate`) is too slow to gate every PR — that's
 why it runs weekly on a schedule (see the `mutation.yml` workflow). Per-PR
-gating uses the scoped `mutate-pkg` form.
+gating uses the scoped `mutate-pkg` form. It fails only when a mutant lives:
+the mutant-coverage gate in `.gremlins.yaml` applies to the full run, since
+one file can sit below it with nothing surviving when its mutants are mostly
+on constants or tagless `switch` cases, which Go's coverage does not
+instrument. Check those `NOT COVERED` mutants by hand
+([docs/mutation/scope.md](docs/mutation/scope.md)).
 
 ### Waiver process
 

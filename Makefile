@@ -160,7 +160,14 @@ mutate: docker-up
 
 # Scoped mutation run. PKG is a directory, or one Go file of the root package
 # (`make mutate-pkg PKG=auth.go`). gremlins only takes packages, so a file is
-# run as the root package with every other source file excluded.
+# run as the root package with every other source file excluded. It gates on
+# efficacy (a lived mutant fails it) but not on mutant coverage: that gate in
+# .gremlins.yaml is meant for the whole package, and a file whose mutants sit
+# mostly on lines Go's coverage does not instrument (constants, tagless
+# switch cases) would fail it with nothing surviving (#141). Those NOT
+# COVERED mutants are checked by hand (docs/mutation/scope.md). The Docker
+# logs are printed only when the run itself failed, not for a gate (gremlins
+# exits 10 or 11).
 mutate-pkg: docker-up
 	@if [ -z "$(PKG)" ]; then echo "Error: PKG is required, e.g. \`make mutate-pkg PKG=auth.go\`"; $(MAKE) docker-down; exit 2; fi
 	@command -v gremlins >/dev/null 2>&1 || { echo "gremlins not installed. Run 'make mutate-tools' first."; $(MAKE) docker-down; exit 1; }
@@ -178,8 +185,8 @@ mutate-pkg: docker-up
 	esac; \
 	echo "Running mutation testing on $(PKG) → $$output"; \
 	go clean -testcache; \
-	gremlins unleash --output $$output $$excludes $$target || status=$$?; \
-	if [ $$status -ne 0 ]; then $(MAKE) docker-logs; fi; \
+	gremlins unleash --threshold-mcover 0 --output $$output $$excludes $$target || status=$$?; \
+	case $$status in 0|10|11) ;; *) $(MAKE) docker-logs;; esac; \
 	$(MAKE) docker-down || status=$$?; \
 	exit $$status
 
