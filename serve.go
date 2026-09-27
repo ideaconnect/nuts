@@ -441,15 +441,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return h.serveStream(w, r, plan, feed, runtime.shutdown)
 }
 
-// transientRetryBase is the average delay a client is asked to wait before
-// retrying a stream request that failed for a transient reason. The delay
-// actually sent is jittered by ±50%, so clients rejected together do not all
-// come back together.
+// transientRetryBase is the default average delay a client is asked to wait
+// before retrying a stream request that failed for a transient reason
+// (transient_retry). The delay actually sent is jittered by ±50%, so clients
+// rejected together do not all come back together.
 const transientRetryBase = 5 * time.Second
 
-// retryDelay returns a delay in [transientRetryBase/2, 3*transientRetryBase/2).
-func retryDelay() time.Duration {
-	return transientRetryBase/2 + rand.N(transientRetryBase)
+// maxSSERetryMillis and maxTransientRetrySeconds bound sse_retry and
+// transient_retry to an hour, past which a client would look dead.
+const (
+	maxSSERetryMillis        = 3600 * 1000
+	maxTransientRetrySeconds = 3600
+)
+
+// retryDelay returns a delay jittered by ±50% around transient_retry: in
+// [base/2, 3*base/2).
+func (h *Handler) retryDelay() time.Duration {
+	base := time.Duration(h.TransientRetry) * time.Second
+	if base <= 0 {
+		base = transientRetryBase
+	}
+	return base/2 + rand.N(base)
 }
 
 // acceptsEventStream reports whether the client asked for an event stream.
@@ -472,7 +484,7 @@ func acceptsEventStream(r *http.Request) bool {
 // reconnects after that delay and keeps its Last-Event-ID. Other clients get
 // the status code with a Retry-After header.
 func (h *Handler) rejectTransient(w http.ResponseWriter, r *http.Request, status int, message string) {
-	delay := retryDelay()
+	delay := h.retryDelay()
 	if acceptsEventStream(r) {
 		h.setSSEHeaders(w)
 		w.WriteHeader(http.StatusOK)
@@ -1123,7 +1135,7 @@ func (h *Handler) endGeneration(w http.ResponseWriter, rc *http.ResponseControll
 	h.log().Info("closing SSE stream: its JetStream stream was recreated or rewound",
 		appendStreamLogFields(plan, zap.String("disconnect_reason", reason))...,
 	)
-	frame := fmt.Sprintf(": %s\nretry: %d\nevent: reset\ndata: {\"reason\":%q}\nid: 0\n\n", reason, retryDelay().Milliseconds(), reason)
+	frame := fmt.Sprintf(": %s\nretry: %d\nevent: reset\ndata: {\"reason\":%q}\nid: 0\n\n", reason, h.retryDelay().Milliseconds(), reason)
 	// Best effort: the stream closes either way, and a client that misses
 	// the frame reconnects with its old cursor.
 	_ = writeSSEChunkWithTimeout(w, rc, frame, writeTimeout)
@@ -1285,6 +1297,12 @@ func (h *Handler) eventName(msg streamMessage) string {
 // first message resumes from there instead of from "now".
 func (h *Handler) formatConnectedEvent(plan streamPlan) string {
 	var event strings.Builder
+	if h.SSERetry > 0 {
+		// Applied by EventSource as soon as it reads the line (#145).
+		event.WriteString("retry: ")
+		event.WriteString(strconv.Itoa(h.SSERetry))
+		event.WriteByte('\n')
+	}
 	event.WriteString("event: connected\ndata: {\"topics\":")
 	event.WriteString(toJSON(plan.Topics))
 	event.WriteString("}\n")

@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `sse_retry <milliseconds>` sends `retry:` with every stream's handshake,
+  setting EventSource's reconnection delay after ordinary disconnects, and
+  `transient_retry <seconds>` sets the average of the jittered delay NUTS
+  asks for after transient failures and closed streams, 5 seconds as
+  before by default (#145).
 - `health_details` adds the NATS server the handler is connected to
   (version, name, cluster, domain) and the stream as the probe read it
   (subjects, storage, replicas, message and byte counts, first and last

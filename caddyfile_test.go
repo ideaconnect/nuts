@@ -55,6 +55,8 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				event_type header Event-Type
 				payload_format raw
 				health_details
+				sse_retry 2500
+				transient_retry 8
 				subscriber_jwt_key secret-key
 				subscriber_jwt_cookie nuts_session
 				allowed_origins https://example.com https://other.com
@@ -92,6 +94,8 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				EventTypeHeader:           "Event-Type",
 				PayloadFormat:             "raw",
 				HealthDetails:             true,
+				SSERetry:                  2500,
+				TransientRetry:            8,
 				SubscriberJWTKey:          "secret-key",
 				SubscriberJWTCookie:       "nuts_session",
 				AllowedOrigins:            []string{"https://example.com", "https://other.com"},
@@ -399,6 +403,8 @@ func TestHandler_UnmarshalCaddyfile_MissingArgs(t *testing.T) {
 		{name: "missing event_id_format arg", directive: "event_id_format"},
 		{name: "missing event_type arg", directive: "event_type"},
 		{name: "missing payload_format arg", directive: "payload_format"},
+		{name: "missing sse_retry arg", directive: "sse_retry"},
+		{name: "missing transient_retry arg", directive: "transient_retry"},
 		{name: "missing max_reconnects arg", directive: "max_reconnects"},
 		{name: "missing max_event_size arg", directive: "max_event_size"},
 		{name: "missing dispatch_timeout arg", directive: "dispatch_timeout"},
@@ -609,6 +615,38 @@ func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
 			wantErr: "argument",
 		},
 		{
+			name:    "negative sse_retry at parse time",
+			line:    "sse_retry -1",
+			wantErr: "sse_retry must be >= 0",
+		},
+		{
+			name:    "negative transient_retry at parse time",
+			line:    "transient_retry -1",
+			wantErr: "transient_retry must be >= 0",
+		},
+		{
+			name:        "sse_retry over an hour",
+			line:        "sse_retry 3600001",
+			wantErr:     "sse_retry must be between",
+			validateErr: true,
+		},
+		{
+			name:        "transient_retry over an hour",
+			line:        "transient_retry 3601",
+			wantErr:     "transient_retry must be between",
+			validateErr: true,
+		},
+		{
+			name:    "sse_retry that is not a number",
+			line:    "sse_retry soon",
+			wantErr: "invalid sse_retry",
+		},
+		{
+			name:    "transient_retry that is not a number",
+			line:    "transient_retry 2.5",
+			wantErr: "invalid transient_retry",
+		},
+		{
 			name:    "health_details that is not a boolean",
 			line:    "health_details sometimes",
 			wantErr: "invalid health_details",
@@ -724,5 +762,21 @@ func TestHandler_UnmarshalCaddyfile_SharedSubscriptions(t *testing.T) {
 		if err != nil || h.SharedSubscriptions != c.want {
 			t.Errorf("%q: SharedSubscriptions = %v (err %v), want %v", c.line, h.SharedSubscriptions, err, c.want)
 		}
+	}
+}
+
+// TestHandler_UnmarshalCaddyfile_RetryHintsGoUpToAnHour: sse_retry and
+// transient_retry accept an hour, their limit (#145).
+func TestHandler_UnmarshalCaddyfile_RetryHintsGoUpToAnHour(t *testing.T) {
+	d := caddyfile.NewTestDispenser("nuts {\n    nats_url nats://localhost:4222\n    stream_name EVENTS\n    sse_retry 3600000\n    transient_retry 3600\n}")
+	h := Handler{}
+	if err := h.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile: %v", err)
+	}
+	if err := h.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want an hour accepted", err)
+	}
+	if h.SSERetry != 3600000 || h.TransientRetry != 3600 {
+		t.Fatalf("SSERetry = %d, TransientRetry = %d; want 3600000 and 3600", h.SSERetry, h.TransientRetry)
 	}
 }

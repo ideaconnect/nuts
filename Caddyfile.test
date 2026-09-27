@@ -94,7 +94,8 @@
 	}
 
 	# The same stream whose readiness probes add the NATS server and the
-	# stream's details, for features/sse_streaming.feature.
+	# stream's details, and whose streams set EventSource's reconnection
+	# delay, for features/sse_streaming.feature.
 	handle /details* {
 		uri strip_prefix /details
 		nuts {
@@ -106,6 +107,7 @@
 			nats_ping_interval 1
 			allowed_origins *
 			health_details
+			sse_retry 2500
 		}
 	}
 

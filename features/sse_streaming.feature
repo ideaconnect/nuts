@@ -82,6 +82,12 @@ Feature: SSE Streaming with JetStream
     Then I should receive HTTP status 200
     And the response should not contain "nats_server"
 
+  # sse_retry sets EventSource's reconnection delay with every stream's
+  # handshake (#145); the /details route sets 2500 ms.
+  Scenario: Streams set the reconnection delay
+    Given I am connected to SSE endpoint "/details?topic=retry"
+    Then the stream should set a reconnection delay of 2500 ms
+
   Scenario: A backlog larger than the prefetch replays on one connection
     # client_buffer_size is 64 by default; the stream stops pulling while the
     # client catches up instead of disconnecting it.

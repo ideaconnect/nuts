@@ -1195,6 +1195,16 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			wantErr:  "event_type must be",
 		},
 		{
+			name:     "negative sse_retry",
+			fragment: `"sse_retry": -1`,
+			wantErr:  "sse_retry",
+		},
+		{
+			name:     "negative transient_retry",
+			fragment: `"transient_retry": -5`,
+			wantErr:  "transient_retry",
+		},
+		{
 			name:     "unknown payload format",
 			fragment: `"payload_format": "binary"`,
 			wantErr:  "payload_format must be",

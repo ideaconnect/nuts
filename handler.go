@@ -121,6 +121,17 @@ type Handler struct {
 	// servers, clusters and limits (#144).
 	HealthDetails bool `json:"health_details,omitempty"`
 
+	// SSERetry is the reconnection delay, in milliseconds, each stream sends
+	// as `retry:` with its connected event. EventSource waits that long
+	// after an ordinary disconnect (a dropped network, a reload, a write
+	// timeout). Zero sends none, leaving the browser's default (#145).
+	SSERetry int `json:"sse_retry,omitempty"`
+	// TransientRetry is the average delay, in seconds, a client is asked to
+	// wait after a transient failure or a stream closed because its
+	// JetStream stream was recreated or rewound; the delay sent is jittered
+	// by ±50%. Zero uses 5 (#145).
+	TransientRetry int `json:"transient_retry,omitempty"`
+
 	// HubURL is the URL advertised in the Link header for hub discovery.
 	// When set, SSE responses include a Link: <url>; rel="nuts" header
 	// so that clients and upstream APIs can discover the event hub automatically.

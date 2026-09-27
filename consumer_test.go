@@ -709,20 +709,21 @@ func TestHandler_WatchStreamReadsEveryIntervalUntilShutdown(t *testing.T) {
 // JetStream stream was recreated or rewound ends with a reset event whose id,
 // 0, makes EventSource replay the stream from its start (#133, #137). It is
 // an event so that pages keeping the cursor see it, and it spreads the
-// reconnects with a jittered retry.
+// reconnects with a retry jittered around transient_retry (#145).
 func TestHandler_EndGenerationResetsTheCursor(t *testing.T) {
 	for _, tt := range []struct {
-		reason string
-		frame  string
+		reason    string
+		transient int
+		frame     string
 	}{
-		{streamRecreated, "event: reset\ndata: {\"reason\":\"stream_recreated\"}\nid: 0\n\n"},
-		{streamRewound, "event: reset\ndata: {\"reason\":\"stream_rewound\"}\nid: 0\n\n"},
+		{streamRecreated, 0, "event: reset\ndata: {\"reason\":\"stream_recreated\"}\nid: 0\n\n"},
+		{streamRewound, 30, "event: reset\ndata: {\"reason\":\"stream_rewound\"}\nid: 0\n\n"},
 	} {
 		t.Run(tt.reason, func(t *testing.T) {
 			gen := newStreamGeneration()
 			gen.reason = tt.reason
 			core, obs := observer.New(zap.InfoLevel)
-			h := &Handler{logger: zap.New(core)}
+			h := &Handler{logger: zap.New(core), TransientRetry: tt.transient}
 			before := metricValue(t, metricsConsumerInvalidated.WithLabelValues(tt.reason))
 			w := newSafeRecorder()
 			h.endGeneration(w, http.NewResponseController(w), streamPlan{Generation: gen}, time.Second)
@@ -733,8 +734,12 @@ func TestHandler_EndGenerationResetsTheCursor(t *testing.T) {
 			if !ok || err != nil || end != tt.frame {
 				t.Fatalf("frame %q, want a %s comment, a retry, then %q", w.Body(), tt.reason, tt.frame)
 			}
-			if d := time.Duration(delay) * time.Millisecond; d < transientRetryBase/2 || d >= 3*transientRetryBase/2 {
-				t.Fatalf("retry %v outside [%v, %v)", d, transientRetryBase/2, 3*transientRetryBase/2)
+			base := transientRetryBase
+			if tt.transient > 0 {
+				base = time.Duration(tt.transient) * time.Second
+			}
+			if d := time.Duration(delay) * time.Millisecond; d < base/2 || d >= 3*base/2 {
+				t.Fatalf("retry %v outside [%v, %v)", d, base/2, 3*base/2)
 			}
 			if got := metricValue(t, metricsConsumerInvalidated.WithLabelValues(tt.reason)); got != before+1 {
 				t.Fatalf("consumer_invalidated{reason=%s} = %v, want %v", tt.reason, got, before+1)

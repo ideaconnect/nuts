@@ -66,6 +66,8 @@ nuts {
     event_type <source> [name]          # Event names: message (default), topic, or header <name>
     payload_format <format>             # Event data: envelope (default) or raw
     health_details [true|false]         # Readiness probes add NATS server and stream details
+    sse_retry <milliseconds>            # retry: sent with every stream's handshake (default: none)
+    transient_retry <seconds>           # Average retry delay after transient failures (default: 5)
 
     # Health probes
     live_path  <path>                   # Liveness probe (default: /livez)
@@ -135,7 +137,7 @@ default, or a negative value to disable the limit entirely.
 
 Caps the number of concurrent SSE streams per NUTS instance. When the cap is
 reached, new clients receive `429 Too Many Requests` (RFC 6585) with a
-jittered `Retry-After` of 3–8 seconds, and
+jittered `Retry-After` of 3–8 seconds by default (`transient_retry`), and
 `nuts_connections_rejected_total{reason="max_connections"}` increments.
 Browser `EventSource` clients get a `200` stream with a `retry:` delay
 instead, so they keep reconnecting. A client-side concurrency cap is

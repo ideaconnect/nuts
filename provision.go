@@ -216,6 +216,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.PayloadFormat == "" {
 		h.PayloadFormat = payloadFormatEnvelope
 	}
+	if h.TransientRetry == 0 {
+		h.TransientRetry = int(transientRetryBase / time.Second)
+	}
 	if h.HealthPath == "" {
 		h.HealthPath = defaultHealthPath
 	}
@@ -869,6 +872,12 @@ func (h *Handler) validateConfigValues() error {
 	case "", eventIDSequence, eventIDSequenceTime:
 	default:
 		return fmt.Errorf("event_id_format must be %q or %q, not %q", eventIDSequence, eventIDSequenceTime, h.EventIDFormat)
+	}
+	if h.SSERetry < 0 || h.SSERetry > maxSSERetryMillis {
+		return fmt.Errorf("sse_retry must be between 0 and %d milliseconds", maxSSERetryMillis)
+	}
+	if h.TransientRetry < 0 || h.TransientRetry > maxTransientRetrySeconds {
+		return fmt.Errorf("transient_retry must be between 0 and %d seconds", maxTransientRetrySeconds)
 	}
 	switch h.PayloadFormat {
 	case "", payloadFormatEnvelope, payloadFormatRaw:

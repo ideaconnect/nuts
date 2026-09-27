@@ -189,10 +189,10 @@ Each is logged once as a warning: `JetStream stream was recreated`,
 `JetStream stream went back to an earlier sequence`, or, for a rewound stream
 that already caught up, `… and has since passed it`. Each closed SSE stream
 counts in `nuts_consumer_invalidated_total{reason}`. The reconnects are spread
-over 2.5 to 7.5 seconds, and each replay is bounded by `replay_max_messages`
-and `replay_window`. Operations that keep the stream, such as
-`nats stream purge` or a config update, do not reset its sequence numbers,
-and NUTS leaves its streams alone.
+over 2.5 to 7.5 seconds by default (`transient_retry`), and each replay is
+bounded by `replay_max_messages` and `replay_window`. Operations that keep
+the stream, such as `nats stream purge` or a config update, do not reset its
+sequence numbers, and NUTS leaves its streams alone.
 
 Limits:
 

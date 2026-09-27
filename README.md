@@ -386,6 +386,8 @@ nuts {
     event_type <source> [name]   # Event names: message (default), topic, or header <name>
     payload_format <format>      # Event data: envelope (default) or raw (the NATS payload itself)
     health_details [true|false]  # Readiness probes add the NATS server and stream details (default: off)
+    sse_retry <milliseconds>     # retry: sent with every stream's handshake (default: 0 = none)
+    transient_retry <seconds>    # Average retry delay after transient failures, jittered ±50% (0=default 5)
     health_path <path>           # Legacy readiness endpoint (empty/default: /healthz)
     live_path <path>             # Process liveness endpoint (empty/default: /livez)
     ready_path <path>            # NATS/stream readiness endpoint (empty/default: /readyz)
@@ -460,7 +462,7 @@ For example, setting `max_event_size 1000` means that if a NATS message produces
 
 Caps the number of concurrent SSE streams per NUTS instance. When the cap
 is reached, new clients receive `429 Too Many Requests` (RFC 6585) with a
-jittered `Retry-After` of 3–8 seconds, and the
+jittered `Retry-After` of 3–8 seconds by default (see `transient_retry`), and the
 `nuts_connections_rejected_total{reason="max_connections"}` counter is
 incremented. Browser `EventSource` clients get a `retry:` stream instead; see
 [Transient failures and EventSource](#transient-failures-and-eventsource).
@@ -1180,9 +1182,9 @@ that send `Accept: text/event-stream`, as every `EventSource` does:
 | Stream consumer limit reached | `200` retry stream | `503` + `Retry-After` |
 | Consumer could not be created | `200` retry stream | `503` + `Retry-After` |
 
-The retry stream holds a comment naming the reason and a `retry:` delay of
-2.5–7.5 seconds (jittered so rejected clients do not return together), then
-closes:
+The retry stream holds a comment naming the reason and a `retry:` delay
+jittered by ±50% around `transient_retry`, 2.5–7.5 seconds by default (so
+rejected clients do not return together), then closes:
 
 ```
 : JetStream not available
@@ -1197,6 +1199,23 @@ JetStream calls to time out.
 Client errors (`400`, `401`, `403`) and topics outside the stream
 (`503 Failed to subscribe to requested topics`) are not retryable: they will
 not succeed on their own.
+
+#### Retry hints: `sse_retry` and `transient_retry`
+
+- `transient_retry <seconds>` sets the average of the delay above, 5 by
+  default: the retry stream's `retry:`, `Retry-After`, and the `retry:` of a
+  stream closed because its JetStream stream was recreated or rewound. The
+  delay sent is jittered by ±50%, so clients sent away together do not come
+  back together. A large deployment may want longer, more spread-out
+  reconnects after an outage.
+- `sse_retry <milliseconds>` sends `retry:` with every stream's handshake,
+  so EventSource waits that long after an ordinary disconnect too (a dropped
+  network, a reload, a write timeout). Unset, browsers use their own default,
+  a few seconds. A `retry:` sets EventSource's delay for the rest of its
+  life, so a client that received a retry stream keeps its delay until the
+  next one.
+
+Both accept up to an hour.
 
 ### Slow Clients And Replay
 

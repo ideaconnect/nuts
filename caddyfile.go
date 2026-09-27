@@ -302,6 +302,26 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.EventIDFormat = d.Val()
 
+			case "sse_retry":
+				v, err := parseInt("sse_retry")
+				if err != nil {
+					return err
+				}
+				if v < 0 {
+					return d.Errf("sse_retry must be >= 0 (0 sends none)")
+				}
+				h.SSERetry = v
+
+			case "transient_retry":
+				v, err := parseInt("transient_retry")
+				if err != nil {
+					return err
+				}
+				if v < 0 {
+					return d.Errf("transient_retry must be >= 0 (0 uses the default)")
+				}
+				h.TransientRetry = v
+
 			case "health_details":
 				if d.NextArg() {
 					b, err := strconv.ParseBool(d.Val())

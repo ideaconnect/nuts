@@ -509,6 +509,13 @@ func TestFormatConnectedEvent(t *testing.T) {
 	if got := h.formatConnectedEvent(streamPlan{Topics: []string{"a"}, Replay: start}); got != "event: connected\ndata: {\"topics\":[\"a\"]}\nid: 0\n\n" {
 		t.Fatalf("connected event at position 0 = %q", got)
 	}
+
+	// #145: sse_retry sets EventSource's reconnection delay with the
+	// handshake.
+	h = &Handler{SSERetry: 2500}
+	if got := h.formatConnectedEvent(streamPlan{Topics: []string{"a"}, Replay: replayPlan{Mode: replayModeDeliverNew, StartSequence: 43}}); got != "retry: 2500\nevent: connected\ndata: {\"topics\":[\"a\"]}\nid: 42\n\n" {
+		t.Fatalf("connected event with sse_retry = %q", got)
+	}
 }
 
 // TestHandler_PlanSubscriptionChecksTheCursorsMessage covers #138: a cursor
@@ -1288,17 +1295,62 @@ func TestHandler_ParseStreamRequest_CursorPrecedence(t *testing.T) {
 	}
 }
 
+// TestRetryDelay_StaysWithinTheJitterRange: the retry delay is jittered by
+// ±50% around transient_retry, 5 s by default (#145).
 func TestRetryDelay_StaysWithinTheJitterRange(t *testing.T) {
-	seen := map[time.Duration]bool{}
-	for i := 0; i < 1000; i++ {
-		d := retryDelay()
-		if d < transientRetryBase/2 || d >= transientRetryBase*3/2 {
-			t.Fatalf("retryDelay() = %v, want [%v, %v)", d, transientRetryBase/2, transientRetryBase*3/2)
+	for _, c := range []struct {
+		retry int
+		base  time.Duration
+	}{
+		{0, transientRetryBase},
+		{2, 2 * time.Second},
+		{30, 30 * time.Second},
+	} {
+		h := &Handler{TransientRetry: c.retry}
+		seen := map[time.Duration]bool{}
+		below, above := 0, 0
+		for i := 0; i < 1000; i++ {
+			d := h.retryDelay()
+			if d < c.base/2 || d >= c.base*3/2 {
+				t.Fatalf("transient_retry %d: retryDelay() = %v, want [%v, %v)", c.retry, d, c.base/2, c.base*3/2)
+			}
+			seen[d] = true
+			if d < c.base {
+				below++
+			} else {
+				above++
+			}
 		}
-		seen[d] = true
+		if len(seen) < 100 {
+			t.Fatalf("transient_retry %d: %d distinct values in 1000 calls; want jitter", c.retry, len(seen))
+		}
+		// Both halves of the range: the average is the base itself.
+		if below < 300 || above < 300 {
+			t.Fatalf("transient_retry %d: %d delays below %v and %d above; want both around 500", c.retry, below, c.base, above)
+		}
 	}
-	if len(seen) < 100 {
-		t.Fatalf("retryDelay() produced %d distinct values in 1000 calls; want jitter", len(seen))
+}
+
+// TestHandler_RejectTransientFollowsTransientRetry: both the retry stream's
+// delay and Retry-After follow transient_retry (#145).
+func TestHandler_RejectTransientFollowsTransientRetry(t *testing.T) {
+	h := &Handler{TransientRetry: 2, logger: zap.NewNop()}
+	for range 50 {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/events?topic=a", nil)
+		req.Header.Set("Accept", "text/event-stream")
+		h.rejectTransient(rr, req, http.StatusServiceUnavailable, "JetStream not available")
+		ms, ok := strings.CutPrefix(strings.Split(rr.Body.String(), "\n")[1], "retry: ")
+		delay, err := strconv.Atoi(ms)
+		if !ok || err != nil || delay < 1000 || delay >= 3000 {
+			t.Fatalf("retry stream %q, want a retry in [1000, 3000) ms", rr.Body.String())
+		}
+
+		rr = httptest.NewRecorder()
+		h.rejectTransient(rr, httptest.NewRequest(http.MethodGet, "/events?topic=a", nil), http.StatusServiceUnavailable, "JetStream not available")
+		if after, err := strconv.Atoi(rr.Header().Get("Retry-After")); err != nil || after < 1 || after > 3 {
+			t.Fatalf("Retry-After = %q, want 1 to 3 s", rr.Header().Get("Retry-After"))
+		}
 	}
 }
 

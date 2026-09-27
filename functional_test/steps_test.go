@@ -51,6 +51,8 @@ type testContext struct {
 	streamNames    map[string]struct{}
 	sseReadDone    chan struct{}
 	natsPaused     bool
+	// sseRetry is the value of the last retry: line of the scenario's stream.
+	sseRetry string
 }
 
 type sseEvent struct {
@@ -458,6 +460,10 @@ func readSSEEvents(body io.Reader, done chan<- struct{}) {
 			tc.sseEventsMutex.Lock()
 			tc.heartbeats = append(tc.heartbeats, line)
 			tc.sseEventsMutex.Unlock()
+		} else if retry, ok := strings.CutPrefix(line, "retry: "); ok {
+			tc.sseEventsMutex.Lock()
+			tc.sseRetry = retry
+			tc.sseEventsMutex.Unlock()
 		}
 	}
 }
@@ -704,6 +710,14 @@ func theResponseShouldContain(text string) error {
 		return fmt.Errorf("response does not contain %q, got: %s", text, tc.httpBody)
 	}
 	return nil
+}
+
+func theStreamShouldSetAReconnectionDelayOf(ms string) error {
+	return waitUntil("retry: "+ms, functionalWaitTimeout, func() (bool, string) {
+		tc.sseEventsMutex.Lock()
+		defer tc.sseEventsMutex.Unlock()
+		return tc.sseRetry == ms, "retry: " + tc.sseRetry
+	})
 }
 
 func theResponseShouldNotContain(text string) error {
@@ -1202,6 +1216,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^I should receive HTTP status (\d+)$`, iShouldReceiveHTTPStatus)
 	ctx.Step(`^the response should contain "([^"]*)"$`, theResponseShouldContain)
 	ctx.Step(`^the response should not contain "([^"]*)"$`, theResponseShouldNotContain)
+	ctx.Step(`^the stream should set a reconnection delay of (\d+) ms$`, theStreamShouldSetAReconnectionDelayOf)
 	ctx.Step(`^the response header "([^"]*)" should be "([^"]*)"$`, theResponseHeaderShouldBe)
 	ctx.Step(`^the SSE response header "([^"]*)" should be "([^"]*)"$`, theSSEResponseHeaderShouldBe)
 	ctx.Step(`^I should receive a heartbeat comment$`, iShouldReceiveAHeartbeatComment)
