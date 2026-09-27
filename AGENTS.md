@@ -224,7 +224,8 @@ mutation testing answers "would the test fail if this line were wrong?"
 Per-file MSI (Mutation Score Indicator) targets and the policy on
 surviving mutants are in
 [docs/mutation/targets.md](docs/mutation/targets.md). The current baseline
-is in [docs/mutation/baseline.md](docs/mutation/baseline.md). `gremlins`
+is [docs/mutation/baseline-20260927.md](docs/mutation/baseline-20260927.md)
+(the first one is [baseline.md](docs/mutation/baseline.md)). `gremlins`
 only mutates operators; [docs/mutation/scope.md](docs/mutation/scope.md)
 describes its blind spots and how to check statement-level changes with
 [scripts/mutate-by-hand.py](scripts/mutate-by-hand.py).

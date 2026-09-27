@@ -773,7 +773,7 @@ func (h *Handler) validateConfigValues() error {
 	// bound.
 	idleHeartbeatUpperBound := int(defaultConsumerInactiveThreshold/time.Second) / 2
 	switch {
-	case h.NatsIdleHeartbeat > 0 && h.NatsIdleHeartbeat >= idleHeartbeatUpperBound:
+	case h.NatsIdleHeartbeat >= idleHeartbeatUpperBound: // the bound is positive, so 0 and the sentinel pass
 		return fmt.Errorf("nats_idle_heartbeat (%d) must be less than half of InactiveThreshold (%d seconds): two missed heartbeats must be detectable before the server reaps the consumer",
 			h.NatsIdleHeartbeat, int(defaultConsumerInactiveThreshold/time.Second))
 	case h.NatsIdleHeartbeat < 0 && h.NatsIdleHeartbeat != natsIdleHeartbeatDisabledSentinel:

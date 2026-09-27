@@ -251,6 +251,53 @@ func waitForLogMessage(t *testing.T, logs *observer.ObservedLogs, snippet string
 	return false
 }
 
+// TestHandler_connectNATS_AsyncErrorsAreCountedAndLogged: an asynchronous
+// error on NUTS' connection, here a subscription that overflows its pending
+// limit, reaches nuts_nats_async_errors_total and the log with the
+// subscription's subject, instead of nats.go's default printer.
+func TestHandler_connectNATS_AsyncErrorsAreCountedAndLogged(t *testing.T) {
+	ns := startJetStreamServer(t)
+	core, obs := observer.New(zap.WarnLevel)
+	h := &Handler{NatsURL: ns.ClientURL(), ReconnectWait: 1, MaxReconnects: intPtr(-1), logger: zap.New(core)}
+	if err := h.connectNATS(); err != nil {
+		t.Fatalf("connectNATS: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Cleanup() })
+	before := metricValue(t, metricsNATSAsyncErrors.WithLabelValues("slow_consumer"))
+
+	release := make(chan struct{})
+	defer close(release)
+	sub, err := h.conn.Subscribe("flood", func(*nats.Msg) { <-release })
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := sub.SetPendingLimits(1, -1); err != nil {
+		t.Fatalf("SetPendingLimits: %v", err)
+	}
+	pub, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect publisher: %v", err)
+	}
+	defer pub.Close()
+	for i := 0; i < 10; i++ {
+		if err := pub.Publish("flood", []byte("x")); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+	if err := pub.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if !waitForLogMessage(t, obs, "NATS async error", 5*time.Second) {
+		t.Fatal("the slow consumer was never reported")
+	}
+	if got := metricValue(t, metricsNATSAsyncErrors.WithLabelValues("slow_consumer")); got <= before {
+		t.Errorf("nats_async_errors_total{kind=slow_consumer} = %v, want more than %v", got, before)
+	}
+	if !hasLogField(obs, "kind", "slow_consumer") || !hasLogField(obs, "subject", "flood") {
+		t.Errorf("async error logged without its kind or subject: %+v", obs.All())
+	}
+}
+
 func TestHandler_connectNATS_ReconnectLifecycle(t *testing.T) {
 	t.Parallel() // asserts no process-wide metric
 	ns, restart := startRestartableJetStreamServer(t)

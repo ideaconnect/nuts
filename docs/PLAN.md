@@ -661,8 +661,10 @@ These are carried over from the v0.4 burn-list (P2 product polish).
   synchronisation. About 17 s (21.5 s under `-race`). The sleeps left are
   assertions (the replay-window age, the window in which no late callback may
   run) or simulate a slow client.
-- [ ] Statement mutants mA, mB, mE, mF, mI and mW are killed, and the gremlins
-  baseline is re-recorded.
+- [x] Statement mutants mA, mB, mE, mF, mI and mW are killed, and the gremlins
+  baseline is re-recorded: 673 killed, 0 lived, and the 40 mutants gremlins
+  cannot see covered were all checked by hand
+  (`docs/mutation/baseline-20260927.md`).
 - [x] README, `docs/CONFIGURATION.md`, `docs/OPERATIONS.md` and
   `docs/PERFORMANCE.md` match the shipped behaviour, and a test verifies the
   memory formula (`TestPerformance_StalledClientHoldsABoundedBacklog`).

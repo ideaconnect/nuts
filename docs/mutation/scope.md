@@ -2,11 +2,12 @@
 
 `gremlins` generates **operator** mutants only: it negates and shifts
 comparisons, swaps `&&`/`||`, changes arithmetic, inverts `break`/`continue`
-and negates numbers. The MSI in [baseline.md](baseline.md) is the share of
+and negates numbers. The MSI in [the current baseline](baseline-20260927.md) is the share of
 those mutants the suite kills. It says nothing about statement-level
 changes: deleting a call, reverting a fix, reordering guards or removing a
 `select` arm. In the 2026-09-26 review, 8 of 11 hand-made statement mutants
-passed the whole suite (#128).
+passed the whole suite (#128). The 2026-09-27 baseline records the
+statement-level mutants run by hand since, and what each survivor led to.
 
 ## Blind spots of `gremlins` itself
 

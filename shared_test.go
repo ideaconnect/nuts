@@ -269,6 +269,7 @@ func TestShared_SlowClientFallsBackWithoutLoss(t *testing.T) {
 	if !waitForSSEBody(slow.safeFlushRecorder, "event: connected", 3*time.Second) {
 		t.Fatalf("slow client never connected; body=%q", slow.Body())
 	}
+	joinedAfterConnect := metricValue(t, metricsSharedTransitions.WithLabelValues(sharedTransitionJoined))
 
 	// Two messages at a time, each pair drained by the fast client before the
 	// next: its queue never holds more than 2 of its 4 frames, so only the
@@ -295,6 +296,16 @@ func TestShared_SlowClientFallsBackWithoutLoss(t *testing.T) {
 	assertContiguousIDs(t, ids[1:], 1, 30)
 	if got := metricValue(t, metricsSharedTransitions.WithLabelValues(sharedTransitionFellBehind)); got != fellBefore+1 {
 		t.Fatalf("shared_transitions_total{fell_behind} = %v, want %v", got, fellBefore+1)
+	}
+	// Caught up, the connection waits sharedJoinBackoff before rejoining
+	// rather than trying on every frame: neither its last catch-up frame nor
+	// a new message takes it back to the shared subscription yet.
+	publishRange(t, js, "events.a", 31, 31)
+	if !waitForSSEBody(slow.safeFlushRecorder, `{"n":31}`, 3*time.Second) {
+		t.Fatalf("the caught-up client missed message 31; ids=%v", lastN(parseSSEIDs(t, slow.Body()), 3))
+	}
+	if got := metricValue(t, metricsSharedTransitions.WithLabelValues(sharedTransitionJoined)); got != joinedAfterConnect {
+		t.Fatalf("shared_transitions_total{joined} moved %v -> %v within sharedJoinBackoff", joinedAfterConnect, got)
 	}
 	cancel()
 	<-done
