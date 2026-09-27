@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -717,14 +718,18 @@ func (f fakeStreamLookup) Stream(_ context.Context, _ string) (jetstream.Stream,
 	return f.stream, f.err
 }
 
+// TestHandler_ReadStreamSnapshot_StreamInfoErrorReturnsEmptySnapshot: a
+// failed read leaves the snapshot empty but for the stream generation, which
+// is the latest read's, so the request still closes if the stream turns out
+// to have been recreated (#133).
 func TestHandler_ReadStreamSnapshot_StreamInfoErrorReturnsEmptySnapshot(t *testing.T) {
-	h := &Handler{StreamName: "EVENTS", logger: zap.NewNop()}
+	h := &Handler{StreamName: "EVENTS", logger: zap.NewNop(), watch: newStreamWatch(time.Second)}
 	plan := streamPlan{Replay: replayPlan{HasLastID: true}}
 
 	snapshot := h.readStreamSnapshot(context.Background(), fakeStreamLookup{err: errors.New("stream info boom")}, plan)
 
-	if !reflect.DeepEqual(snapshot, streamInfoSnapshot{}) {
-		t.Errorf("readStreamSnapshot with StreamInfo error: got %+v, want zero-value snapshot", snapshot)
+	if want := (streamInfoSnapshot{Generation: h.watch.current()}); want.Generation == nil || !reflect.DeepEqual(snapshot, want) {
+		t.Errorf("readStreamSnapshot with StreamInfo error: got %+v, want an empty snapshot on the current generation", snapshot)
 	}
 }
 
@@ -1492,7 +1497,7 @@ func TestStreamReads_LatecomersShareTheNextRead(t *testing.T) {
 
 		firstDone := make(chan struct{})
 		go func() {
-			if stream, err := reads.read(context.Background(), fetch); err != nil || readNumber(stream) != 1 {
+			if stream, _, err := reads.read(context.Background(), fetch); err != nil || readNumber(stream) != 1 {
 				t.Errorf("the first caller got read %v (err %v), want 1", stream, err)
 			}
 			close(firstDone)
@@ -1506,7 +1511,7 @@ func TestStreamReads_LatecomersShareTheNextRead(t *testing.T) {
 			arrivals[i] = clock.Add(1)
 			go func() {
 				defer wg.Done()
-				stream, err := reads.read(context.Background(), fetch)
+				stream, _, err := reads.read(context.Background(), fetch)
 				if err != nil {
 					t.Errorf("read: %v", err)
 				} else if n := readNumber(stream); n != 2 {
@@ -1528,7 +1533,7 @@ func TestStreamReads_LatecomersShareTheNextRead(t *testing.T) {
 			}
 		}
 
-		if stream, err := reads.read(context.Background(), fetch); err != nil || len(starts) != 3 || readNumber(stream) != 3 {
+		if stream, _, err := reads.read(context.Background(), fetch); err != nil || len(starts) != 3 || readNumber(stream) != 3 {
 			t.Fatalf("a caller after the storm got reads=%d err=%v, want its own fresh read", len(starts), err)
 		}
 	})
@@ -1537,14 +1542,14 @@ func TestStreamReads_LatecomersShareTheNextRead(t *testing.T) {
 func TestStreamReads_ErrorsAndCancellation(t *testing.T) {
 	var reads streamReads
 	boom := errors.New("boom")
-	if _, err := reads.read(context.Background(), func() (jetstream.Stream, error) { return nil, boom }); !errors.Is(err, boom) {
+	if _, _, err := reads.read(context.Background(), func() (jetstream.Stream, error) { return nil, boom }); !errors.Is(err, boom) {
 		t.Fatalf("read error = %v, want %v", err, boom)
 	}
 
 	release := make(chan struct{})
 	defer close(release)
 	go func() {
-		_, _ = reads.read(context.Background(), func() (jetstream.Stream, error) { <-release; return fakeStream{}, nil })
+		_, _, _ = reads.read(context.Background(), func() (jetstream.Stream, error) { <-release; return fakeStream{}, nil })
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -1558,11 +1563,40 @@ func TestStreamReads_ErrorsAndCancellation(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if _, err := reads.read(ctx, func() (jetstream.Stream, error) { return fakeStream{}, nil }); !errors.Is(err, context.DeadlineExceeded) {
+	if _, _, err := reads.read(ctx, func() (jetstream.Stream, error) { return fakeStream{}, nil }); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waiting caller whose request ended got %v, want its context error", err)
 	}
 	if time.Since(start) > time.Second {
 		t.Fatal("a cancelled caller kept waiting for the read")
+	}
+}
+
+// TestStreamReads_HandEachCallerItsReadsGeneration: the stream watch is given
+// every successful read, in the order the reads ran, and each caller gets the
+// generation of the read it shared (#133). A failed read has none.
+func TestStreamReads_HandEachCallerItsReadsGeneration(t *testing.T) {
+	var reads streamReads
+	var observed []uint64
+	gens := map[uint64]*streamGeneration{}
+	reads.observe = func(stream jetstream.Stream) *streamGeneration {
+		n := stream.CachedInfo().State.LastSeq
+		observed = append(observed, n)
+		gens[n] = newStreamGeneration()
+		return gens[n]
+	}
+	for n := uint64(1); n <= 3; n++ {
+		stream, gen, err := reads.read(context.Background(), func() (jetstream.Stream, error) {
+			return fakeStream{info: &jetstream.StreamInfo{State: jetstream.StreamState{LastSeq: n}}}, nil
+		})
+		if err != nil || stream.CachedInfo().State.LastSeq != n || gen == nil || gen != gens[n] {
+			t.Fatalf("read %d: err=%v, got its own generation: %v", n, err, gen != nil && gen == gens[n])
+		}
+	}
+	if _, gen, err := reads.read(context.Background(), func() (jetstream.Stream, error) { return nil, errors.New("boom") }); err == nil || gen != nil {
+		t.Fatalf("a failed read: err=%v generation=%v, want an error and no generation", err, gen)
+	}
+	if !slices.Equal(observed, []uint64{1, 2, 3}) {
+		t.Fatalf("observed reads %v, want 1, 2, 3", observed)
 	}
 }
 

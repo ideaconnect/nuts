@@ -857,14 +857,17 @@ func (f fakeConsumer) CachedInfo() *jetstream.ConsumerInfo { return f.info }
 var testFeedPlan = streamPlan{Topics: []string{"alpha"}, FullSubjects: []string{"events.alpha"}}
 
 // newTestSharedSub builds a shared subscription without a JetStream consumer,
-// registered under key "k". stopped counts calls that would stop its feed.
+// registered under testSharedKey. stopped counts calls that would stop its
+// feed.
+var testSharedKey = sharedTopics{subjects: "k"}
+
 func newTestSharedSub(floor uint64) (*sharedSub, *int) {
 	stopped := 0
 	registry := newSharedRegistry()
 	sub := &sharedSub{
 		h:        &Handler{logger: zap.NewNop()},
 		registry: registry,
-		key:      "k",
+		key:      testSharedKey,
 		stream: &consumerStream{
 			feed:     &streamFeed{stop: func() { stopped++ }},
 			consumer: fakeConsumer{},
@@ -875,7 +878,7 @@ func newTestSharedSub(floor uint64) (*sharedSub, *int) {
 		floor:   floor,
 		clients: map[*sharedClient]struct{}{},
 	}
-	registry.subs["k"] = sub
+	registry.subs[testSharedKey] = sub
 	metricsSharedSubscriptions.Inc()
 	return sub, &stopped
 }

@@ -31,6 +31,175 @@ type streamLookup interface {
 // errHandlerClosing rejects new streams once Cleanup has started.
 var errHandlerClosing = errors.New("handler is shutting down")
 
+const (
+	// streamWatchInterval is how often a handler reads its stream when no
+	// request has, so that a stream recreated or rewound under open SSE
+	// streams is noticed (#133). A rewind counts once a read at least half
+	// an interval after the first read that found it still finds it, so the
+	// next poll decides.
+	streamWatchInterval = 10 * time.Second
+
+	// Reasons a stream generation ends. Each is also the disconnect_reason,
+	// and the consumer_invalidated reason, of the SSE streams it closes.
+	streamRecreated = "stream_recreated"
+	streamRewound   = "stream_rewound"
+)
+
+// streamGeneration is the configured stream as a run of reads saw it: one
+// creation time, and sequences that only grow. A request is planned from a
+// read and keeps that read's generation. When a later read finds the stream
+// recreated or rewound, the generation ends and its SSE streams close (#133):
+// the ordered consumer of each would recreate itself after the last sequence
+// it delivered, a position the stream no longer has, and wait there, skipping
+// every message the stream gets until it passes that position.
+type streamGeneration struct {
+	ended chan struct{}
+	// reason is streamRecreated or streamRewound, set before ended closes.
+	reason string
+}
+
+func newStreamGeneration() *streamGeneration {
+	return &streamGeneration{ended: make(chan struct{})}
+}
+
+// done returns a channel that is closed when the generation ends. A nil
+// generation never ends.
+func (g *streamGeneration) done() <-chan struct{} {
+	if g == nil {
+		return nil
+	}
+	return g.ended
+}
+
+// streamWatch follows the stream through the reads of streamReads, which run
+// one after another, so it sees the stream's states in the order the server
+// reported them.
+type streamWatch struct {
+	// confirm is how long after the first read that found the stream
+	// rewound a read must still find it so.
+	confirm time.Duration
+
+	mu      sync.Mutex
+	gen     *streamGeneration
+	created time.Time
+	// lastSeq is the highest last sequence this generation's reads saw.
+	lastSeq uint64
+	// behindSince is when a read first found the stream below lastSeq; zero
+	// unless the reads since then all did.
+	behindSince time.Time
+}
+
+func newStreamWatch(confirm time.Duration) *streamWatch {
+	return &streamWatch{confirm: confirm, gen: newStreamGeneration()}
+}
+
+// current returns the generation of the latest read, for a request whose own
+// read failed. A nil watch returns nil.
+func (w *streamWatch) current() *streamGeneration {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.gen
+}
+
+// observe records a read of the stream made at now. It returns the
+// generation the read belongs to and, when the read ended the previous one,
+// the reason.
+//
+// A different creation time means the stream was deleted and created again,
+// or restored by nats-server 2.15, which gives a restored stream a new
+// creation time. A last sequence below one already seen, with the same
+// creation time, means it was restored by an earlier server, which keeps the
+// creation time, or from a copy of its store directory. That only counts once
+// the reads have shown it for confirm, and never from a replica that answered
+// while its group had no leader: such a replica may not have applied the
+// stream's latest messages.
+func (w *streamWatch) observe(info *jetstream.StreamInfo, now time.Time) (*streamGeneration, string) {
+	if w == nil {
+		return nil, ""
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if info == nil || info.Created.IsZero() {
+		return w.gen, "" // nothing to place the read by
+	}
+	if w.created.IsZero() {
+		w.created, w.lastSeq = info.Created, info.State.LastSeq
+		return w.gen, ""
+	}
+	if !info.Created.Equal(w.created) {
+		return w.end(streamRecreated, info), streamRecreated
+	}
+	if info.State.LastSeq >= w.lastSeq {
+		w.lastSeq, w.behindSince = info.State.LastSeq, time.Time{}
+		return w.gen, ""
+	}
+	if info.Cluster != nil && info.Cluster.Leader == "" {
+		return w.gen, "" // a replica without a leader; its state may lag
+	}
+	if w.behindSince.IsZero() {
+		w.behindSince = now
+	}
+	if now.Sub(w.behindSince) < w.confirm {
+		return w.gen, ""
+	}
+	return w.end(streamRewound, info), streamRewound
+}
+
+// end ends the current generation for reason and starts the next one from
+// info.
+func (w *streamWatch) end(reason string, info *jetstream.StreamInfo) *streamGeneration {
+	w.gen.reason = reason
+	close(w.gen.ended)
+	w.gen = newStreamGeneration()
+	w.created, w.lastSeq, w.behindSince = info.Created, info.State.LastSeq, time.Time{}
+	return w.gen
+}
+
+// observeStream feeds a stream read to the watch, logs a generation it
+// ends, and returns the read's generation.
+func (h *Handler) observeStream(stream jetstream.Stream) *streamGeneration {
+	info := stream.CachedInfo()
+	gen, ended := h.watch.observe(info, time.Now())
+	switch ended {
+	case streamRecreated:
+		h.log().Warn("JetStream stream was recreated; closing the SSE streams positioned on the old one, whose clients reconnect from the start of the new one",
+			zap.String("stream", h.StreamName),
+			zap.Time("stream_created", info.Created),
+		)
+	case streamRewound:
+		h.log().Warn("JetStream stream went back to an earlier sequence; closing the SSE streams positioned on it before, whose clients reconnect with their last event ID",
+			zap.String("stream", h.StreamName),
+			zap.Uint64("stream_last_sequence", info.State.LastSeq),
+		)
+	}
+	return gen
+}
+
+// watchStream reads the stream every interval until shutdown, so that a
+// recreated or rewound stream is noticed even when no request reads it: the
+// SSE streams it strands receive nothing, and nothing else would notice.
+func (h *Handler) watchStream(interval time.Duration, shutdown <-chan struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-shutdown:
+			return
+		case <-ticker.C:
+		}
+		if js := h.currentStreamRuntime().js; js != nil {
+			_, _, _ = h.streamReads.read(context.Background(), func() (jetstream.Stream, error) {
+				ctx, cancel := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
+				defer cancel()
+				return js.Stream(ctx, h.StreamName)
+			})
+		}
+	}
+}
+
 // consumerStream is the JetStream side of a single SSE request: its ordered
 // consumer and the feed that pulls from it.
 type consumerStream struct {

@@ -283,6 +283,19 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	h.logStreamLimits(stream.CachedInfo())
 
+	// Follow the stream, so the SSE streams positioned on it are closed once
+	// it is recreated or rewound (#133).
+	interval := h.watchInterval
+	if interval <= 0 {
+		interval = streamWatchInterval
+	}
+	h.watch = newStreamWatch(interval / 2)
+	h.streamReads.observe = h.observeStream
+	h.mu.RLock()
+	shutdown := h.shutdown
+	h.mu.RUnlock()
+	go h.watchStream(interval, shutdown)
+
 	h.log().Info("nuts handler provisioned",
 		zap.String("nats_url", redactURL(h.NatsURL)),
 		zap.String("stream_name", h.StreamName),

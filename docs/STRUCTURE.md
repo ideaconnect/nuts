@@ -134,6 +134,7 @@ Step by step:
 5. **SSE writer loop** — a single `select` in `serve.go` multiplexes:
    - **`feed.frames`** — formatted frames, written and flushed with a `write_timeout` deadline; a missed deadline disconnects the client as slow.
    - **`feed.errs`** — the consumer could not be recreated; the stream closes so the client resumes elsewhere.
+   - **`plan.Generation.done()`** — the stream-info reads found the stream recreated or rewound (`streamWatch` in `consumer.go`); the stream closes so the client reconnects onto the new stream.
    - **`heartbeat.C`** — periodic SSE comment (`: heartbeat <timestamp>`) keeps the connection alive through proxies/load balancers.
    - **`ctx.Done()`** — client disconnect; the consumer is deleted in the background.
    - **`shutdown`** — `Cleanup()` closes this channel on module teardown so in-flight handlers return promptly instead of waiting for the next heartbeat or NATS-side error.

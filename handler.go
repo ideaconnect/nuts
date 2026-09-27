@@ -8,6 +8,7 @@ package nuts
 
 import (
 	"sync"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -214,6 +215,15 @@ type Handler struct {
 
 	// streamReads coalesces the stream-info reads of concurrent requests.
 	streamReads streamReads
+
+	// watch follows the configured stream across reads and ends the SSE
+	// streams positioned on it once it is recreated or rewound (#133).
+	watch *streamWatch
+
+	// watchInterval is how often watchStream reads the stream; a rewind is
+	// confirmed over half of it. Zero uses streamWatchInterval; tests
+	// shorten it.
+	watchInterval time.Duration
 
 	// mu protects conn, js, shutdown and closing.
 	mu sync.RWMutex

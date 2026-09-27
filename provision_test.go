@@ -178,6 +178,11 @@ func TestHandler_Provision(t *testing.T) {
 		if jsNil {
 			t.Fatal("expected Provision to initialize JetStream context")
 		}
+		// #133: stream reads feed the watch, which confirms a rewind over
+		// the watch interval.
+		if h.watch == nil || h.watch.confirm != streamWatchInterval/2 || h.streamReads.observe == nil {
+			t.Fatalf("expected Provision to watch the stream and confirm rewinds over %v", streamWatchInterval/2)
+		}
 	})
 
 	t.Run("connect failure is wrapped", func(t *testing.T) {

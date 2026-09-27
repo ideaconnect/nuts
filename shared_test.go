@@ -128,8 +128,8 @@ func TestSharedSub_ClosesWhenEveryClientFellBehind(t *testing.T) {
 		t.Fatal("closed while its clients kept up")
 	}
 	sub.publish(sharedFrame(3)) // both queues are full now
-	if !sub.isClosed() || *stopped != 1 || sub.registry.subs["k"] != nil {
-		t.Fatalf("closed=%v stopped=%d registered=%v after every client fell behind", sub.isClosed(), *stopped, sub.registry.subs["k"] != nil)
+	if !sub.isClosed() || *stopped != 1 || sub.registry.subs[testSharedKey] != nil {
+		t.Fatalf("closed=%v stopped=%d registered=%v after every client fell behind", sub.isClosed(), *stopped, sub.registry.subs[testSharedKey] != nil)
 	}
 	for _, c := range []*sharedClient{a, b} {
 		if drain(c); c.reason != sharedTransitionFellBehind || c.lastSeq != 2 {
@@ -152,7 +152,7 @@ func TestSharedSub_LastLeaveClosesTheSubscription(t *testing.T) {
 	if !sub.isClosed() || *stopped != 1 {
 		t.Fatalf("closed=%v stopped=%d after the last client left", sub.isClosed(), *stopped)
 	}
-	if sub.registry.subs["k"] != nil {
+	if sub.registry.subs[testSharedKey] != nil {
 		t.Fatal("closed subscription still registered")
 	}
 	if got := metricValue(t, metricsSharedSubscriptions); got != gauge-1 {
@@ -179,11 +179,19 @@ func TestSharedSub_FailureMovesEveryClientOff(t *testing.T) {
 	sub.publish(sharedFrame(2)) // ignored once closed
 }
 
-func TestSharedKey_IgnoresTopicOrder(t *testing.T) {
-	a := sharedKey(streamPlan{FullSubjects: []string{"events.b", "events.a"}})
-	b := sharedKey(streamPlan{FullSubjects: []string{"events.a", "events.b"}})
-	if a != b || a != "events.a,events.b" {
-		t.Fatalf("keys %q and %q, want both events.a,events.b", a, b)
+// TestSharedKey_IgnoresTopicOrderButNotTheGeneration: a topic set is shared
+// whatever the order of its topics, but only within a stream generation, so
+// no connection joins a subscription positioned on a stream that has since
+// been recreated or rewound (#133).
+func TestSharedKey_IgnoresTopicOrderButNotTheGeneration(t *testing.T) {
+	gen := newStreamGeneration()
+	a := sharedKey(streamPlan{FullSubjects: []string{"events.b", "events.a"}, Generation: gen})
+	b := sharedKey(streamPlan{FullSubjects: []string{"events.a", "events.b"}, Generation: gen})
+	if a != b || a.subjects != "events.a,events.b" || a.generation != gen {
+		t.Fatalf("keys %+v and %+v, want both events.a,events.b on the plan's generation", a, b)
+	}
+	if next := sharedKey(streamPlan{FullSubjects: []string{"events.a", "events.b"}, Generation: newStreamGeneration()}); next == a {
+		t.Fatal("the topic set has the same key on another stream generation")
 	}
 }
 

@@ -18,6 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests are told to retry at once.
 
 ### Fixed
+- **A stream recreated under open SSE streams no longer leaves them silent**
+  (#133). Each one's consumer resumed after the last sequence it delivered, a
+  position the new stream had not reached, so it skipped the new stream's
+  messages until it passed it, while heartbeats kept the connection looking
+  healthy. NUTS now reads the stream's info on every stream request and
+  every 10 seconds. When the stream's creation time changes (a stream
+  created again, or restored on nats-server 2.15), it closes the SSE
+  streams opened on the old stream with `disconnect_reason=stream_recreated`
+  and sets their clients' last event ID to `0`, so EventSource reconnects
+  from the start of the new stream. When the creation time stays but the
+  last sequence goes back, on two reads at least 5 seconds apart (a restore
+  on nats-server 2.14 or earlier, which keep the creation time), they close
+  with `disconnect_reason=stream_rewound` and keep their cursors, which fall
+  back to the retained replay (#103). Both are counted in
+  `nuts_consumer_invalidated_total{reason}`, and shared subscriptions are no
+  longer shared across the change. `caddy reload --force` is no longer
+  needed after recreating a stream.
 - Release notes told users to `docker pull idcttech/nuts:<version>` without
   the `v` the image tags carry (`idcttech/nuts:v0.5.0`); the footer now uses
   the tag. The v0.4.3 and v0.5.0 notes are corrected.

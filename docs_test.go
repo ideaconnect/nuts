@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/prometheus/client_golang/prometheus"
@@ -261,5 +262,24 @@ func TestDocumentedDefaultsMatchProvision(t *testing.T) {
 	}
 	if checked < 25 {
 		t.Fatalf("checked only %d defaults; the table format changed", checked)
+	}
+}
+
+// TestDocumentedStreamWatchTimings: TROUBLESHOOTING.md tells operators how
+// soon NUTS notices a recreated or rewound stream (#133), so its numbers must
+// follow streamWatchInterval.
+func TestDocumentedStreamWatchTimings(t *testing.T) {
+	doc, err := os.ReadFile(filepath.Join("docs", "TROUBLESHOOTING.md"))
+	if err != nil {
+		t.Fatalf("read TROUBLESHOOTING.md: %v", err)
+	}
+	text := strings.Join(strings.Fields(string(doc)), " ")
+	for _, want := range []string{
+		fmt.Sprintf("every %d seconds, and closes the SSE streams", int(streamWatchInterval/time.Second)),
+		fmt.Sprintf("a read at least %d seconds later still finds it back", int(streamWatchInterval/2/time.Second)),
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("TROUBLESHOOTING.md does not say %q", want)
+		}
 	}
 }

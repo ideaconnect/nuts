@@ -604,12 +604,14 @@ Several of these are good first issues.
 
 These are carried over from the v0.4 burn-list (P2 product polish).
 
-- [ ] P1 ([#133]): Detect a stream recreated under live connections. Their consumers
+- [x] P1 ([#133]): Detect a stream recreated under live connections. Their consumers
   resume after the old last sequence and stay silent until the new stream
   passes it, skipping everything before (reproduced in both subscription
-  modes). End such streams, for example when the stream's creation time
-  changes, so clients reconnect and take the cursor-ahead fallback (#103).
-  Documented in `docs/TROUBLESHOOTING.md` meanwhile.
+  modes). Done: stream-info reads, on requests and every 10 s, end a stream
+  generation when the creation time changes (`stream_recreated`; the last
+  frame resets the client's cursor to 0) or the last sequence is behind on
+  two reads at least 5 s apart (`stream_rewound`; the cursor falls back to
+  the retained replay).
 - [x] P1 ([#134]): Notice a silently dead NATS server sooner. NUTS kept nats.go's
   two-minute ping interval, so a server that stopped answering took minutes
   to declare stale, and meanwhile each new request waited about 7–10 s for

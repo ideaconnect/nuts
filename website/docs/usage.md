@@ -295,7 +295,7 @@ NUTS registers the following metrics; expose them via Caddy's `metrics` handler:
 | `nuts_dispatch_timeout_total` | Counter | Deprecated, always `0`: `dispatch_timeout` has no effect |
 | `nuts_write_disconnects_total{site}` | Counter | SSE streams ended by a response-writer write error (`site`: `connected`, `message`, `heartbeat`) |
 | `nuts_nats_async_errors_total{kind}` | Counter | Asynchronous NATS client errors (`kind`: `slow_consumer`, `timeout`, `connection_state`, `consumer_invalidated` — legacy, stays `0`, `other`) |
-| `nuts_consumer_invalidated_total{reason}` | Counter | Consumers lost under a live stream (`reason`: `recreated` — recovered from the last delivered sequence; `unrecoverable` — recreation failed and the stream closed) |
+| `nuts_consumer_invalidated_total{reason}` | Counter | Consumers lost under a live stream (`reason`: `recreated` — recovered from the last delivered sequence; `unrecoverable` — recreation failed and the stream closed; `stream_recreated` — the JetStream stream was recreated and the stream closed, the client reconnects from the start of the new one; `stream_rewound` — the stream's sequence went back, as after a restore that kept its creation time, and the stream closed) |
 | `nuts_readiness_failures_total{cause}` | Counter | `/readyz` responses returning `503` (`cause`: `nats_disconnected`, `jetstream_missing`, `stream_info_error`) |
 | `nuts_shared_subscriptions` | Gauge | Shared subscriptions (one consumer per topic set) with `shared_subscriptions` on |
 | `nuts_shared_transitions_total{transition}` | Counter | Connections joining shared subscriptions (`joined`) or leaving them because they fell behind (`fell_behind`) or the shared consumer failed (`shared_failed`) |

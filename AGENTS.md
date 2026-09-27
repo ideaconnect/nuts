@@ -64,8 +64,8 @@ Top-level Go source is the Caddy module package itself (`package nuts`):
 | [provision.go](provision.go) | `Provision`, `Validate`, `Cleanup`; NATS dial and TLS config. |
 | [auth.go](auth.go) | Subscriber JWT verification and `subscribe`-claim parsing. |
 | [serve.go](serve.go) | `ServeHTTP`, the SSE streaming loop, replay planning, probes, CORS. |
-| [consumer.go](consumer.go) | The JetStream side of a stream: ordered pull consumer config, pull options, the feed goroutine, consumer teardown. |
-| [shared.go](shared.go) | `shared_subscriptions`: one consumer per topic set shared by caught-up connections, the recent-frame ring, and each connection's hand-offs between its own consumer and the shared one. |
+| [consumer.go](consumer.go) | The JetStream side of a stream: ordered pull consumer config, pull options, the feed goroutine, consumer teardown, and the stream watch whose generations end the streams of a recreated or rewound stream. |
+| [shared.go](shared.go) | `shared_subscriptions`: one consumer per topic set and stream generation shared by caught-up connections, the recent-frame ring, and each connection's hand-offs between its own consumer and the shared one. |
 | [caddyfile.go](caddyfile.go) | Caddyfile parsing (`UnmarshalCaddyfile`, `parseCaddyfile`). |
 | [helpers.go](helpers.go) | Pure helpers: SSE writers, JSON helpers, topic/cookie validation, URL redaction. |
 | [metrics.go](metrics.go) | Prometheus counters and gauges. |

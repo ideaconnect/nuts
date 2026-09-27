@@ -151,26 +151,52 @@ client reconnects with its last event ID. Check that the requested sequence is
 still retained (`replay_fallback_reason` in the logs) and, for multi-topic
 streams, the nats-server version.
 
-## Streams Stall After The Stream Was Recreated
+## Streams Close After The Stream Was Recreated Or Restored
 
-Deleting a stream and creating it again (or restoring an older backup of it)
-while clients are connected can leave their open SSE streams silent. Each
-connection's consumer resumes after the last stream sequence it delivered, and
-the new stream numbers its messages from 1 again, so those connections receive
-nothing until the new stream passes their old position. Heartbeats continue,
-so neither the browser nor the readiness probe notices.
+A stream deleted and created again numbers its messages from 1 again. An open
+SSE stream's consumer would resume after the last sequence it delivered and
+wait there, silently skipping the new stream's messages until it passed that
+position. NUTS therefore reads the stream's info on every stream request and
+every 10 seconds, and closes the SSE streams positioned on the old stream
+(#133):
 
-Clients that connect afterwards are not affected: a `Last-Event-ID` or
-`?last-id=` ahead of the stream falls back to the retained replay
-(`replay_window` when configured), as the `replay fallback` log line shows.
+- **Recreated**: the stream's creation time changed. It was deleted and
+  created again, or restored with `nats stream restore` on nats-server 2.15,
+  which gives a restored stream a new creation time. The SSE streams close
+  with `disconnect_reason=stream_recreated`, and their last frame sets the
+  client's last event ID to `0`, so EventSource reconnects and replays the
+  stream from its start.
+- **Rewound**: the creation time is the same but the last sequence went back,
+  and a read at least 5 seconds later still finds it back. The stream was
+  restored with `nats stream restore` on nats-server 2.14 or earlier, which
+  keep the creation time, or its store directory was restored from a copy.
+  The SSE streams close with `disconnect_reason=stream_rewound` and the
+  clients keep their last event ID. Where it is ahead of the stream, the
+  reconnect falls back to the retained replay (`replay_window` when
+  configured), as the `replay fallback` log line shows.
 
-After recreating a stream under live traffic, reload Caddy with
-`caddy reload --force` (a reload with an unchanged config is skipped) or
-restart it. Every stream closes, clients reconnect with their last event ID,
-and each one takes the fallback above. Operations that keep the stream,
-such as `nats stream purge`, do not reset its sequence numbers and need
-nothing. A fix is tracked in
-[#133](https://github.com/ideaconnect/nuts/issues/133).
+Both are logged once as a warning (`JetStream stream was recreated` or
+`JetStream stream went back to an earlier sequence`) and counted per SSE
+stream in `nuts_consumer_invalidated_total{reason}`. The reconnects are spread
+over 2.5 to 7.5 seconds, and each replay is bounded by `replay_max_messages`
+and `replay_window`. Operations that keep the stream, such as
+`nats stream purge` or a config update, do not reset its sequence numbers,
+and NUTS leaves its streams alone.
+
+Limits:
+
+- A rewind is noticed only while the restored stream stays below the highest
+  sequence NUTS saw, and a client resumes without a gap only while its last
+  event ID is still ahead of the stream. A client that was past the backup's
+  last sequence can otherwise skip messages published to the restored stream
+  up to its position. When a restore rewinds the stream, pause publishers
+  while restoring and for 30 seconds after: NUTS logs `JetStream stream went
+  back to an earlier sequence` within 20 seconds, and its clients reconnect
+  within 7.5 seconds of that.
+- A client that was disconnected while the stream was recreated reconnects
+  with a cursor from the old stream. While the cursor is ahead of the new
+  stream it gets the retained replay; once the new stream has passed it, the
+  client resumes after it and misses the new stream's messages before it.
 
 ## Docker Image Starts But Config Looks Wrong
 

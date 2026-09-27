@@ -3,6 +3,8 @@ package nuts
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"testing"
@@ -10,6 +12,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // deliveryModes runs a delivery contract test twice, in parallel: with every
@@ -90,7 +94,12 @@ func TestDeliveryContract_NATSRestartLeavesNoHole(t *testing.T) {
 			t.Fatalf("CreateStream: %v", err)
 		}
 		js, _ := nc.JetStream()
-		h, srv := newContractServer(t, ns.ClientURL(), mode)
+		// A restarted server keeps the stream's creation time, so the watch
+		// for recreated streams (#133), polling fast here, must not end it.
+		h, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) {
+			h.watchInterval = 100 * time.Millisecond
+			mode(h)
+		})
 
 		stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
 		if connected := stream.collectIDs(1, 3*time.Second); len(connected) != 1 || connected[0] != 0 {
@@ -111,6 +120,163 @@ func TestDeliveryContract_NATSRestartLeavesNoHole(t *testing.T) {
 		default:
 		}
 	})
+}
+
+// TestDeliveryContract_RecreatedStreamSendsClientsToTheNewOne covers #133: a
+// stream deleted and created again under an open SSE stream would leave its
+// consumer waiting at the old stream's position, skipping everything the new
+// stream gets before it. The SSE stream closes instead, after setting the
+// client's last event ID to 0, so the reconnect replays the new stream from
+// its start, even once the new stream has passed the old position.
+func TestDeliveryContract_RecreatedStreamSendsClientsToTheNewOne(t *testing.T) {
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns := startJetStreamServer(t)
+		nc, err := nats.Connect(ns.ClientURL())
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(nc.Close)
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		js, _ := nc.JetStream()
+		core, obs := observer.New(zap.InfoLevel)
+		_, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) {
+			h.watchInterval = 100 * time.Millisecond
+			h.logger = zap.New(core)
+			mode(h)
+		})
+
+		stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
+		stream.collectIDs(1, 3*time.Second)
+		publishRange(t, js, "events.alpha", 1, 3)
+		assertContiguousIDs(t, stream.collectIDs(3, 3*time.Second), 1, 3)
+
+		if err := mustJetStream(t, nc).DeleteStream(context.Background(), "EVENTS"); err != nil {
+			t.Fatalf("DeleteStream: %v", err)
+		}
+		createTestStream(t, nc, "EVENTS", []string{"events.>"})
+		// Past the old position: resuming from the old cursor would skip 1..3.
+		publishRange(t, js, "events.alpha", 1, 5)
+
+		select {
+		case <-stream.closed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the SSE stream stayed open on the recreated stream")
+		}
+		// The consumer may have delivered the new stream's 4 and 5 under the
+		// old numbering first; the reset replays them.
+		ids := stream.collectIDs(10, time.Second)
+		if len(ids) == 0 || ids[len(ids)-1] != 0 {
+			t.Fatalf("ids after the recreation = %v, want them to end with the reset to 0", ids)
+		}
+		if !hasLogField(obs, "disconnect_reason", streamRecreated) {
+			t.Fatalf("no stream_recreated disconnect logged: %+v", obs.All())
+		}
+		if n := obs.FilterMessageSnippet("JetStream stream was recreated;").Len(); n != 1 {
+			t.Fatalf("the recreation was logged %d times, want once", n)
+		}
+
+		resumed := openSSEStream(t, srv.URL+"/events?topic=alpha", "0")
+		ids = resumed.collectIDs(6, 3*time.Second)
+		if len(ids) != 6 || ids[0] != 0 {
+			t.Fatalf("resumed ids = %v, want the connected id 0, then 1..5", ids)
+		}
+		assertContiguousIDs(t, ids[1:], 1, 5)
+	})
+}
+
+// TestDeliveryContract_RewoundStreamSendsClientsToTheRetainedReplay covers
+// the other half of #133: a stream restored from a copy of its store
+// directory, like a restore on nats-server 2.14 and earlier, keeps its
+// creation time, but its sequence goes back, and an open SSE stream's
+// consumer would wait past the restored stream's end. Once the stream has
+// stayed behind for the confirmation time, the SSE stream closes and the
+// client keeps its cursor. The cursor is ahead of the stream, so the
+// reconnect falls back to the retained replay (#103), which has the messages
+// published since the restore.
+func TestDeliveryContract_RewoundStreamSendsClientsToTheRetainedReplay(t *testing.T) {
+	deliveryModes(t, func(t *testing.T, mode func(*Handler)) {
+		ns, restart := startRestartableJetStreamServer(t)
+		streamDir := filepath.Join(ns.StoreDir(), "$G", "streams", "EVENTS")
+		backup := filepath.Join(t.TempDir(), "EVENTS")
+		nc, err := nats.Connect(ns.ClientURL(), nats.MaxReconnects(-1), nats.ReconnectWait(100*time.Millisecond))
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(nc.Close)
+		if _, err := mustJetStream(t, nc).CreateStream(context.Background(), jetstream.StreamConfig{
+			Name: "EVENTS", Subjects: []string{"events.>"}, Storage: jetstream.FileStorage,
+		}); err != nil {
+			t.Fatalf("CreateStream: %v", err)
+		}
+		js, _ := nc.JetStream()
+		publishRange(t, js, "events.alpha", 1, 3)
+		ns.Shutdown() // a consistent backup of the stream at 3
+		if err := os.CopyFS(backup, os.DirFS(streamDir)); err != nil {
+			t.Fatalf("back up the stream: %v", err)
+		}
+		ns = restart()
+
+		core, obs := observer.New(zap.InfoLevel)
+		h, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) {
+			h.watchInterval = 100 * time.Millisecond
+			h.logger = zap.New(core)
+			mode(h)
+		})
+		stream := openSSEStream(t, srv.URL+"/events?topic=alpha", "")
+		stream.collectIDs(1, 3*time.Second)
+		publishRange(t, js, "events.alpha", 4, 6)
+		assertContiguousIDs(t, stream.collectIDs(3, 3*time.Second), 4, 6)
+		waitForWatchedSequence(t, h, 6)
+
+		ns.Shutdown()
+		if err := os.RemoveAll(streamDir); err != nil {
+			t.Fatalf("remove the stream: %v", err)
+		}
+		if err := os.CopyFS(streamDir, os.DirFS(backup)); err != nil {
+			t.Fatalf("restore the stream: %v", err)
+		}
+		restart()
+		waitForNATSReconnect(t, h)
+		// Still behind the client's 6: resuming from it would wait for 7.
+		publishRange(t, js, "events.alpha", 4, 5)
+
+		select {
+		case <-stream.closed:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the SSE stream stayed open on the rewound stream")
+		}
+		if ids := stream.collectIDs(10, time.Second); len(ids) != 0 {
+			t.Fatalf("ids after the rewind = %v, want none: the client keeps its cursor", ids)
+		}
+		if !hasLogField(obs, "disconnect_reason", streamRewound) {
+			t.Fatalf("no stream_rewound disconnect logged: %+v", obs.All())
+		}
+		if n := obs.FilterMessageSnippet("JetStream stream went back to an earlier sequence").Len(); n != 1 {
+			t.Fatalf("the rewind was logged %d times, want once", n)
+		}
+
+		resumed := openSSEStream(t, srv.URL+"/events?topic=alpha", "6")
+		assertContiguousIDs(t, resumed.collectIDs(5, 3*time.Second), 1, 5)
+	})
+}
+
+// waitForWatchedSequence waits until the handler's stream watch has seen the
+// stream reach lastSeq.
+func waitForWatchedSequence(t *testing.T, h *Handler, lastSeq uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		h.watch.mu.Lock()
+		seen := h.watch.lastSeq
+		h.watch.mu.Unlock()
+		if seen >= lastSeq {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the stream watch saw the stream at %d, want %d", seen, lastSeq)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TestDeliveryContract_LinkLossBeforeFirstMessageNeitherReplaysNorSkips: an

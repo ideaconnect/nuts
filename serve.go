@@ -164,6 +164,10 @@ type streamPlan struct {
 	// ConsumerInactiveLimit caps the consumer's InactiveThreshold; see
 	// streamInfoSnapshot.
 	ConsumerInactiveLimit time.Duration
+	// Generation is the stream generation the plan was made on. The SSE
+	// stream closes when it ends, and connections only share subscriptions
+	// within one.
+	Generation *streamGeneration
 }
 
 // subjectLabel produces a single comma-joined subject string suitable for log
@@ -229,6 +233,9 @@ type streamInfoSnapshot struct {
 	StartSequenceTime time.Time
 	// HasStartSequenceTime distinguishes a missing timestamp from a zero one.
 	HasStartSequenceTime bool
+	// Generation is the stream generation of the read (see streamWatch), or
+	// of the latest read when this one failed.
+	Generation *streamGeneration
 }
 
 // streamRuntime is a snapshot of the handler's NATS-level state under the
@@ -664,7 +671,7 @@ func (h *Handler) currentStreamRuntime() streamRuntime {
 func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan streamPlan) streamInfoSnapshot {
 	readCtx, cancel := context.WithTimeout(ctx, defaultMetadataReadTimeout)
 	defer cancel()
-	stream, err := h.streamReads.read(readCtx, func() (jetstream.Stream, error) {
+	stream, gen, err := h.streamReads.read(readCtx, func() (jetstream.Stream, error) {
 		fetchCtx, cancel := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
 		defer cancel()
 		return js.Stream(fetchCtx, h.StreamName)
@@ -673,7 +680,7 @@ func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan 
 		h.log().Warn("failed to read JetStream stream info for request planning",
 			appendStreamLogFields(plan, zap.Error(err))...,
 		)
-		return streamInfoSnapshot{}
+		return streamInfoSnapshot{Generation: h.watch.current()}
 	}
 	info := stream.CachedInfo()
 	snapshot := streamInfoSnapshot{
@@ -682,6 +689,7 @@ func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan 
 		LastSeq:               info.State.LastSeq,
 		Subjects:              info.Config.Subjects,
 		ConsumerInactiveLimit: info.Config.ConsumerLimits.InactiveThreshold,
+		Generation:            gen,
 	}
 	if plan.Replay.HasLastID && h.ReplayWindow > 0 && plan.Replay.StartSequence >= info.State.FirstSeq {
 		msg, err := stream.GetMsg(readCtx, plan.Replay.StartSequence)
@@ -710,8 +718,13 @@ func (h *Handler) readStreamSnapshot(ctx context.Context, js streamLookup, plan 
 // started after it arrived: its snapshot is never older than the request, so
 // a client resuming from the newest message cannot look ahead of the stream.
 // While a read runs, arriving callers wait for the next one, so a storm
-// costs one read per read's duration instead of one per request.
+// costs one read per read's duration instead of one per request. Reads run
+// one after another, so observe sees the stream's states in order.
 type streamReads struct {
+	// observe, when set, is given every successful read as it completes and
+	// returns the stream generation the read belongs to (see streamWatch).
+	observe func(jetstream.Stream) *streamGeneration
+
 	mu      sync.Mutex
 	running *streamRead
 	next    *streamRead
@@ -722,12 +735,14 @@ type streamRead struct {
 	done   chan struct{}
 	fetch  func() (jetstream.Stream, error)
 	stream jetstream.Stream
+	gen    *streamGeneration
 	err    error
 }
 
-// read returns the result of a read that starts after this call. fetch is
-// used if this caller is the one that starts the read.
-func (r *streamReads) read(ctx context.Context, fetch func() (jetstream.Stream, error)) (jetstream.Stream, error) {
+// read returns the result of a read that starts after this call, with the
+// read's stream generation. fetch is used if this caller is the one that
+// starts the read.
+func (r *streamReads) read(ctx context.Context, fetch func() (jetstream.Stream, error)) (jetstream.Stream, *streamGeneration, error) {
 	r.mu.Lock()
 	var call *streamRead
 	if r.running == nil {
@@ -743,9 +758,9 @@ func (r *streamReads) read(ctx context.Context, fetch func() (jetstream.Stream, 
 	r.mu.Unlock()
 	select {
 	case <-call.done:
-		return call.stream, call.err
+		return call.stream, call.gen, call.err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
 }
 
@@ -754,6 +769,9 @@ func (r *streamReads) read(ctx context.Context, fetch func() (jetstream.Stream, 
 func (r *streamReads) run(call *streamRead) {
 	for call != nil {
 		call.stream, call.err = call.fetch()
+		if call.err == nil && r.observe != nil {
+			call.gen = r.observe(call.stream)
+		}
 		close(call.done)
 		r.mu.Lock()
 		r.running, r.next = r.next, nil
@@ -771,6 +789,7 @@ func (r *streamReads) run(call *streamRead) {
 // Idempotent: calling it twice with the same snapshot yields the same result.
 func (h *Handler) planSubscription(plan streamPlan, snapshot streamInfoSnapshot) streamPlan {
 	plan.ConsumerInactiveLimit = snapshot.ConsumerInactiveLimit
+	plan.Generation = snapshot.Generation
 	if len(snapshot.Subjects) > 0 {
 		for idx, fullSubject := range plan.FullSubjects {
 			if !subjectAllowedByStream(fullSubject, snapshot.Subjects) {
@@ -884,6 +903,7 @@ func (h *Handler) setSSEHeaders(w http.ResponseWriter) {
 //
 //   - shutdown     — Cleanup() closing the handler-wide channel.
 //   - ctx.Done()   — the HTTP client closed or timed out.
+//   - plan.Generation.done() — the stream was recreated or rewound (#133).
 //   - feed.errs    — the ordered consumer could not be recreated.
 //   - feed.frames  — a formatted JetStream message to write and flush.
 //   - heartbeat.C  — periodic SSE comment to keep proxies from closing idle
@@ -937,6 +957,10 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 			)
 			return nil
 
+		case <-plan.Generation.done():
+			h.endGeneration(w, rc, plan, writeTimeout)
+			return nil
+
 		case err := <-feed.errs:
 			metricsConsumerInvalidated.WithLabelValues("unrecoverable").Inc()
 			h.log().Warn("closing SSE stream: JetStream consumer could not be recreated",
@@ -976,6 +1000,30 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, plan strea
 			}
 		}
 	}
+}
+
+// endGeneration closes an SSE stream whose stream generation ended: its
+// consumer is positioned on a stream that was recreated or rewound (#133).
+// The last frame spreads the reconnects of the streams closed together over
+// retryDelay. After a recreation it also sets the client's last event ID to
+// 0: every message of the new stream is one the client has not seen, and a
+// cursor from the old stream would skip as many of them as it is high once
+// the new stream reaches it. After a rewind the client keeps its cursor: the
+// stream still holds the messages up to where it went back, and a cursor
+// ahead of the stream falls back to the retained replay (#103).
+func (h *Handler) endGeneration(w http.ResponseWriter, rc *http.ResponseController, plan streamPlan, writeTimeout time.Duration) {
+	reason := plan.Generation.reason
+	metricsConsumerInvalidated.WithLabelValues(reason).Inc()
+	h.log().Info("closing SSE stream: its JetStream stream was recreated or rewound",
+		appendStreamLogFields(plan, zap.String("disconnect_reason", reason))...,
+	)
+	frame := fmt.Sprintf(": %s\nretry: %d\n", reason, retryDelay().Milliseconds())
+	if reason == streamRecreated {
+		frame += "id: 0\n"
+	}
+	// Best effort: the stream closes either way, and a client that misses
+	// the frame reconnects with its old cursor.
+	_ = writeSSEChunkWithTimeout(w, rc, frame+"\n", writeTimeout)
 }
 
 // maxBatchFrames and maxBatchBytes bound a batch: frames already waiting when

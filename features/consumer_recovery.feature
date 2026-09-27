@@ -43,3 +43,28 @@ Feature: JetStream consumer recovery
       | endpoint              |
       | /events?topic=restart |
       | /shared?topic=restart |
+
+  # A stream deleted and created again numbers its messages from 1. An open
+  # SSE stream's ordered consumer would recreate itself after the last
+  # sequence it delivered and wait there, skipping the new stream's first
+  # messages, so NUTS ends the SSE stream instead (#133). Its last frame sets
+  # the client's last event ID to 0, and the reconnect replays the new
+  # stream from its start. Client B's request reads the stream and notices
+  # the new one at once; without requests, NUTS reads it every 10 seconds.
+  Scenario Outline: A recreated stream sends its clients to the new one
+    Given client "A" is connected to SSE endpoint "<endpoint>"
+    When I publish 3 messages to subject "events.recreate"
+    Then client "A" should have received 3 messages
+    When the stream "EVENTS" is deleted and created again with subjects "events.>"
+    And I publish 5 messages to subject "events.recreate"
+    And client "B" is connected to SSE endpoint "<endpoint>"
+    Then the SSE stream of client "A" should end within 5 seconds
+    And the last event ID of client "A" should be "0"
+    When client "A" reconnects to SSE endpoint "<endpoint>" with its last event ID
+    Then client "A" should have received 5 messages
+    And client "B" should have received 0 messages
+
+    Examples:
+      | endpoint               |
+      | /events?topic=recreate |
+      | /shared?topic=recreate |

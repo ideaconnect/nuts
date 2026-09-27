@@ -758,17 +758,19 @@ func readClientSSEEvents(cc *clientContext, body io.Reader) {
 		line := scanner.Text()
 
 		if line == "" {
+			// Like EventSource, a frame's id counts even when the frame
+			// carries no data: NUTS resets it that way (#133).
+			cc.mu.Lock()
+			if currentEvent.ID != "" {
+				cc.lastEventID = currentEvent.ID
+			}
 			if currentEvent.Event != "" || len(dataLines) > 0 {
 				currentEvent.Data = strings.Join(dataLines, "\n")
-				cc.mu.Lock()
 				cc.sseEvents = append(cc.sseEvents, currentEvent)
-				if currentEvent.ID != "" {
-					cc.lastEventID = currentEvent.ID
-				}
-				cc.mu.Unlock()
-				currentEvent = sseEvent{}
-				dataLines = nil
 			}
+			cc.mu.Unlock()
+			currentEvent = sseEvent{}
+			dataLines = nil
 			continue
 		}
 
@@ -880,6 +882,39 @@ func clientReconnectsWithLastEventID(name, endpoint string) error {
 	go readClientSSEEvents(cc, resp.Body)
 
 	return waitForClientConnectedEvent(name, cc)
+}
+
+// theStreamIsDeletedAndCreatedAgain replaces the stream with a new one under
+// the scenario's open SSE streams: the new stream numbers its messages from 1.
+func theStreamIsDeletedAndCreatedAgain(streamName, subjects string) error {
+	return createStream(streamName, subjects, 0)
+}
+
+// theSSEStreamOfClientShouldEndWithin waits for NUTS to close the client's
+// SSE stream.
+func theSSEStreamOfClientShouldEndWithin(name string, seconds int) error {
+	cc, ok := tc.clients[name]
+	if !ok {
+		return fmt.Errorf("client %q not found", name)
+	}
+	if err := waitForReadDone(cc.readDone, time.Duration(seconds)*time.Second); err != nil {
+		return fmt.Errorf("client %q: the SSE stream stayed open: %w", name, err)
+	}
+	return nil
+}
+
+func theLastEventIDOfClientShouldBe(name, want string) error {
+	cc, ok := tc.clients[name]
+	if !ok {
+		return fmt.Errorf("client %q not found", name)
+	}
+	cc.mu.Lock()
+	got := cc.lastEventID
+	cc.mu.Unlock()
+	if got != want {
+		return fmt.Errorf("client %q has last event ID %q, want %q", name, got, want)
+	}
+	return nil
 }
 
 func clientConnectsWithLastEventIDFromClient(name, endpoint, otherName string) error {
@@ -1170,6 +1205,9 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^client "([^"]*)" should have received (\d+) messages in total$`, clientShouldHaveReceivedNMessagesInTotal)
 	ctx.Step(`^client "([^"]*)" should have received an event containing '([^']*)'$`, clientShouldHaveReceivedEventContaining)
 	ctx.Step(`^client "([^"]*)" should not have received an event containing '([^']*)'$`, clientShouldNotHaveReceivedEventContaining)
+	ctx.Step(`^the stream "([^"]*)" is deleted and created again with subjects "([^"]*)"$`, theStreamIsDeletedAndCreatedAgain)
+	ctx.Step(`^the SSE stream of client "([^"]*)" should end within (\d+) seconds?$`, theSSEStreamOfClientShouldEndWithin)
+	ctx.Step(`^the last event ID of client "([^"]*)" should be "([^"]*)"$`, theLastEventIDOfClientShouldBe)
 }
 
 // theStreamShouldHaveConsumersForSubject waits until exactly want of the

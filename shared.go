@@ -49,19 +49,29 @@ const (
 // sharedRegistry holds a handler's shared subscriptions by topic set.
 type sharedRegistry struct {
 	mu   sync.Mutex
-	subs map[string]*sharedSub
+	subs map[sharedTopics]*sharedSub
 }
 
 func newSharedRegistry() *sharedRegistry {
-	return &sharedRegistry{subs: map[string]*sharedSub{}}
+	return &sharedRegistry{subs: map[sharedTopics]*sharedSub{}}
 }
 
-// sharedKey identifies a topic set regardless of the order of its topics.
-// Topics cannot contain commas.
-func sharedKey(plan streamPlan) string {
+// sharedTopics identifies a topic set on one stream generation. A connection
+// planned after the stream was recreated or rewound must not join a
+// subscription whose consumer is positioned on the stream as it was (#133).
+type sharedTopics struct {
+	generation *streamGeneration
+	// subjects are the topic set's subjects, sorted and joined by commas,
+	// which topics cannot contain.
+	subjects string
+}
+
+// sharedKey identifies the plan's topic set regardless of the order of its
+// topics.
+func sharedKey(plan streamPlan) sharedTopics {
 	subjects := slices.Clone(plan.FullSubjects)
 	slices.Sort(subjects)
-	return strings.Join(subjects, ",")
+	return sharedTopics{generation: plan.Generation, subjects: strings.Join(subjects, ",")}
 }
 
 // sharedSub is one shared subscription: a consumer, the frames it delivered
@@ -69,7 +79,7 @@ func sharedKey(plan streamPlan) string {
 type sharedSub struct {
 	h        *Handler
 	registry *sharedRegistry
-	key      string
+	key      sharedTopics
 	plan     streamPlan
 	stream   *consumerStream
 	done     chan struct{}
@@ -121,7 +131,7 @@ func (h *Handler) joinShared(ctx context.Context, js jetstream.JetStream, plan s
 // getOrStart returns the topic set's shared subscription, starting one that
 // begins right after lastSeq when there is none. ctx bounds only the
 // creation: the subscription outlives the connection that started it.
-func (r *sharedRegistry) getOrStart(ctx context.Context, h *Handler, js jetstream.JetStream, plan streamPlan, key string, lastSeq uint64) (*sharedSub, error) {
+func (r *sharedRegistry) getOrStart(ctx context.Context, h *Handler, js jetstream.JetStream, plan streamPlan, key sharedTopics, lastSeq uint64) (*sharedSub, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if sub := r.subs[key]; sub != nil && !sub.isClosed() {

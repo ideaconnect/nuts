@@ -91,6 +91,15 @@ groups:
           summary: NUTS streams closed because their consumer could not be recreated
           description: "Streams on {{ $labels.job }} lost their JetStream consumer and could not recreate it; clients reconnect from their last event ID. Check JetStream availability and the stream's consumer limit."
 
+      - alert: NutsStreamReplacedUnderClients
+        expr: sum by (job) (increase(nuts_consumer_invalidated_total{reason=~"stream_recreated|stream_rewound"}[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: NUTS closed SSE streams because their JetStream stream was recreated or restored
+          description: "The JetStream stream behind {{ $labels.job }} was recreated or restored from a backup under open SSE streams; their clients reconnected and replayed the new stream. If nobody did this on purpose, look for a job that creates the stream on startup: a memory-storage stream is lost when its server restarts."
+
       - alert: NutsConsumerRecreationsSustained
         expr: rate(nuts_consumer_invalidated_total{reason="recreated"}[10m]) > 0.5 and rate(nuts_nats_connection_events_total{event="reconnect"}[10m]) == 0
         for: 15m

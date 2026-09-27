@@ -101,10 +101,13 @@ filters when correlating logs with alerts.
 2. Run `nats stream info <STREAM>` and verify the configured subject filters
    cover the expected `topic_prefix`.
 3. Recreate or restore the stream before routing traffic to the NUTS instance.
-4. If clients were connected while the stream was recreated, reload Caddy with
-   `caddy reload --force`. Their open streams otherwise stay silent until the
-   new stream passes their old position; see
-   [TROUBLESHOOTING.md](TROUBLESHOOTING.md#streams-stall-after-the-stream-was-recreated).
+4. Clients connected while the stream was recreated need nothing: NUTS
+   notices the new stream on the next request or within 10 seconds, closes
+   their streams with `disconnect_reason=stream_recreated`, and they replay
+   the new stream from its start. On nats-server 2.14 and earlier a restore
+   keeps the creation time and rewinds the stream instead: pause publishers
+   while restoring; see
+   [TROUBLESHOOTING.md](TROUBLESHOOTING.md#streams-close-after-the-stream-was-recreated-or-restored).
 
 ## Incident: Oversized messages dropped
 
@@ -195,6 +198,14 @@ closing the connection, or a proxy that stopped forwarding.
   streams close with `disconnect_reason="consumer_unrecoverable"`:
   recreation kept failing for about 75 seconds (10 attempts), so the stream
   ended and the client reconnects with its last event ID.
+- `nuts_consumer_invalidated_total{reason="stream_recreated"}` or
+  `{reason="stream_rewound"}` increases: the JetStream stream itself was
+  deleted and created again, or restored from a backup, under open streams.
+  Their consumers were positioned on the old stream, so the streams closed
+  and their clients reconnect onto the new one; see
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md#streams-close-after-the-stream-was-recreated-or-restored).
+  If nobody recreated the stream, look for a job that creates it on startup:
+  a memory-storage stream is lost when its server restarts.
 
 **Actions**
 

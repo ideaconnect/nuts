@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -360,4 +362,183 @@ func TestHandler_ConsumerDeletedMidStream_RecreatesAndResumes(t *testing.T) {
 		t.Fatalf("no recreation log naming the deleted consumer %q; logs=%v", info.Name, obs.All())
 	}
 	stopSSE(t, cancel, done)
+}
+
+// TestStreamWatch_EndsAGenerationWhenTheStreamIsRecreatedOrRewound walks the
+// watch through the reads of a stream's life (#133). A new creation time ends
+// the generation at once. A last sequence below the highest seen ends it
+// only once the reads have shown it for the whole confirmation time, not
+// when a replica without a leader reports it, and not when the stream caught
+// up in between. Each ended generation is replaced by an open one.
+func TestStreamWatch_EndsAGenerationWhenTheStreamIsRecreatedOrRewound(t *testing.T) {
+	var none *streamWatch
+	if gen, reason := none.observe(&jetstream.StreamInfo{Created: time.Now()}, time.Now()); gen != nil || reason != "" || none.current() != nil {
+		t.Fatal("a nil watch must do nothing")
+	}
+	var noGen *streamGeneration
+	if noGen.done() != nil {
+		t.Fatal("a nil generation must never end")
+	}
+
+	created := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	read := func(created time.Time, lastSeq uint64) *jetstream.StreamInfo {
+		return &jetstream.StreamInfo{Created: created, State: jetstream.StreamState{LastSeq: lastSeq}}
+	}
+	leaderless := read(created, 5)
+	leaderless.Cluster = &jetstream.ClusterInfo{Name: "c1"}
+	led := read(created, 11)
+	led.Cluster = &jetstream.ClusterInfo{Name: "c1", Leader: "n1"}
+	const confirm = 10 * time.Second
+	steps := []struct {
+		name  string
+		after time.Duration // since the previous read
+		info  *jetstream.StreamInfo
+		ended string
+	}{
+		{"the first read sets the baseline", 0, read(created, 10), ""},
+		{"a read without a creation time is ignored", 0, read(time.Time{}, 0), ""},
+		{"a missing read is ignored", 0, nil, ""},
+		{"the stream grows", 0, read(created, 12), ""},
+		{"a replica without a leader may lag", 0, leaderless, ""},
+		{"a read below the highest sequence starts the clock", 5 * time.Second, read(created, 11), ""},
+		{"still behind, not yet for the whole time", confirm - 1, read(created, 11), ""},
+		{"caught up: the clock stops", 0, read(created, 12), ""},
+		{"behind again, the clock starts again", time.Second, led, ""},
+		{"behind for the whole time: rewound", confirm, led, streamRewound},
+		{"behind the rewound stream, a new clock starts", 0, read(created, 10), ""},
+		{"the rewound stream is the new baseline", confirm, read(created, 11), ""},
+		{"a new creation time: recreated", 0, read(created.Add(time.Minute), 0), streamRecreated},
+		{"the new stream grows", 0, read(created.Add(time.Minute), 1), ""},
+		{"the old stream's highest sequence is forgotten", confirm, read(created.Add(time.Minute), 1), ""},
+	}
+	w := newStreamWatch(confirm)
+	gen := w.current()
+	now := created.Add(time.Hour)
+	for _, step := range steps {
+		now = now.Add(step.after)
+		got, ended := w.observe(step.info, now)
+		if ended != step.ended {
+			t.Fatalf("%s: ended %q, want %q", step.name, ended, step.ended)
+		}
+		if got != w.current() {
+			t.Fatalf("%s: the read's generation is not the current one", step.name)
+		}
+		select {
+		case <-gen.done():
+			if step.ended == "" || gen.reason != step.ended || got == gen {
+				t.Fatalf("%s: generation ended with %q, and the read got the ended one: %v", step.name, gen.reason, got == gen)
+			}
+			select {
+			case <-got.done():
+				t.Fatalf("%s: the new generation started out ended", step.name)
+			default:
+			}
+		default:
+			if step.ended != "" || got != gen {
+				t.Fatalf("%s: the generation did not end, but the read got another: %v", step.name, got != gen)
+			}
+		}
+		gen = got
+	}
+
+	// The first read's last sequence is part of the baseline.
+	w = newStreamWatch(confirm)
+	w.observe(read(created, 10), now)
+	w.observe(read(created, 9), now)
+	if _, ended := w.observe(read(created, 9), now.Add(confirm)); ended != streamRewound {
+		t.Fatalf("a stream rewound right after the first read: ended %q, want %q", ended, streamRewound)
+	}
+}
+
+// fakeStreamJS is a jetstream.JetStream whose Stream returns stream.
+type fakeStreamJS struct {
+	jetstream.JetStream
+	stream jetstream.Stream
+}
+
+func (f fakeStreamJS) Stream(context.Context, string) (jetstream.Stream, error) {
+	return f.stream, nil
+}
+
+// TestHandler_WatchStreamReadsEveryIntervalUntilShutdown: with no request
+// reading the stream, the handler reads it every interval, so a recreated
+// stream is noticed with nobody asking (#133). It skips reads while there is
+// no JetStream context and stops with the handler.
+func TestHandler_WatchStreamReadsEveryIntervalUntilShutdown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var reads atomic.Int32
+		h := &Handler{StreamName: "EVENTS", logger: zap.NewNop()}
+		h.js = fakeStreamJS{stream: fakeStream{info: &jetstream.StreamInfo{}}}
+		h.streamReads.observe = func(jetstream.Stream) *streamGeneration {
+			reads.Add(1)
+			return nil
+		}
+		shutdown := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			h.watchStream(time.Second, shutdown)
+			close(done)
+		}()
+
+		time.Sleep(3*time.Second + time.Millisecond)
+		synctest.Wait()
+		if got := reads.Load(); got != 3 {
+			t.Fatalf("reads after 3 intervals = %d, want 3", got)
+		}
+		h.mu.Lock()
+		h.js = nil
+		h.mu.Unlock()
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if got := reads.Load(); got != 3 {
+			t.Fatalf("reads without a JetStream context = %d, want still 3", got)
+		}
+		close(shutdown)
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("watchStream kept running after shutdown")
+		}
+	})
+}
+
+// TestHandler_EndGenerationResetsTheCursorOnlyForANewStream: a stream closed
+// because the stream was recreated tells EventSource to reconnect from the
+// start of the new stream (id 0); one closed after a rewind keeps its cursor.
+// Both spread their reconnects with a jittered retry.
+func TestHandler_EndGenerationResetsTheCursorOnlyForANewStream(t *testing.T) {
+	for _, tt := range []struct {
+		reason string
+		frame  string
+	}{
+		{streamRecreated, "id: 0\n\n"},
+		{streamRewound, "\n"},
+	} {
+		t.Run(tt.reason, func(t *testing.T) {
+			gen := newStreamGeneration()
+			gen.reason = tt.reason
+			core, obs := observer.New(zap.InfoLevel)
+			h := &Handler{logger: zap.New(core)}
+			before := metricValue(t, metricsConsumerInvalidated.WithLabelValues(tt.reason))
+			w := newSafeRecorder()
+			h.endGeneration(w, http.NewResponseController(w), streamPlan{Generation: gen}, time.Second)
+
+			rest, ok := strings.CutPrefix(w.Body(), ": "+tt.reason+"\nretry: ")
+			ms, end, _ := strings.Cut(rest, "\n")
+			delay, err := strconv.Atoi(ms)
+			if !ok || err != nil || end != tt.frame {
+				t.Fatalf("frame %q, want a %s comment, a retry, then %q", w.Body(), tt.reason, tt.frame)
+			}
+			if d := time.Duration(delay) * time.Millisecond; d < transientRetryBase/2 || d >= 3*transientRetryBase/2 {
+				t.Fatalf("retry %v outside [%v, %v)", d, transientRetryBase/2, 3*transientRetryBase/2)
+			}
+			if got := metricValue(t, metricsConsumerInvalidated.WithLabelValues(tt.reason)); got != before+1 {
+				t.Fatalf("consumer_invalidated{reason=%s} = %v, want %v", tt.reason, got, before+1)
+			}
+			if !hasLogField(obs, "disconnect_reason", tt.reason) {
+				t.Fatalf("no disconnect_reason=%s logged: %+v", tt.reason, obs.All())
+			}
+		})
+	}
 }
