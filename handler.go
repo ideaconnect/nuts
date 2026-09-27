@@ -107,6 +107,13 @@ type Handler struct {
 	// EventTypeHeader is the header EventType "header" reads.
 	EventTypeHeader string `json:"event_type_header,omitempty"`
 
+	// PayloadFormat is what an event's data holds: "envelope" (the default),
+	// the JSON {"topic","payload","time"}; or "raw", the NATS payload itself,
+	// one data line per line of it. In raw mode a payload that is not UTF-8
+	// text, or holds a carriage return, cannot be sent as SSE data and is
+	// dropped (#143).
+	PayloadFormat string `json:"payload_format,omitempty"`
+
 	// HubURL is the URL advertised in the Link header for hub discovery.
 	// When set, SSE responses include a Link: <url>; rel="nuts" header
 	// so that clients and upstream APIs can discover the event hub automatically.

@@ -302,6 +302,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.EventIDFormat = d.Val()
 
+			case "payload_format":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.PayloadFormat = d.Val()
+
 			case "event_type":
 				if !d.NextArg() {
 					return d.ArgErr()

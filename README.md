@@ -384,6 +384,7 @@ nuts {
     replay_window <seconds>      # Time-bound replay to the last N seconds (default: 0 = all retained)
     event_id_format <format>     # Event ids: sequence (default) or sequence_time (sequence and message time)
     event_type <source> [name]   # Event names: message (default), topic, or header <name>
+    payload_format <format>      # Event data: envelope (default) or raw (the NATS payload itself)
     health_path <path>           # Legacy readiness endpoint (empty/default: /healthz)
     live_path <path>             # Process liveness endpoint (empty/default: /livez)
     ready_path <path>            # NATS/stream readiness endpoint (empty/default: /readyz)
@@ -647,6 +648,30 @@ names themselves, and an event named `error` would reach the page's
 `onerror` handler as if the connection had failed. Otherwise, and for a
 message without the header, the event is named `message`. The JSON data is
 the same in every case. The event name counts towards `max_event_size`.
+
+#### `payload_format`
+
+By default an event's data is the JSON envelope
+`{"topic":…,"payload":…,"time":…}`. `payload_format raw` sends the NATS
+payload itself instead: a page that only wants the payload need not unwrap
+it, plain-text or CSV payloads arrive as they are, and the envelope's 120 to
+150 bytes no longer count towards `max_event_size`.
+
+```
+event: message
+data: first line of the payload
+data: second line of the payload
+id: 12345
+```
+
+A payload with line breaks is sent as several `data:` lines, which
+EventSource joins with `\n` again. SSE data is UTF-8 text and a carriage
+return ends a line, so a payload that is not valid UTF-8 or holds a carriage
+return cannot be sent: it is dropped, logged, and counted as
+`nuts_messages_dropped_total{reason="raw_not_text"}`. The envelope's topic
+and time are gone in raw mode; pair it with
+[`event_type topic`](#event_type) to tell topics apart. The `connected` and
+`reset` events keep their JSON data.
 
 #### `event_id_format`
 
@@ -953,7 +978,7 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 |--------|------|-------------|
 | `nuts_active_connections` | Gauge | Currently connected SSE clients |
 | `nuts_messages_delivered_total` | Counter | SSE message events successfully written |
-| `nuts_messages_dropped_total{reason}` | Counter (labeled) | Messages not delivered to a client. `reason` is one of `raw_payload` (inbound NATS payload exceeded `max_event_size`), `formatted_sse_message` (SSE envelope after JSON wrap exceeded `max_event_size`), `replay_window` (a replayed message older than `replay_window`) or `control_message` (a subject delete marker or schedule definition; see [Server control messages](#server-control-messages)). |
+| `nuts_messages_dropped_total{reason}` | Counter (labeled) | Messages not delivered to a client. `reason` is one of `raw_payload` (inbound NATS payload exceeded `max_event_size`), `formatted_sse_message` (SSE envelope after JSON wrap exceeded `max_event_size`), `replay_window` (a replayed message older than `replay_window`), `control_message` (a subject delete marker or schedule definition; see [Server control messages](#server-control-messages)) or `raw_not_text` (a payload [`payload_format raw`](#payload_format) cannot send: not UTF-8 text, or holding a carriage return). |
 | `nuts_wildcard_filter_drops_total` | Counter | Deprecated, always 0: the pre-NATS-2.10 wildcard fallback was removed. |
 | `nuts_slow_client_disconnects_total` | Counter | Clients disconnected because a write missed `write_timeout` (the client stopped reading) |
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
@@ -1241,7 +1266,7 @@ data: {"topic":"my-topic","payload":{"your":"data"},"time":"2024-01-01T12:00:00Z
 id: 12345
 ```
 
-The event is named `message` unless [`event_type`](#event_type) names it after its topic or a header. The `id` field contains the JetStream sequence number, which can be used with `last-id` or `Last-Event-ID` for replay. With [`event_id_format sequence_time`](#event_id_format) it also carries the stored time of the message: `id: 12345-1790513389663997004`. It is the last line of each event: SSE allows the fields in any order, and some clients (for example `@microsoft/fetch-event-source`) record an id as soon as they read it, so with the id last a frame cut off mid-write cannot make them resume after a message they never received.
+The event is named `message` unless [`event_type`](#event_type) names it after its topic or a header, and its data is the JSON envelope unless [`payload_format raw`](#payload_format) sends the payload itself. The `id` field contains the JetStream sequence number, which can be used with `last-id` or `Last-Event-ID` for replay. With [`event_id_format sequence_time`](#event_id_format) it also carries the stored time of the message: `id: 12345-1790513389663997004`. It is the last line of each event: SSE allows the fields in any order, and some clients (for example `@microsoft/fetch-event-source`) record an id as soon as they read it, so with the id last a frame cut off mid-write cannot make them resume after a message they never received.
 
 The first frame of every stream is the handshake event:
 

@@ -1195,6 +1195,11 @@ func TestHandler_Provision_RejectsInvalidOptionalJSONConfigBeforeDialing(t *test
 			wantErr:  "event_type must be",
 		},
 		{
+			name:     "unknown payload format",
+			fragment: `"payload_format": "binary"`,
+			wantErr:  "payload_format must be",
+		},
+		{
 			name:     "event type header without header mode",
 			fragment: `"event_type": "topic", "event_type_header": "Event-Type"`,
 			wantErr:  "event_type_header",

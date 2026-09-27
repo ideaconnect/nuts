@@ -46,6 +46,7 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				hub_url https://example.com/events
 				event_id_format sequence_time
 				event_type header Event-Type
+				payload_format raw
 				subscriber_jwt_key secret-key
 				subscriber_jwt_cookie nuts_session
 				allowed_origins https://example.com https://other.com
@@ -81,6 +82,7 @@ func TestHandler_UnmarshalCaddyfile(t *testing.T) {
 				EventIDFormat:             "sequence_time",
 				EventType:                 "header",
 				EventTypeHeader:           "Event-Type",
+				PayloadFormat:             "raw",
 				SubscriberJWTKey:          "secret-key",
 				SubscriberJWTCookie:       "nuts_session",
 				AllowedOrigins:            []string{"https://example.com", "https://other.com"},
@@ -387,6 +389,7 @@ func TestHandler_UnmarshalCaddyfile_MissingArgs(t *testing.T) {
 		{name: "missing nats_ping_interval arg", directive: "nats_ping_interval"},
 		{name: "missing event_id_format arg", directive: "event_id_format"},
 		{name: "missing event_type arg", directive: "event_type"},
+		{name: "missing payload_format arg", directive: "payload_format"},
 		{name: "missing max_reconnects arg", directive: "max_reconnects"},
 		{name: "missing max_event_size arg", directive: "max_event_size"},
 		{name: "missing dispatch_timeout arg", directive: "dispatch_timeout"},
@@ -595,6 +598,12 @@ func TestHandler_UnmarshalCaddyfile_RejectsInvalidOptionalConfig(t *testing.T) {
 			name:    "event_type with an extra argument",
 			line:    "event_type topic extra",
 			wantErr: "argument",
+		},
+		{
+			name:        "unknown payload_format",
+			line:        "payload_format text",
+			wantErr:     "payload_format must be",
+			validateErr: true,
 		},
 		{
 			name:        "unknown event_type",

@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `payload_format raw` sends the NATS payload itself as each event's data,
+  without the JSON envelope: a `data:` line per line of it, which
+  EventSource joins back (#143). A payload SSE cannot carry, not UTF-8 text
+  or holding a carriage return, is dropped and counted as
+  `nuts_messages_dropped_total{reason="raw_not_text"}`. The default,
+  `envelope`, changes nothing.
 - `event_type topic` and `event_type header <name>` name each message's SSE
   event after its topic or a header of the NATS message, so a page can add
   one `addEventListener` per kind of event instead of routing every

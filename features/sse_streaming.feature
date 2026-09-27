@@ -22,6 +22,14 @@ Feature: SSE Streaming with JetStream
     Then I should receive a "orders" event
     And I should not receive an SSE event with topic "notifications"
 
+  # payload_format raw sends the NATS payload itself as the event's data,
+  # without the JSON envelope (#143).
+  Scenario: Events carry the raw payload
+    Given I am connected to SSE endpoint "/raw?topic=plain"
+    When I publish message 'just some text' to subject "events.plain"
+    Then I should receive an SSE event containing 'just some text'
+    And I should not receive an SSE event containing '"payload"'
+
   Scenario: Receive messages from multiple topics
     Given I am connected to SSE endpoint "/events?topic=alerts&topic=updates"
     When I publish message '{"type": "alert"}' to subject "events.alerts"

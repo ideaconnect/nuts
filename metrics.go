@@ -39,11 +39,12 @@ var (
 	// producer, the second at envelope overhead on small but pathological
 	// payloads. replay_window counts replayed messages older than the window,
 	// control_message the server's subject delete markers and schedule
-	// definitions.
+	// definitions, raw_not_text the payloads payload_format raw cannot send
+	// (#143).
 	metricsMessagesDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "messages_dropped_total",
-		Help:      "Total number of messages not delivered to a client, labelled by reason (raw_payload, formatted_sse_message, replay_window, control_message).",
+		Help:      "Total number of messages not delivered to a client, labelled by reason (raw_payload, formatted_sse_message, replay_window, control_message, raw_not_text).",
 	}, []string{"reason"})
 
 	// nuts_wildcard_filter_drops_total is deprecated: it counted messages the

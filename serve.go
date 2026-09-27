@@ -19,6 +19,7 @@
 package nuts
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -31,6 +32,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/nats-io/nats.go"
@@ -78,6 +80,11 @@ const (
 	eventTypeMessage = "message"
 	eventTypeTopic   = "topic"
 	eventTypeHeader  = "header"
+
+	// Values of payload_format: an event's data is the JSON envelope, or
+	// the NATS payload itself (#143).
+	payloadFormatEnvelope = "envelope"
+	payloadFormatRaw      = "raw"
 )
 
 // replayMode describes how a JetStream subscription should position itself
@@ -116,6 +123,9 @@ const (
 	// bookkeeping (a subject delete marker or a schedule definition), which
 	// is not an application event.
 	dropReasonControlMessage string = "control_message"
+	// dropReasonRawNotText tags a payload that payload_format raw cannot
+	// send: SSE data is UTF-8 text, and a carriage return ends a line (#143).
+	dropReasonRawNotText string = "raw_not_text"
 )
 
 // isFallback reports whether the mode was selected by the fallback path
@@ -1339,6 +1349,13 @@ func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formatted
 		formatted.DropSize = len(msg.Data)
 		return formatted
 	}
+	raw := h.PayloadFormat == payloadFormatRaw
+	if raw && (!utf8.Valid(msg.Data) || bytes.IndexByte(msg.Data, '\r') >= 0) {
+		formatted.Dropped = true
+		formatted.DropReason = dropReasonRawNotText
+		formatted.DropSize = len(msg.Data)
+		return formatted
+	}
 
 	// Build the frame in one pass. The data line is the JSON encoding of
 	// messageEventPayload, written by hand: the payload is validated once
@@ -1350,17 +1367,33 @@ func (h *Handler) formatMessageEvent(msg streamMessage, now time.Time) formatted
 	var scratch [64]byte
 	event.WriteString("event: ")
 	event.WriteString(h.eventName(msg))
-	event.WriteString("\ndata: {\"topic\":")
-	writeJSONString(&event, strings.TrimPrefix(msg.Subject, h.TopicPrefix))
-	event.WriteString(`,"payload":`)
-	writeJSONPayload(&event, msg.Data)
-	event.WriteString(`,"time":"`)
-	timestamp := now
-	if msg.HasMetadata {
-		timestamp = msg.Timestamp
+	if raw {
+		// The payload itself, a data line per line of it: EventSource joins
+		// them with "\n" again. An empty payload is one empty data line,
+		// which still dispatches an event.
+		for rest := msg.Data; ; {
+			line, after, more := bytes.Cut(rest, []byte{'\n'})
+			event.WriteString("\ndata: ")
+			event.Write(line)
+			if !more {
+				break
+			}
+			rest = after
+		}
+		event.WriteByte('\n')
+	} else {
+		event.WriteString("\ndata: {\"topic\":")
+		writeJSONString(&event, strings.TrimPrefix(msg.Subject, h.TopicPrefix))
+		event.WriteString(`,"payload":`)
+		writeJSONPayload(&event, msg.Data)
+		event.WriteString(`,"time":"`)
+		timestamp := now
+		if msg.HasMetadata {
+			timestamp = msg.Timestamp
+		}
+		event.Write(timestamp.UTC().AppendFormat(scratch[:0], time.RFC3339))
+		event.WriteString("\"}\n")
 	}
-	event.Write(timestamp.UTC().AppendFormat(scratch[:0], time.RFC3339))
-	event.WriteString("\"}\n")
 	// The id goes last (#107). EventSource applies it only when the event
 	// is dispatched, but clients such as fetch-event-source store it as soon
 	// as they parse the line: with the id first, a frame cut off by a write
@@ -1424,6 +1457,12 @@ func (h *Handler) recordDroppedMessage(formatted formattedMessageEvent) {
 			zap.Uint64("stream_sequence", formatted.StreamSequence),
 			zap.Int("payload_size", formatted.DropSize),
 			zap.Int("max_event_size", h.MaxEventSize),
+		)
+	case dropReasonRawNotText:
+		h.log().Warn("dropping a NATS payload payload_format raw cannot send: not UTF-8 text, or holds a carriage return",
+			zap.String("topic", formatted.Subject),
+			zap.Uint64("stream_sequence", formatted.StreamSequence),
+			zap.Int("payload_size", formatted.DropSize),
 		)
 	case dropReasonFormattedSSEMessage:
 		h.log().Warn("dropping oversized SSE event",

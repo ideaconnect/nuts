@@ -213,6 +213,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.EventType == "" {
 		h.EventType = eventTypeMessage
 	}
+	if h.PayloadFormat == "" {
+		h.PayloadFormat = payloadFormatEnvelope
+	}
 	if h.HealthPath == "" {
 		h.HealthPath = defaultHealthPath
 	}
@@ -866,6 +869,11 @@ func (h *Handler) validateConfigValues() error {
 	case "", eventIDSequence, eventIDSequenceTime:
 	default:
 		return fmt.Errorf("event_id_format must be %q or %q, not %q", eventIDSequence, eventIDSequenceTime, h.EventIDFormat)
+	}
+	switch h.PayloadFormat {
+	case "", payloadFormatEnvelope, payloadFormatRaw:
+	default:
+		return fmt.Errorf("payload_format must be %q or %q, not %q", payloadFormatEnvelope, payloadFormatRaw, h.PayloadFormat)
 	}
 	switch h.EventType {
 	case "", eventTypeMessage, eventTypeTopic:

@@ -8,8 +8,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // referenceMessageFrame renders a message frame the way formatMessageEvent
@@ -29,9 +32,19 @@ func referenceMessageFrame(h *Handler, msg streamMessage, now time.Time) string 
 	}
 	var event strings.Builder
 	event.WriteString("event: " + referenceEventName(h, msg) + "\n")
-	event.WriteString("data: ")
-	event.WriteString(toJSON(payload))
-	event.WriteString("\n")
+	if h.PayloadFormat == "raw" {
+		text := string(msg.Data)
+		if !utf8.ValidString(text) || strings.ContainsRune(text, '\r') {
+			return ""
+		}
+		for _, line := range strings.Split(text, "\n") {
+			event.WriteString("data: " + line + "\n")
+		}
+	} else {
+		event.WriteString("data: ")
+		event.WriteString(toJSON(payload))
+		event.WriteString("\n")
+	}
 	if msg.HasMetadata {
 		event.WriteString("id: ")
 		event.WriteString(strconv.FormatUint(msg.StreamSequence, 10))
@@ -124,17 +137,23 @@ func TestFormatMessageEvent_MatchesTheReferenceFormatter(t *testing.T) {
 
 func FuzzFormatMessageEventMatchesReference(f *testing.F) {
 	for _, data := range formatterEdgeCases {
-		f.Add([]byte(data), "orders", uint64(42), true, false, uint8(0), "")
-		f.Add([]byte(data), "orders", uint64(42), true, true, uint8(1), "")
-		f.Add([]byte(data), "orders", uint64(42), true, false, uint8(2), "order.created")
+		f.Add([]byte(data), "orders", uint64(42), true, false, uint8(0), "", false)
+		f.Add([]byte(data), "orders", uint64(42), true, true, uint8(1), "", false)
+		f.Add([]byte(data), "orders", uint64(42), true, false, uint8(2), "order.created", false)
+		f.Add([]byte(data), "orders", uint64(42), true, false, uint8(0), "", true)
 	}
-	f.Add([]byte(`{}`), "reset", uint64(1), true, false, uint8(1), "")
-	f.Add([]byte(`{}`), "orders", uint64(1), true, false, uint8(2), "has space")
+	f.Add([]byte(`{}`), "reset", uint64(1), true, false, uint8(1), "", false)
+	f.Add([]byte(`{}`), "orders", uint64(1), true, false, uint8(2), "has space", false)
+	f.Add([]byte("line one\nline two\n"), "orders", uint64(1), true, false, uint8(0), "", true)
+	f.Add([]byte("a\r\nb"), "orders", uint64(1), true, false, uint8(0), "", true)
 	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
-	f.Fuzz(func(t *testing.T, data []byte, topic string, seq uint64, hasMeta, timedIDs bool, eventType uint8, header string) {
+	f.Fuzz(func(t *testing.T, data []byte, topic string, seq uint64, hasMeta, timedIDs bool, eventType uint8, header string, raw bool) {
 		h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 		if timedIDs {
 			h.EventIDFormat = eventIDSequenceTime
+		}
+		if raw {
+			h.PayloadFormat = payloadFormatRaw
 		}
 		switch eventType % 3 {
 		case 1:
@@ -144,10 +163,77 @@ func FuzzFormatMessageEventMatchesReference(f *testing.F) {
 		}
 		msg := streamMessage{Subject: "events." + topic, Data: data, Header: nats.Header{"Event-Type": []string{header}}, HasMetadata: hasMeta, StreamSequence: seq, Timestamp: now.Add(-time.Minute)}
 		want := referenceMessageFrame(h, msg, now)
-		if got := h.formatMessageEvent(msg, now).Frame; got != want {
+		got := h.formatMessageEvent(msg, now).Frame
+		if got != want {
 			t.Fatalf("frame differs for data=%q topic=%q:\n got %q\nwant %q", data, topic, got, want)
 		}
+		// #143: what EventSource makes of a raw frame is the payload itself.
+		if raw && got != "" {
+			if back := eventSourceData(got); back != string(data) {
+				t.Fatalf("raw payload %q reads back as %q from %q", data, back, got)
+			}
+		}
 	})
+}
+
+// eventSourceData is the data EventSource dispatches for one frame: the
+// values of its data lines, joined with "\n".
+func eventSourceData(frame string) string {
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSuffix(frame, "\n\n"), "\n") {
+		if value, ok := strings.CutPrefix(line, "data: "); ok {
+			lines = append(lines, value)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// TestFormatMessageEvent_RawPayload covers #143: in payload_format raw the
+// event's data is the NATS payload, a data line per line of it, which
+// EventSource joins back. A payload SSE cannot carry is dropped and counted;
+// an oversized one keeps its own reason.
+func TestFormatMessageEvent_RawPayload(t *testing.T) {
+	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1, PayloadFormat: payloadFormatRaw}
+	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	frame := func(data string) formattedMessageEvent {
+		return h.formatMessageEvent(streamMessage{Subject: "events.orders", Data: []byte(data), HasMetadata: true, StreamSequence: 7, Timestamp: now}, now)
+	}
+	for data, want := range map[string]string{
+		`{"id":1}`:            "event: message\ndata: {\"id\":1}\nid: 7\n\n",
+		"line one\nline two":  "event: message\ndata: line one\ndata: line two\nid: 7\n\n",
+		"ends with a break\n": "event: message\ndata: ends with a break\ndata: \nid: 7\n\n",
+		"":                    "event: message\ndata: \nid: 7\n\n",
+		"zażółć <b>&</b>":     "event: message\ndata: zażółć <b>&</b>\nid: 7\n\n",
+	} {
+		got := frame(data)
+		if got.Dropped || got.Frame != want {
+			t.Errorf("raw %q: frame %q (dropped %v), want %q", data, got.Frame, got.Dropped, want)
+		}
+		if back := eventSourceData(got.Frame); back != data {
+			t.Errorf("raw %q reads back as %q", data, back)
+		}
+	}
+	for _, data := range []string{"a\r\nb", "carriage\rreturn", "\xff\xfe not UTF-8"} {
+		if got := frame(data); !got.Dropped || got.DropReason != dropReasonRawNotText || got.DropSize != len(data) || got.Frame != "" {
+			t.Errorf("raw %q: dropped %v for %q (size %d), want a raw_not_text drop", data, got.Dropped, got.DropReason, got.DropSize)
+		}
+	}
+	h.MaxEventSize = 4
+	if got := frame("\xff too big"); got.DropReason != dropReasonRawPayload {
+		t.Errorf("an oversized payload was dropped for %q, want %q", got.DropReason, dropReasonRawPayload)
+	}
+
+	core, obs := observer.New(zap.WarnLevel)
+	h.logger = zap.New(core)
+	before := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonRawNotText))
+	h.MaxEventSize = -1
+	h.recordDroppedMessage(frame("a\rb"))
+	if got := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonRawNotText)); got != before+1 {
+		t.Fatalf("messages_dropped_total{raw_not_text} = %v, want %v", got, before+1)
+	}
+	if !hasLogField(obs, "topic", "events.orders") || obs.FilterMessageSnippet("payload_format raw cannot send").Len() != 1 {
+		t.Fatalf("the drop was not logged: %+v", obs.All())
+	}
 }
 
 func BenchmarkFormatMessageEventLarge(b *testing.B) {

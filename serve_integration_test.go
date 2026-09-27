@@ -1568,3 +1568,59 @@ func TestHandler_EventTypeFromTheTopicOrAHeader(t *testing.T) {
 		})
 	}
 }
+
+// TestHandler_RawPayloadFormat: with payload_format raw, an event's data is
+// the published payload, a data line per line of it; a payload SSE cannot
+// carry is dropped, and the stream goes on (#143).
+func TestHandler_RawPayloadFormat(t *testing.T) {
+	ns := startJetStreamServer(t)
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	createTestStream(t, nc, "EVENTS", []string{"events.>"})
+	_, srv := newContractServer(t, ns.ClientURL(), func(h *Handler) { h.PayloadFormat = payloadFormatRaw })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/events?topic=text", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	lines := bufio.NewScanner(resp.Body)
+	nextData := func() string {
+		t.Helper()
+		var data []string
+		event := ""
+		for lines.Scan() {
+			line := lines.Text()
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				event = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				data = append(data, strings.TrimPrefix(line, "data: "))
+			case line == "" && event == "message":
+				return strings.Join(data, "\n")
+			case line == "":
+				event, data = "", nil
+			}
+		}
+		t.Fatalf("stream ended: %v", lines.Err())
+		return ""
+	}
+	js, _ := nc.JetStream()
+	for _, payload := range []string{"first line\nsecond line", "carriage\rreturn", `{"after":"the drop"}`} {
+		if _, err := js.Publish("events.text", []byte(payload)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+	if got := nextData(); got != "first line\nsecond line" {
+		t.Fatalf("first event data = %q", got)
+	}
+	if got := nextData(); got != `{"after":"the drop"}` {
+		t.Fatalf("the event after the unsendable payload = %q", got)
+	}
+}

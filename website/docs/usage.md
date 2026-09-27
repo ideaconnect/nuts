@@ -64,6 +64,7 @@ nuts {
     replay_window <seconds>             # Time-bound replay window (default: 0 = all retained)
     event_id_format <format>            # Event ids: sequence (default) or sequence_time
     event_type <source> [name]          # Event names: message (default), topic, or header <name>
+    payload_format <format>             # Event data: envelope (default) or raw
 
     # Health probes
     live_path  <path>                   # Liveness probe (default: /livez)
@@ -286,7 +287,7 @@ NUTS registers the following metrics; expose them via Caddy's `metrics` handler:
 |--------|------|-------------|
 | `nuts_active_connections` | Gauge | Currently connected SSE clients |
 | `nuts_messages_delivered_total` | Counter | SSE message events successfully written to clients |
-| `nuts_messages_dropped_total{reason}` | Counter | Messages not delivered (`reason`: `raw_payload`, `formatted_sse_message` — exceeded `max_event_size`; `replay_window` — a replayed message older than `replay_window`; `control_message` — a subject delete marker or schedule definition) |
+| `nuts_messages_dropped_total{reason}` | Counter | Messages not delivered (`reason`: `raw_payload`, `formatted_sse_message` — exceeded `max_event_size`; `replay_window` — a replayed message older than `replay_window`; `control_message` — a subject delete marker or schedule definition; `raw_not_text` — a payload `payload_format raw` cannot send) |
 | `nuts_wildcard_filter_drops_total` | Counter | Deprecated, always `0`: the pre-2.10 wildcard fallback was removed |
 | `nuts_slow_client_disconnects_total` | Counter | Clients disconnected because a write missed `write_timeout` |
 | `nuts_replay_requests_total` | Counter | Connections requesting message replay |
