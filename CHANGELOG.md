@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Planned as the next **MAJOR** release. Each SSE stream is now backed by an
+## [0.5.0] - 2026-09-27
+
+A development release on the 0.x line: it makes the breaking changes planned
+for 1.0, as the pre-1.0 carve-out in README's versioning policy allows, and
+1.0 follows once they have been in use. Each SSE stream is now backed by an
 ordered **pull** consumer instead of a push consumer. That removes a class of
 silent message loss, and clients that fall behind no longer get disconnected.
 Read **Upgrading** and **Changed** before upgrading. **nats-server 2.10 or
@@ -60,7 +64,7 @@ needs a consumer that filters on several subjects, which nats-server supports
 from 2.10 on. For 2.9, NUTS subscribed to a common wildcard instead, threw away
 the messages the client had not asked for (`nuts_wildcard_filter_drops_total`),
 and chose between the two paths by reading the server's version string.
-Keeping that fallback in 1.0 would have meant:
+Keeping that fallback would have meant:
 
 - a second delivery path to hold to the new no-loss contract, on a server
   version the test matrix no longer runs;
@@ -72,7 +76,7 @@ Keeping that fallback in 1.0 would have meant:
   to discard most of it.
 
 nats-server 2.9 has been out of support since 2024 (its last release was
-2.9.25) and gets no security fixes. 1.0 requires 2.10, where every request
+2.9.25) and gets no security fixes. 0.5.0 requires 2.10, where every request
 uses server-side `FilterSubjects`; the test matrix covers 2.10, 2.12, 2.14 and
 2.15. `nuts_wildcard_filter_drops_total` stays registered at zero until the
 next major release.

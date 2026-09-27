@@ -78,7 +78,8 @@ items are due before each release.
     ([#116]).
   - Blocks: Phase 4.
 - [x] **D3: Server support floor.** Decided: drop 2.9 and ship the result as
-  the next MAJOR release.
+  the next MAJOR release. On 2026-09-27 the maintainer chose to tag it as
+  v0.5.0, a development release on the 0.x line; 1.0 follows later.
   - Options: keep nats-server 2.9 (the wildcard fallback), or require ≥ 2.10.
     Either way, set a minimum server version for multi-topic correctness.
   - Recommendation:
@@ -121,9 +122,10 @@ items are due before each release.
 | v0.6.0 | Phases 4–5 | Delivery pipeline, NATS 2.15 compatibility, new defaults (D5), response shapes (D4c) |
 | v0.7.0 | Phase 6 | Shared fan-out, opt-in first |
 
-**Revised:** with D2 = B and 2.9 dropped (D3), Phases 2–9 ship together as the
-next MAJOR release, v1.0.0, from the `v1-remediation` branch instead of as
-v0.5–v0.7. v0.4.3 is stamped at commit 114632f and waits for its tag.
+**Revised:** with D2 = B and 2.9 dropped (D3), Phases 2–9 ship together from the
+`v1-remediation` branch as v0.5.0, a development release on the 0.x line,
+instead of as v0.5–v0.7; 1.0 comes later. v0.4.3 is stamped at commit
+114632f.
 
 ## Phase 1: Unblock CI, fix the critical bug, release v0.4.3
 
@@ -296,8 +298,8 @@ D2.
   - [x] Normalise one trailing `/` before matching.
   - [x] Assert `Content-Type: application/json` for `/livez/`, `/readyz/` and
     `/healthz/`.
-- [x] **Release v0.5.0.** *S* Folded into the MAJOR release; the Breaking
-  entries are in the CHANGELOG.
+- [x] **Release v0.5.0.** *S* Folded into the combined v0.5.0 release; the
+  Breaking entries are in the CHANGELOG.
   - [x] The CHANGELOG marks as **Breaking**:
     - [#102]: cursor precedence;
     - [#101]: the id on `connected`;
@@ -437,7 +439,7 @@ server-side limit is hit.
     context (shared with [#123]).
 - [x] **[#74] `nats_idle_heartbeat -1` warning.** *minor · S*
   - [x] Log a Warn when set, and add a README operability note.
-- [x] **Release v0.6.0** (Phases 4–5). *S* Folded into the MAJOR release; the Breaking entries are in the CHANGELOG.
+- [x] **Release v0.6.0** (Phases 4–5). *S* Folded into v0.5.0; the Breaking entries are in the CHANGELOG.
   - [x] The CHANGELOG marks as **Breaking**:
     - the new defaults (D5);
     - the response shapes ([#105]);
