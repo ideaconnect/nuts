@@ -167,18 +167,26 @@ every 10 seconds, and closes the SSE streams positioned on the old stream
   event that sets the client's last event ID to `0`, so EventSource
   reconnects and replays the stream from its start. Pages that keep the last
   event ID across reloads must take it from `reset` events too.
-- **Rewound**: the creation time is the same but the last sequence went back,
-  and a read at least 5 seconds later still finds it back. The stream was
-  restored with `nats stream restore` on nats-server 2.14 or earlier, which
-  keep the creation time, or its store directory was restored from a copy.
-  The SSE streams close with `disconnect_reason=stream_rewound` and the
-  clients keep their last event ID. Where it is ahead of the stream, the
-  reconnect falls back to the retained replay (`replay_window` when
-  configured), as the `replay fallback` log line shows.
+- **Rewound**: the creation time is the same, but the stream went back to an
+  earlier sequence. It was restored with `nats stream restore` on
+  nats-server 2.14 or earlier, which keep the creation time, or its store
+  directory was restored from a copy. NUTS notices it in either of two ways:
+  - The last sequence is below the highest one seen, and a read at least 5
+    seconds later still finds it back.
+  - The restored stream has already passed the sequences NUTS saw. Every 10
+    seconds NUTS checks that the message it last saw at a sequence is still
+    the one stored there. Sequences are never reused, so another message
+    there means the stream went back.
 
-Both are logged once as a warning (`JetStream stream was recreated` or
-`JetStream stream went back to an earlier sequence`) and counted per SSE
-stream in `nuts_consumer_invalidated_total{reason}`. The reconnects are spread
+  The SSE streams close with `disconnect_reason=stream_rewound` and the same
+  `reset` event, and clients replay the stream from its start. The restored
+  stream gives the sequences after the backup's end to new messages, so no
+  cursor from before the restore is safe to resume from (#137).
+
+Each is logged once as a warning: `JetStream stream was recreated`,
+`JetStream stream went back to an earlier sequence`, or, for a rewound stream
+that already caught up, `… and has since passed it`. Each closed SSE stream
+counts in `nuts_consumer_invalidated_total{reason}`. The reconnects are spread
 over 2.5 to 7.5 seconds, and each replay is bounded by `replay_max_messages`
 and `replay_window`. Operations that keep the stream, such as
 `nats stream purge` or a config update, do not reset its sequence numbers,
@@ -186,14 +194,14 @@ and NUTS leaves its streams alone.
 
 Limits:
 
-- A rewind is noticed only while the restored stream stays below the highest
-  sequence NUTS saw, and a client resumes without a gap only while its last
-  event ID is still ahead of the stream. A client that was past the backup's
-  last sequence can otherwise skip messages published to the restored stream
-  up to its position. When a restore rewinds the stream, pause publishers
-  while restoring and for 30 seconds after: NUTS logs `JetStream stream went
-  back to an earlier sequence` within 20 seconds, and its clients reconnect
-  within 7.5 seconds of that.
+- Until NUTS notices a recreated or rewound stream, its open SSE streams
+  receive nothing new from it. That lasts at most about 20 seconds, or 10
+  seconds when a request reads the stream first. They receive everything
+  once they replay.
+- NUTS notices a rewound stream that already caught up only while the stream
+  still holds the message it last checked, which is at most 10 seconds old.
+  If the stream's limits (`max_msgs`, `max_age`, `max_bytes`) remove messages
+  within 10 seconds, such a rewind can go unnoticed.
 - A client that was disconnected while the stream was recreated reconnects
   with a cursor from the old stream. While the cursor is ahead of the new
   stream it gets the retained replay; once the new stream has passed it, the

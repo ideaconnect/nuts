@@ -105,8 +105,9 @@ filters when correlating logs with alerts.
    notices the new stream on the next request or within 10 seconds, closes
    their streams with `disconnect_reason=stream_recreated`, and they replay
    the new stream from its start. On nats-server 2.14 and earlier a restore
-   keeps the creation time and rewinds the stream instead: pause publishers
-   while restoring; see
+   keeps the creation time and rewinds the stream instead; NUTS notices that
+   too (`disconnect_reason=stream_rewound`), and clients replay the restored
+   stream from its start. See
    [TROUBLESHOOTING.md](TROUBLESHOOTING.md#streams-close-after-the-stream-was-recreated-or-restored).
 
 ## Incident: Oversized messages dropped

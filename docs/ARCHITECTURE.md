@@ -42,8 +42,9 @@ flowchart LR
    frames until the client disconnects, the handler shuts down, a write misses
    `write_timeout`, a replay cap is reached, the consumer cannot be
    recreated, or the stream is recreated or rewound.
-8. When the stream ends, NUTS deletes the consumer in the background and
-   releases the `max_connections` slot at once.
+8. When the stream ends, NUTS releases the `max_connections` slot at once,
+   and deletes the consumer in the background once the feed has stopped
+   pulling.
 
 ## Delivery Pipeline
 
@@ -83,12 +84,14 @@ flowchart LR
   finds a new creation time (the stream was recreated), or a last sequence
   below the highest seen that a read at least 5 seconds earlier also found
   (restored from a backup that kept the creation time), ends the
-  generation. Its SSE streams close with `disconnect_reason=stream_recreated`
-  or `stream_rewound`, because their consumers would wait at a position the
-  stream no longer has. A recreated stream's last frame is a `reset` event
-  that sets the client's last event ID to `0`. Shared subscriptions are kept
-  per generation. The handler reads the stream every 10 seconds when no
-  request does.
+  generation. So does a poll that finds another message at the sequence it
+  checked last: a rewound stream that has since caught up. Its SSE streams
+  close with `disconnect_reason=stream_recreated` or `stream_rewound`,
+  because their consumers would wait at, or have skipped past, positions the
+  stream gave to other messages. Their last frame is a `reset` event that
+  sets the client's last event ID to `0`, so it replays the stream from its
+  start. Shared subscriptions are kept per generation. The handler reads the
+  stream every 10 seconds when no request does.
 - **Start positions.** Requests without a cursor start at an explicit
   `LastSeq + 1` rather than `DeliverNew`: an ordered consumer that resets
   before its first message re-applies its original deliver policy, and

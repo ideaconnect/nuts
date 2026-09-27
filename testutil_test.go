@@ -796,7 +796,11 @@ func newFakeJSMsg(subject string, seq uint64, consumer string, data string) fake
 }
 
 // fakeIterator is a jetstream.MessagesContext fed from a channel. Next blocks
-// until a message, an error or Stop arrives, like the real iterator.
+// until a message, an error, Stop or the end of ctx arrives, like the real
+// iterator given ctx through jetstream.NextContext; a feed under test is
+// started with ctx and cancel (startFeed). Stop records whether it was
+// called while a Next was waiting, which the real ordered consumer does not
+// allow (see startStreamFeed).
 type fakeIterator struct {
 	msgs    chan jetstream.Msg
 	errs    chan error
@@ -804,9 +808,18 @@ type fakeIterator struct {
 	once    sync.Once
 	nexts   int
 	mu      sync.Mutex
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	// inNext counts Next calls in progress; stopDuringNext is set when Stop
+	// is called while one is.
+	inNext         atomic.Int32
+	stopDuringNext atomic.Bool
 }
 
 func (f *fakeIterator) Next(...jetstream.NextOpt) (jetstream.Msg, error) {
+	f.inNext.Add(1)
+	defer f.inNext.Add(-1)
 	f.mu.Lock()
 	f.nexts++
 	f.mu.Unlock()
@@ -822,10 +835,22 @@ func (f *fakeIterator) Next(...jetstream.NextOpt) (jetstream.Msg, error) {
 		return nil, err
 	case <-f.stopped:
 		return nil, jetstream.ErrMsgIteratorClosed
+	case <-f.ctx.Done():
+		return nil, f.ctx.Err()
 	}
 }
 
-func (f *fakeIterator) Stop()                   { f.once.Do(func() { close(f.stopped) }) }
+func (f *fakeIterator) Stop() {
+	if f.inNext.Load() > 0 {
+		f.stopDuringNext.Store(true)
+	}
+	f.once.Do(func() { close(f.stopped) })
+}
+
+// startFeed starts a stream feed over the fake with the fake's context.
+func (f *fakeIterator) startFeed(h *Handler, plan streamPlan) *streamFeed {
+	return h.startStreamFeed(f.ctx, f.cancel, f, plan)
+}
 func (f *fakeIterator) Drain()                  { f.Stop() }
 func (f *fakeIterator) Closed() <-chan struct{} { return f.stopped }
 
@@ -837,11 +862,21 @@ func (f *fakeIterator) nextCalls() int {
 }
 
 func newFakeIterator(buffer int) *fakeIterator {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &fakeIterator{
 		msgs:    make(chan jetstream.Msg, buffer),
 		errs:    make(chan error, 1),
 		stopped: make(chan struct{}),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
+}
+
+// closedChannel returns a channel that is already closed.
+func closedChannel() <-chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
 }
 
 var errFakeResetFailed = errors.New("ordered consumer reset failed")
@@ -869,7 +904,7 @@ func newTestSharedSub(floor uint64) (*sharedSub, *int) {
 		registry: registry,
 		key:      testSharedKey,
 		stream: &consumerStream{
-			feed:     &streamFeed{stop: func() { stopped++ }},
+			feed:     &streamFeed{stop: func() { stopped++ }, exited: closedChannel()},
 			consumer: fakeConsumer{},
 			release:  func() {},
 			log:      zap.NewNop(),

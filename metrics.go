@@ -156,15 +156,15 @@ var (
 	//                    (its creation time changed), so the SSE stream
 	//                    closed and the client reconnects from the start of
 	//                    the new stream (#133).
-	//   - stream_rewound: the stream's last sequence went back with its
+	//   - stream_rewound: the stream went back to an earlier sequence with its
 	//                    creation time unchanged, as after a restore on
 	//                    nats-server 2.14 or earlier, so the SSE stream
-	//                    closed and the client reconnects with its last event
-	//                    ID (#133).
+	//                    closed and the client replays it from its start
+	//                    (#133, #137).
 	metricsConsumerInvalidated = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nuts",
 		Name:      "consumer_invalidated_total",
-		Help:      "Total JetStream consumer failures under live SSE streams. reason: recreated (the ordered consumer recovered after a gap, reconnect or missed heartbeats), unrecoverable (recreation failed and the stream closed), stream_recreated (the stream was deleted and created again; the SSE stream closed and the client reconnects from the start of the new one), stream_rewound (the stream's sequence went back, as after a restore that kept its creation time; the SSE stream closed and the client reconnects with its last event ID).",
+		Help:      "Total JetStream consumer failures under live SSE streams. reason: recreated (the ordered consumer recovered after a gap, reconnect or missed heartbeats), unrecoverable (recreation failed and the stream closed), stream_recreated (the stream was deleted and created again; the SSE stream closed and the client reconnects from the start of the new one), stream_rewound (the stream went back to an earlier sequence, as after a restore that kept its creation time; the SSE stream closed and the client replays it from its start).",
 	}, []string{"reason"})
 
 	// nuts_write_disconnects_total counts SSE streams that ended because a

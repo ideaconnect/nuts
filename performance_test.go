@@ -503,7 +503,7 @@ func BenchmarkIsValidTopic(b *testing.B) {
 func BenchmarkStreamFeed(b *testing.B) {
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	it := newFakeIterator(1024)
-	feed := h.startStreamFeed(it, streamPlan{Topics: []string{"bench"}, FullSubjects: []string{"events.bench"}})
+	feed := it.startFeed(h, streamPlan{Topics: []string{"bench"}, FullSubjects: []string{"events.bench"}})
 	defer feed.stop()
 	msg := newFakeJSMsg("events.bench", 42, "nuts_bench_1", `{"kind":"bench","value":123,"nested":{"ok":true}}`)
 	go func() {

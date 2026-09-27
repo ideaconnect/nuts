@@ -906,7 +906,7 @@ Then scrape `http://localhost:8080/metrics` from Prometheus. Available metrics:
 | `nuts_replay_cap_reached_total` | Counter | Replaying SSE connections closed after `replay_max_messages` was reached |
 | `nuts_dispatch_timeout_total` | Counter | Deprecated, always 0: `dispatch_timeout` has no effect. |
 | `nuts_nats_async_errors_total{kind}` | Counter (labeled) | Asynchronous NATS client errors observed by the registered ErrorHandler. `kind` is one of `slow_consumer`, `timeout`, `connection_state`, `consumer_invalidated`, `other`. `consumer_invalidated` only applied to the legacy push subscriptions and stays `0`: consumer health is handled by the ordered consumer itself and counted in `nuts_consumer_invalidated_total`. `slow_consumer` should stay `0` too, since each stream pulls at most `client_buffer_size` messages at a time. |
-| `nuts_consumer_invalidated_total{reason}` | Counter (labeled) | JetStream consumer failures under live streams. `reason` is `recreated` (the consumer recovered after a gap, a NATS reconnect or missed heartbeats; the client noticed nothing), `unrecoverable` (recreation kept failing and the stream closed with `disconnect_reason=consumer_unrecoverable`), `stream_recreated` (the JetStream stream was deleted and created again, so the stream closed and the client reconnects from the start of the new one) or `stream_rewound` (the stream's sequence went back, as after a restore that kept its creation time, so the stream closed and the client reconnects with its last event ID). |
+| `nuts_consumer_invalidated_total{reason}` | Counter (labeled) | JetStream consumer failures under live streams. `reason` is `recreated` (the consumer recovered after a gap, a NATS reconnect or missed heartbeats; the client noticed nothing), `unrecoverable` (recreation kept failing and the stream closed with `disconnect_reason=consumer_unrecoverable`), `stream_recreated` (the JetStream stream was deleted and created again, so the stream closed and the client reconnects from the start of the new one) or `stream_rewound` (the stream's sequence went back, as after a restore that kept its creation time, so the stream closed and the client replays it from its start). |
 | `nuts_write_disconnects_total{site}` | Counter (labeled) | SSE streams terminated by a response-writer write error (typically the `write_timeout` deadline firing). `site` is one of `connected`, `message`, `heartbeat`. |
 | `nuts_readiness_failures_total{cause}` | Counter (labeled) | `/readyz` probe responses that returned 503 because a dependency was degraded. `cause` is one of `nats_disconnected`, `jetstream_missing`, `stream_info_error`. |
 | `nuts_shared_subscriptions` | Gauge | Shared subscriptions (one JetStream consumer per topic set) with `shared_subscriptions` on. |
@@ -1197,8 +1197,8 @@ replay. Treat it like any other event ID. It is omitted when the stream
 starts in a fallback replay mode, in which case the client keeps its previous
 cursor.
 
-When the JetStream stream is deleted and created again under an open
-stream, NUTS ends the stream with a `reset` event:
+When the JetStream stream is deleted and created again, or restored from a
+backup, under an open stream, NUTS ends the stream with a `reset` event:
 
 ```
 : stream_recreated
@@ -1208,9 +1208,10 @@ data: {"reason":"stream_recreated"}
 id: 0
 ```
 
-The new stream numbers its messages from 1, so the event sets the client's
-last event ID to `0`, and EventSource reconnects from the start of the new
-stream after the `retry` delay. A page that keeps the last event ID across
+The new or restored stream numbers the messages after its start or its
+backup's end anew, so the event sets the client's last event ID to `0`, and
+EventSource replays the stream from its start after the `retry` delay. The
+`reason` is `stream_recreated` or `stream_rewound`. A page that keeps the last event ID across
 page reloads must take it from `reset` events too, as the
 [JavaScript example](#javascript-eventsource) does. See
 [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#streams-close-after-the-stream-was-recreated-or-restored).

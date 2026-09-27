@@ -87,6 +87,13 @@ type streamWatch struct {
 	// behindSince is when a read first found the stream below lastSeq; zero
 	// unless the reads since then all did.
 	behindSince time.Time
+	// markSeq and markTime are a last sequence of the stream and the time of
+	// the message stored there, as of the generation's first read or the
+	// last continuity check (checkContinuity). Only polls move them, after
+	// finding that message still there, so a rewound stream that caught up
+	// between two polls still shows at the next one.
+	markSeq  uint64
+	markTime time.Time
 }
 
 func newStreamWatch(confirm time.Duration) *streamWatch {
@@ -127,6 +134,7 @@ func (w *streamWatch) observe(info *jetstream.StreamInfo, now time.Time) (*strea
 	}
 	if w.created.IsZero() {
 		w.created, w.lastSeq = info.Created, info.State.LastSeq
+		w.markSeq, w.markTime = info.State.LastSeq, info.State.LastTime
 		return w.gen, ""
 	}
 	if !info.Created.Equal(w.created) {
@@ -155,7 +163,47 @@ func (w *streamWatch) end(reason string, info *jetstream.StreamInfo) *streamGene
 	close(w.gen.ended)
 	w.gen = newStreamGeneration()
 	w.created, w.lastSeq, w.behindSince = info.Created, info.State.LastSeq, time.Time{}
+	w.markSeq, w.markTime = info.State.LastSeq, info.State.LastTime
 	return w.gen
+}
+
+// mark returns what the next continuity check compares the stream with: the
+// current generation, and the marked sequence and message time.
+func (w *streamWatch) mark() (*streamGeneration, uint64, time.Time) {
+	if w == nil {
+		return nil, 0, time.Time{}
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.gen, w.markSeq, w.markTime
+}
+
+// advance moves the mark of gen to the last sequence and message time in
+// info, once a continuity check found nothing wrong up to there.
+func (w *streamWatch) advance(gen *streamGeneration, info *jetstream.StreamInfo) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.gen == gen {
+		w.markSeq, w.markTime = info.State.LastSeq, info.State.LastTime
+	}
+}
+
+// rewound ends gen as rewound and starts the next generation from info,
+// unless gen has ended already. It reports whether it ended gen.
+func (w *streamWatch) rewound(gen *streamGeneration, info *jetstream.StreamInfo) bool {
+	if w == nil {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.gen != gen {
+		return false
+	}
+	w.end(streamRewound, info)
+	return true
 }
 
 // observeStream feeds a stream read to the watch, logs a generation it
@@ -170,7 +218,7 @@ func (h *Handler) observeStream(stream jetstream.Stream) *streamGeneration {
 			zap.Time("stream_created", info.Created),
 		)
 	case streamRewound:
-		h.log().Warn("JetStream stream went back to an earlier sequence; closing the SSE streams positioned on it before, whose clients reconnect with their last event ID",
+		h.log().Warn("JetStream stream went back to an earlier sequence; closing the SSE streams positioned on it before, whose clients reconnect from the start of the stream",
 			zap.String("stream", h.StreamName),
 			zap.Uint64("stream_last_sequence", info.State.LastSeq),
 		)
@@ -190,13 +238,61 @@ func (h *Handler) watchStream(interval time.Duration, shutdown <-chan struct{}) 
 			return
 		case <-ticker.C:
 		}
-		if js := h.currentStreamRuntime().js; js != nil {
-			_, _, _ = h.streamReads.read(context.Background(), func() (jetstream.Stream, error) {
-				ctx, cancel := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
-				defer cancel()
-				return js.Stream(ctx, h.StreamName)
-			})
+		js := h.currentStreamRuntime().js
+		if js == nil {
+			continue
 		}
+		gen, seq, seen := h.watch.mark()
+		stream, _, err := h.streamReads.read(context.Background(), func() (jetstream.Stream, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
+			defer cancel()
+			return js.Stream(ctx, h.StreamName)
+		})
+		if err == nil {
+			h.checkContinuity(stream, gen, seq, seen)
+		}
+	}
+}
+
+// checkContinuity notices a stream that went back and has since passed seq,
+// the sequence marked before this poll's read (#137). The reads' last
+// sequences only show a rewound stream while it is still behind; one that
+// caught up looks like a stream that grew, while every open consumer skipped
+// what the restored stream holds between the backup's end and its position.
+// Sequences are never reused, so a message stored at seq at another time than
+// the one seen there is another message. The mark moves on once the message
+// is found unchanged, or cannot be compared: trimmed by the stream's limits
+// or deleted. It stays while the stream is behind it, which the reads handle,
+// and when the message cannot be read now.
+func (h *Handler) checkContinuity(stream jetstream.Stream, gen *streamGeneration, seq uint64, seen time.Time) {
+	info := stream.CachedInfo()
+	if info == nil || info.State.LastSeq < seq {
+		return
+	}
+	if seq == 0 || seen.IsZero() || info.State.FirstSeq > seq {
+		h.watch.advance(gen, info) // nothing to compare
+		return
+	}
+	if info.State.LastSeq == seq && info.State.LastTime.Equal(seen) {
+		return // nothing stored since
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultMetadataReadTimeout)
+	defer cancel()
+	msg, err := stream.GetMsg(ctx, seq)
+	if errors.Is(err, jetstream.ErrMsgNotFound) || (err == nil && msg.Time.Equal(seen)) {
+		h.watch.advance(gen, info)
+		return
+	}
+	if err != nil {
+		return // try again at the next poll
+	}
+	if h.watch.rewound(gen, info) {
+		h.log().Warn("JetStream stream went back to an earlier sequence and has since passed it; closing the SSE streams positioned on it before, whose clients reconnect from the start of the stream",
+			zap.String("stream", h.StreamName),
+			zap.Uint64("sequence", seq),
+			zap.Time("message_time_before", seen),
+			zap.Time("message_time_now", msg.Time),
+		)
 	}
 }
 
@@ -249,7 +345,8 @@ func (h *Handler) openConsumerStream(ctx context.Context, js jetstream.JetStream
 		return nil, err
 	}
 	h.logSubscription(plan)
-	cs.feed = h.startStreamFeed(iterator, plan)
+	feedCtx, stopFeed := context.WithCancel(context.Background())
+	cs.feed = h.startStreamFeed(feedCtx, stopFeed, iterator, plan)
 	return cs, nil
 }
 
@@ -265,12 +362,17 @@ func (h *Handler) trackStream() bool {
 	return true
 }
 
-// close stops pulling and removes the consumer from the server. Only the
-// first call does anything.
+// close stops pulling and removes the consumer from the server once the feed
+// has stopped its iterator: a consumer deleted under a running ordered
+// consumer would be recreated. Only the first call does anything, and it
+// does not wait.
 func (cs *consumerStream) close() {
 	cs.closeOnce.Do(func() {
 		cs.feed.stop()
-		cs.deleteConsumer()
+		go func() {
+			<-cs.feed.exited
+			cs.deleteConsumer()
+		}()
 	})
 }
 
@@ -412,6 +514,8 @@ type streamFeed struct {
 	frames <-chan formattedMessageEvent
 	errs   <-chan error
 	stop   func()
+	// exited is closed once the feed's goroutine has stopped its iterator.
+	exited <-chan struct{}
 }
 
 // feedHandoffFrames is how many formatted frames a feed hands ahead to its
@@ -420,18 +524,28 @@ const feedHandoffFrames = 16
 
 // startStreamFeed pulls from the iterator on its own goroutine, formats each
 // message, drops the ones that cannot be sent, and hands the rest to the
-// writer. The hand-off holds feedHandoffFrames frames and blocks when full,
-// which is what stops further pulls while the writer is busy.
-func (h *Handler) startStreamFeed(it jetstream.MessagesContext, plan streamPlan) *streamFeed {
+// writer, until ctx ends. The hand-off holds feedHandoffFrames frames and
+// blocks when full, which is what stops further pulls while the writer is
+// busy. The feed's stop is stop, which must cancel ctx.
+//
+// Only the feed's goroutine stops the iterator, once Next has returned:
+// nats.go's ordered consumer (v1.54.0) swaps in the subscription of a
+// recreated consumer without holding its lock, so a Stop from another
+// goroutine during a recreation races with it and can leave the new
+// subscription pulling. Cancelling ctx ends a Next that waits for messages
+// at once, and one that is recreating the consumer once the recreation ends.
+func (h *Handler) startStreamFeed(ctx context.Context, stop context.CancelFunc, it jetstream.MessagesContext, plan streamPlan) *streamFeed {
 	frames := make(chan formattedMessageEvent, feedHandoffFrames)
 	errs := make(chan error, 1)
-	done := make(chan struct{})
+	exited := make(chan struct{})
 	go func() {
+		defer close(exited)
+		defer it.Stop()
 		consumerName := ""
 		for {
-			msg, err := it.Next()
+			msg, err := it.Next(jetstream.NextContext(ctx))
 			if err != nil {
-				if !errors.Is(err, jetstream.ErrMsgIteratorClosed) {
+				if ctx.Err() == nil && !errors.Is(err, jetstream.ErrMsgIteratorClosed) {
 					errs <- err
 				}
 				return
@@ -452,22 +566,12 @@ func (h *Handler) startStreamFeed(it jetstream.MessagesContext, plan streamPlan)
 			}
 			select {
 			case frames <- formatted:
-			case <-done:
+			case <-ctx.Done():
 				return
 			}
 		}
 	}()
-	var once sync.Once
-	return &streamFeed{
-		frames: frames,
-		errs:   errs,
-		stop: func() {
-			once.Do(func() {
-				close(done)
-				it.Stop()
-			})
-		},
-	}
+	return &streamFeed{frames: frames, errs: errs, stop: stop, exited: exited}
 }
 
 // noteConsumerChange counts and logs a consumer that the ordered consumer

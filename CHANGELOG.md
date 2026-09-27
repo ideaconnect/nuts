@@ -18,25 +18,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests are told to retry at once.
 
 ### Fixed
-- **A stream recreated under open SSE streams no longer leaves them silent**
-  (#133). Each one's consumer resumed after the last sequence it delivered, a
-  position the new stream had not reached, so it skipped the new stream's
-  messages until it passed it, while heartbeats kept the connection looking
-  healthy. NUTS now reads the stream's info on every stream request and
-  every 10 seconds. When the stream's creation time changes (a stream
-  created again, or restored on nats-server 2.15), it closes the SSE
-  streams opened on the old stream with `disconnect_reason=stream_recreated`.
-  Their last frame is a `reset` event that sets their clients' last event
-  ID to `0`, so EventSource reconnects from the start of the new stream;
-  pages that keep the last event ID across reloads can take it from the
-  event. When the creation time stays but the
-  last sequence goes back, on two reads at least 5 seconds apart (a restore
-  on nats-server 2.14 or earlier, which keep the creation time), they close
-  with `disconnect_reason=stream_rewound` and keep their cursors, which fall
-  back to the retained replay (#103). Both are counted in
-  `nuts_consumer_invalidated_total{reason}`, and shared subscriptions are no
-  longer shared across the change. `caddy reload --force` is no longer
-  needed after recreating a stream.
+- **A stream recreated or restored under open SSE streams no longer leaves
+  them silent** (#133, #137). Each one's consumer resumed after the last
+  sequence it delivered, a position the new stream had not reached, so it
+  skipped the new stream's messages until it passed it, while heartbeats
+  kept the connection looking healthy. NUTS now reads the stream's info on
+  every stream request and every 10 seconds, and closes the SSE streams
+  positioned on the old stream:
+  - with `disconnect_reason=stream_recreated` when the stream's creation
+    time changes (a stream created again, or restored on nats-server 2.15);
+  - with `disconnect_reason=stream_rewound` when the creation time stays but
+    the stream went back to an earlier sequence (a restore on nats-server
+    2.14 or earlier, which keep the creation time). Two reads at least 5
+    seconds apart must find it behind, or a poll must find another message
+    at the sequence it last checked, for a stream that already caught up.
+
+  Their last frame is a `reset` event that sets the client's last event ID
+  to `0`, so EventSource replays the stream from its start: the new or
+  restored stream gives the sequences after its start or its backup's end
+  to other messages, so no earlier cursor is safe. Pages that keep the last
+  event ID across reloads can take it from the event. Both reasons are
+  counted in `nuts_consumer_invalidated_total{reason}`, and shared
+  subscriptions are no longer shared across the change.
+  `caddy reload --force` is no longer needed after recreating a stream.
+- An SSE stream that ended while its JetStream consumer was being recreated
+  (for example a client leaving during a NATS reconnect) could leave the
+  recreated consumer pulling, with no one reading it, until the server
+  reaped it. nats.go's ordered consumer (v1.54.0) swaps in the new
+  consumer's subscription without its lock, and NUTS stopped the iterator
+  from another goroutine at that moment, which is also a data race. NUTS now
+  ends a feed through the context of its pending `Next`, stops the iterator
+  on the feed's own goroutine, and deletes the consumer only after that.
 - Release notes told users to `docker pull idcttech/nuts:<version>` without
   the `v` the image tags carry (`idcttech/nuts:v0.5.0`); the footer now uses
   the tag. The v0.4.3 and v0.5.0 notes are corrected.

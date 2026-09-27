@@ -36,7 +36,7 @@ func receiveFrame(t *testing.T, feed *streamFeed) formattedMessageEvent {
 func TestStreamFeed_DeliversFormattedFramesInOrder(t *testing.T) {
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	it := newFakeIterator(8)
-	feed := h.startStreamFeed(it, testFeedPlan)
+	feed := it.startFeed(h, testFeedPlan)
 	defer feed.stop()
 
 	for seq := uint64(1); seq <= 3; seq++ {
@@ -61,7 +61,7 @@ func TestStreamFeed_DropsOversizedPayloadsBeforeTheWriter(t *testing.T) {
 	// before formatting.
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: 150, logger: zap.NewNop()}
 	it := newFakeIterator(8)
-	feed := h.startStreamFeed(it, testFeedPlan)
+	feed := it.startFeed(h, testFeedPlan)
 	defer feed.stop()
 	before := metricValue(t, metricsMessagesDropped.WithLabelValues(dropReasonRawPayload))
 
@@ -91,7 +91,7 @@ func TestStreamFeed_StopsPullingWhileTheWriterIsBusy(t *testing.T) {
 		for seq := uint64(1); seq <= 100; seq++ {
 			it.msgs <- newFakeJSMsg("events.alpha", seq, "c_1", `{}`)
 		}
-		feed := h.startStreamFeed(it, testFeedPlan)
+		feed := it.startFeed(h, testFeedPlan)
 		defer feed.stop()
 
 		synctest.Wait()
@@ -115,7 +115,7 @@ func TestStreamFeed_StopReleasesAFeedBlockedOnTheWriter(t *testing.T) {
 		for seq := uint64(1); seq <= 100; seq++ {
 			it.msgs <- newFakeJSMsg("events.alpha", seq, "c_1", `{}`)
 		}
-		feed := h.startStreamFeed(it, testFeedPlan)
+		feed := it.startFeed(h, testFeedPlan)
 		synctest.Wait() // the hand-off is full and the feed blocked on it
 		feed.stop()
 		synctest.Wait()
@@ -125,7 +125,7 @@ func TestStreamFeed_StopReleasesAFeedBlockedOnTheWriter(t *testing.T) {
 func TestStreamFeed_ReportsIteratorFailureOnce(t *testing.T) {
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	it := newFakeIterator(1)
-	feed := h.startStreamFeed(it, testFeedPlan)
+	feed := it.startFeed(h, testFeedPlan)
 	defer feed.stop()
 
 	it.errs <- errFakeResetFailed
@@ -144,21 +144,37 @@ func TestStreamFeed_ReportsIteratorFailureOnce(t *testing.T) {
 	}
 }
 
+// TestStreamFeed_StopEndsPullingAndIsIdempotent: stop ends a feed whose
+// Next is waiting for messages, and the feed's own goroutine stops the
+// iterator once Next has returned. A Stop from another goroutine while Next
+// runs races with nats.go's ordered consumer swapping in a recreated
+// consumer's subscription (see startStreamFeed).
 func TestStreamFeed_StopEndsPullingAndIsIdempotent(t *testing.T) {
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1}
 	it := newFakeIterator(1)
-	feed := h.startStreamFeed(it, testFeedPlan)
+	feed := it.startFeed(h, testFeedPlan)
+	for it.inNext.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
 
 	feed.stop()
 	feed.stop()
 	select {
-	case <-it.Closed():
+	case <-feed.exited:
 	case <-time.After(time.Second):
-		t.Fatal("stop did not stop the iterator")
+		t.Fatal("stop did not end the feed")
+	}
+	select {
+	case <-it.Closed():
+	default:
+		t.Fatal("the feed ended without stopping its iterator")
+	}
+	if it.stopDuringNext.Load() {
+		t.Fatal("the iterator was stopped while Next was waiting")
 	}
 	select {
 	case err := <-feed.errs:
-		t.Fatalf("a closed iterator must not be reported as a failure, got %v", err)
+		t.Fatalf("a stopped feed must not report a failure, got %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 }
@@ -167,7 +183,7 @@ func TestStreamFeed_MessageWithoutMetadataIsSentWithoutID(t *testing.T) {
 	core, obs := observer.New(zap.WarnLevel)
 	h := &Handler{TopicPrefix: "events.", MaxEventSize: -1, logger: zap.New(core)}
 	it := newFakeIterator(1)
-	feed := h.startStreamFeed(it, testFeedPlan)
+	feed := it.startFeed(h, testFeedPlan)
 	defer feed.stop()
 
 	it.msgs <- fakeJSMsg{subject: "events.alpha", data: []byte(`{}`), metaErr: jetstream.ErrNotJSMessage}
@@ -274,6 +290,40 @@ func TestConsumerStream_DeleteFailureIsLogged(t *testing.T) {
 			t.Fatal("a stream without consumer info was not released")
 		}
 	})
+}
+
+// TestConsumerStream_CloseDeletesTheConsumerAfterTheFeedStopped: close stops
+// the feed and returns at once, and deletes the consumer only once the feed
+// has stopped its iterator: a consumer deleted under a running ordered
+// consumer would be recreated.
+func TestConsumerStream_CloseDeletesTheConsumerAfterTheFeedStopped(t *testing.T) {
+	deleted := make(chan struct{}, 1)
+	exited := make(chan struct{})
+	stopped := 0
+	cs := &consumerStream{
+		js:       fakeDeleteJS{deleted: deleted},
+		stream:   "EVENTS",
+		consumer: fakeConsumer{info: &jetstream.ConsumerInfo{Name: "nuts_x_1"}},
+		release:  func() {},
+		log:      zap.NewNop(),
+		feed:     &streamFeed{stop: func() { stopped++ }, exited: exited},
+	}
+	cs.close()
+	cs.close()
+	if stopped != 1 {
+		t.Fatalf("feed stopped %d times, want once", stopped)
+	}
+	select {
+	case <-deleted:
+		t.Fatal("the consumer was deleted before the feed stopped its iterator")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(exited)
+	select {
+	case <-deleted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the consumer was not deleted once the feed stopped")
+	}
 }
 
 // TestConsumerStream_NoDeleteWhileDisconnected: with the NATS connection
@@ -450,6 +500,158 @@ func TestStreamWatch_EndsAGenerationWhenTheStreamIsRecreatedOrRewound(t *testing
 	}
 }
 
+// TestStreamWatch_KeepsAContinuityMark: the watch marks a last sequence and
+// the time of the message there for the poll's continuity check (#137). The
+// generation's first read sets the mark and reads do not move it: only a
+// check (advance) does, for the generation it started from, and an ended
+// generation marks the stream as the ending read saw it.
+func TestStreamWatch_KeepsAContinuityMark(t *testing.T) {
+	var none *streamWatch
+	none.advance(nil, nil)
+	if gen, seq, at := none.mark(); gen != nil || seq != 0 || !at.IsZero() || none.rewound(nil, nil) {
+		t.Fatal("a nil watch must do nothing")
+	}
+	created := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	read := func(created time.Time, lastSeq uint64, lastTime time.Time) *jetstream.StreamInfo {
+		return &jetstream.StreamInfo{Created: created, State: jetstream.StreamState{LastSeq: lastSeq, LastTime: lastTime}}
+	}
+	at := func(seq uint64) time.Time { return created.Add(time.Duration(seq) * time.Second) }
+	wantMark := func(w *streamWatch, step string, gen *streamGeneration, seq uint64, seen time.Time) {
+		t.Helper()
+		if g, s, a := w.mark(); g != gen || s != seq || !a.Equal(seen) {
+			t.Fatalf("%s: mark = %d at %v (same generation: %v), want %d at %v", step, s, a, g == gen, seq, seen)
+		}
+	}
+	w := newStreamWatch(time.Second)
+	now := created.Add(time.Hour)
+
+	w.observe(read(created, 10, at(10)), now)
+	gen := w.current()
+	wantMark(w, "first read", gen, 10, at(10))
+	w.observe(read(created, 12, at(12)), now)
+	wantMark(w, "a read of a stream that grew", gen, 10, at(10))
+	w.advance(gen, read(created, 12, at(12)))
+	wantMark(w, "advance", gen, 12, at(12))
+	w.advance(newStreamGeneration(), read(created, 15, at(15)))
+	wantMark(w, "advance for another generation", gen, 12, at(12))
+
+	if !w.rewound(gen, read(created, 20, at(99))) {
+		t.Fatal("rewound did not end the marked generation")
+	}
+	select {
+	case <-gen.done():
+		if gen.reason != streamRewound {
+			t.Fatalf("generation ended with %q, want %q", gen.reason, streamRewound)
+		}
+	default:
+		t.Fatal("the marked generation is still open")
+	}
+	next := w.current()
+	wantMark(w, "after rewound", next, 20, at(99))
+	if w.rewound(gen, read(created, 30, at(30))) {
+		t.Fatal("rewound ended a generation twice")
+	}
+	w.advance(gen, read(created, 30, at(30)))
+	wantMark(w, "a stale rewound and advance", next, 20, at(99))
+
+	w.observe(read(created.Add(time.Minute), 1, at(1)), now)
+	wantMark(w, "recreated", w.current(), 1, at(1))
+}
+
+// continuityStream is a jetstream.Stream whose GetMsg returns msg or err and
+// counts its calls.
+type continuityStream struct {
+	jetstream.Stream
+	info  *jetstream.StreamInfo
+	msg   *jetstream.RawStreamMsg
+	err   error
+	calls int
+}
+
+func (s *continuityStream) CachedInfo() *jetstream.StreamInfo { return s.info }
+
+func (s *continuityStream) GetMsg(context.Context, uint64, ...jetstream.GetMsgOpt) (*jetstream.RawStreamMsg, error) {
+	s.calls++
+	return s.msg, s.err
+}
+
+// TestHandler_CheckContinuity: a poll compares the message stored at the
+// marked sequence with the one seen there. Another message there ends the
+// generation (#137). The mark moves on once the message is found unchanged
+// or cannot be compared, and stays while the stream is behind it, when the
+// message cannot be read now, and for a generation a read ended meanwhile.
+func TestHandler_CheckContinuity(t *testing.T) {
+	created := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	seen := created.Add(time.Minute)
+	later := seen.Add(time.Second)
+	state := func(firstSeq, lastSeq uint64, lastTime time.Time) *jetstream.StreamInfo {
+		return &jetstream.StreamInfo{Created: created, State: jetstream.StreamState{FirstSeq: firstSeq, LastSeq: lastSeq, LastTime: lastTime}}
+	}
+	msgAt := func(at time.Time) *jetstream.RawStreamMsg { return &jetstream.RawStreamMsg{Time: at} }
+	for _, tt := range []struct {
+		name     string
+		info     *jetstream.StreamInfo
+		seq      uint64
+		seen     time.Time
+		msg      *jetstream.RawStreamMsg
+		err      error
+		calls    int
+		advanced bool
+		ended    bool
+		stale    bool // a read ended the generation before the check
+	}{
+		{name: "no stream info", info: nil, seq: 10, seen: seen},
+		{name: "behind the mark: the reads handle it", info: state(1, 9, seen), seq: 10, seen: seen},
+		{name: "nothing marked yet", info: state(1, 12, later), seq: 0, seen: time.Time{}, advanced: true},
+		{name: "an empty stream marked", info: state(1, 12, later), seq: 10, seen: time.Time{}, advanced: true},
+		{name: "the marked message was trimmed", info: state(11, 12, later), seq: 10, seen: seen, advanced: true},
+		{name: "unchanged", info: state(1, 10, seen), seq: 10, seen: seen},
+		{name: "grew, the same message", info: state(1, 12, later), seq: 10, seen: seen, msg: msgAt(seen), calls: 1, advanced: true},
+		{name: "grew, the message was deleted", info: state(1, 12, later), seq: 10, seen: seen, err: jetstream.ErrMsgNotFound, calls: 1, advanced: true},
+		{name: "grew, the read failed", info: state(1, 12, later), seq: 10, seen: seen, err: context.DeadlineExceeded, calls: 1},
+		{name: "same sequence, another message", info: state(1, 10, later), seq: 10, seen: seen, msg: msgAt(later), calls: 1, ended: true},
+		{name: "passed it, another message", info: state(1, 12, later), seq: 10, seen: seen, msg: msgAt(seen.Add(-time.Second)), calls: 1, ended: true},
+		{name: "another message, generation already ended", info: state(1, 12, later), seq: 10, seen: seen, msg: msgAt(later), calls: 1, stale: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			core, obs := observer.New(zap.InfoLevel)
+			h := &Handler{StreamName: "EVENTS", logger: zap.New(core), watch: newStreamWatch(time.Second)}
+			gen := h.watch.current()
+			if tt.stale {
+				h.watch.rewound(gen, state(1, 1, seen))
+			}
+			_, markSeq, markTime := h.watch.mark()
+			stream := &continuityStream{info: tt.info, msg: tt.msg, err: tt.err}
+			h.checkContinuity(stream, gen, tt.seq, tt.seen)
+
+			if stream.calls != tt.calls {
+				t.Fatalf("GetMsg calls = %d, want %d", stream.calls, tt.calls)
+			}
+			select {
+			case <-gen.done():
+				if !tt.ended && !tt.stale {
+					t.Fatal("the generation ended")
+				}
+			default:
+				if tt.ended {
+					t.Fatal("the generation did not end")
+				}
+			}
+			if want := map[bool]int{true: 1, false: 0}[tt.ended]; obs.FilterMessageSnippet("has since passed it").Len() != want {
+				t.Fatalf("the rewind was not logged %d times", want)
+			}
+			_, seq, at := h.watch.mark()
+			moved := seq != markSeq || !at.Equal(markTime)
+			if want := tt.advanced || tt.ended; moved != want {
+				t.Fatalf("mark moved from %d at %v to %d at %v: %v, want %v", markSeq, markTime, seq, at, moved, want)
+			}
+			if moved && (seq != tt.info.State.LastSeq || !at.Equal(tt.info.State.LastTime)) {
+				t.Fatalf("mark = %d at %v, want the stream as read: %d at %v", seq, at, tt.info.State.LastSeq, tt.info.State.LastTime)
+			}
+		})
+	}
+}
+
 // fakeStreamJS is a jetstream.JetStream whose Stream returns stream.
 type fakeStreamJS struct {
 	jetstream.JetStream
@@ -503,18 +705,18 @@ func TestHandler_WatchStreamReadsEveryIntervalUntilShutdown(t *testing.T) {
 	})
 }
 
-// TestHandler_EndGenerationResetsTheCursorOnlyForANewStream: a stream closed
-// because the stream was recreated ends with a reset event whose id, 0, makes
-// EventSource reconnect from the start of the new stream; it is an event so
-// that pages keeping the cursor see it. One closed after a rewind keeps its
-// cursor. Both spread their reconnects with a jittered retry.
-func TestHandler_EndGenerationResetsTheCursorOnlyForANewStream(t *testing.T) {
+// TestHandler_EndGenerationResetsTheCursor: a stream closed because its
+// JetStream stream was recreated or rewound ends with a reset event whose id,
+// 0, makes EventSource replay the stream from its start (#133, #137). It is
+// an event so that pages keeping the cursor see it, and it spreads the
+// reconnects with a jittered retry.
+func TestHandler_EndGenerationResetsTheCursor(t *testing.T) {
 	for _, tt := range []struct {
 		reason string
 		frame  string
 	}{
 		{streamRecreated, "event: reset\ndata: {\"reason\":\"stream_recreated\"}\nid: 0\n\n"},
-		{streamRewound, "\n"},
+		{streamRewound, "event: reset\ndata: {\"reason\":\"stream_rewound\"}\nid: 0\n\n"},
 	} {
 		t.Run(tt.reason, func(t *testing.T) {
 			gen := newStreamGeneration()
