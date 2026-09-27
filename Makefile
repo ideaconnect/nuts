@@ -140,7 +140,10 @@ mutate-tools:
 
 # Full-module mutation testing run. Brings up the Docker NATS stack because
 # gremlins runs `go test ./...` for coverage (hard-coded in gremlins), which
-# transitively executes the godog suite under functional_test/.
+# transitively executes the godog suite under functional_test/. gremlins
+# times each mutant against that coverage run, so the test cache is cleared
+# first: a cached coverage run makes the timeout a couple of seconds and
+# every mutant times out.
 # Output goes to $(MUTATION_OUTPUT_DIR)/run-<UTC-timestamp>.json.
 mutate: docker-up
 	@command -v gremlins >/dev/null 2>&1 || { echo "gremlins not installed. Run 'make mutate-tools' first."; $(MAKE) docker-down; exit 1; }
@@ -149,13 +152,15 @@ mutate: docker-up
 	stamp=$$(date -u +%Y%m%dT%H%M%SZ); \
 	output=$(MUTATION_OUTPUT_DIR)/run-$$stamp.json; \
 	echo "Running mutation testing on github.com/ideaconnect/nuts → $$output"; \
+	go clean -testcache; \
 	gremlins unleash --output $$output . || status=$$?; \
 	if [ $$status -ne 0 ]; then $(MAKE) docker-logs; fi; \
 	$(MAKE) docker-down || status=$$?; \
 	exit $$status
 
-# Scoped mutation run. PKG accepts anything gremlins accepts as a path:
-# a Go file (`make mutate-pkg PKG=auth.go`) or a directory.
+# Scoped mutation run. PKG is a directory, or one Go file of the root package
+# (`make mutate-pkg PKG=auth.go`). gremlins only takes packages, so a file is
+# run as the root package with every other source file excluded.
 mutate-pkg: docker-up
 	@if [ -z "$(PKG)" ]; then echo "Error: PKG is required, e.g. \`make mutate-pkg PKG=auth.go\`"; $(MAKE) docker-down; exit 2; fi
 	@command -v gremlins >/dev/null 2>&1 || { echo "gremlins not installed. Run 'make mutate-tools' first."; $(MAKE) docker-down; exit 1; }
@@ -164,8 +169,16 @@ mutate-pkg: docker-up
 	stamp=$$(date -u +%Y%m%dT%H%M%SZ); \
 	scope=$$(echo "$(PKG)" | tr '/.' '__'); \
 	output=$(MUTATION_OUTPUT_DIR)/run-$$scope-$$stamp.json; \
+	target="$(PKG)"; excludes=""; \
+	case "$(PKG)" in *.go) \
+		target=.; \
+		for f in *.go; do \
+			case "$$f" in "$(PKG)"|*_test.go) ;; *) excludes="$$excludes -E ^$$(echo "$$f" | sed 's/[.]/[.]/g')$$";; esac; \
+		done;; \
+	esac; \
 	echo "Running mutation testing on $(PKG) → $$output"; \
-	gremlins unleash --output $$output $(PKG) || status=$$?; \
+	go clean -testcache; \
+	gremlins unleash --output $$output $$excludes $$target || status=$$?; \
 	if [ $$status -ne 0 ]; then $(MAKE) docker-logs; fi; \
 	$(MAKE) docker-down || status=$$?; \
 	exit $$status
