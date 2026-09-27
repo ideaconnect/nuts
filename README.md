@@ -24,18 +24,25 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 - **[Message Replay](#message-replay-with-last-id-or-last-event-id)**: Clients can reconnect and replay messages from a specific ID using `?last-id=` or the standard `Last-Event-ID` header. Replay can be bounded by `replay_max_messages` or `replay_window` when configured.
 - **Multiple Topics**: Subscribe to multiple NATS subjects simultaneously
 - **Automatic Reconnection**: Built-in NATS reconnection handling; after a reconnect each stream resumes after the last message it delivered, without gaps
+- **[NATS Liveness](#nats_ping_interval)**: NUTS pings the NATS server every 20 seconds, so a server that stops answering is found within a minute; in the meantime, once one request's read times out, new requests are told to retry at once
+- **[Recreated Streams](#message-format)**: When the JetStream stream is recreated or restored under open streams, clients get a `reset` event and replay the new stream from its start
 - **[CORS Support](#cors-and-allowed_origins)**: Configurable cross-origin resource sharing
 - **Heartbeat**: Keep-alive mechanism to prevent connection timeouts
 - **[Backpressure, Not Drops](#slow-clients-and-replay)**: Each stream pulls from JetStream only as fast as its client reads, so bursts and long replays wait in the stream instead of being dropped or disconnecting the client. A client that stops reading is disconnected by `write_timeout` and resumes from its last event ID. Oversized events can still be rejected by `max_event_size`.
+- **[Shared Subscriptions](#shared_subscriptions)**: Optionally, connections caught up with the live stream share one JetStream consumer per topic set
 - **[NATS Authentication](#with-nats-authentication)**: Credentials file, token, or user/password auth for the NUTS-to-NATS connection
 - **NATS TLS / mTLS**: Optional `nats_tls_ca`, `nats_tls_cert`, `nats_tls_key` directives for an encrypted and mutually authenticated NATS connection
 - **[Subscriber JWT Authorization](#subscriber-authentication-and-topic-authorization)**: Optional HMAC-signed JWT auth with per-topic `subscribe` claims, accepted from `Authorization: Bearer` or a configurable cookie
 - **[Connection Caps](#max_connections)**: `max_connections` bounds concurrent SSE streams; rejected clients receive `429 Too Many Requests` with `Retry-After`, and browser `EventSource` clients are told to [retry](#transient-failures-and-eventsource)
 - **[Per-frame Write Bounds](#write_timeout)**: `write_timeout` (default 30 s) bounds every SSE write, so a client that stopped reading cannot tie up a handler indefinitely
 - **Topic Prefixing**: Optional prefix for all NATS subscriptions
+- **[Event Names](#event_type) and [Raw Payloads](#payload_format)**: Name SSE events after their topic or a message header, and send the NATS payload itself instead of the JSON envelope
+- **[Timed Event IDs](#event_id_format)**: `event_id_format sequence_time` adds each message's stored time to its id, so a client returning with a cursor from a replaced stream replays the new one
+- **[Retry Hints](#retry-hints-sse_retry-and-transient_retry)**: `sse_retry` sets EventSource's reconnection delay, and `transient_retry` the delay NUTS asks for after transient failures
 - **[Prometheus Metrics](#prometheus-metrics)**: Built-in `nuts_*` counters and gauges (active connections, messages delivered, slow-client disconnects, replay stats)
-- **[Liveness And Readiness Checks](#liveness-and-readiness-checks)**: `/livez`, `/readyz`, and legacy `/healthz` probe endpoints
+- **[Liveness And Readiness Checks](#liveness-and-readiness-checks)**: `/livez`, `/readyz`, and legacy `/healthz` probe endpoints; `health_details` adds the NATS server and stream details
 - **[Hub Discovery](#hub-discovery)**: Optional `Link` header with `rel="nuts"` for automatic hub detection
+- **[JavaScript Helper](#replay-aware-javascript-helper)**: `example/nuts-client.js`, a dependency-free module that keeps the cursor across page reloads
 
 ## Table of Contents
 
@@ -52,10 +59,19 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 - [Configuration](#configuration)
   - [Caddyfile Syntax](#caddyfile-syntax)
   - [Path-shorthand and `route`](#path-shorthand-and-route)
+  - [`topic_prefix`](#topic_prefix)
+  - [Zero and negative values](#zero-and-negative-values)
   - [`max_event_size`](#max_event_size)
   - [`max_connections`](#max_connections)
   - [`write_timeout`](#write_timeout)
+  - [`nats_ping_interval`](#nats_ping_interval)
+  - [JetStream consumers](#jetstream-consumers)
+  - [`shared_subscriptions`](#shared_subscriptions)
+  - [Consumer limits on nats-server 2.15](#consumer-limits-on-nats-server-215)
   - [`replay_max_messages` and `replay_window`](#replay_max_messages-and-replay_window)
+  - [`event_type`](#event_type)
+  - [`payload_format`](#payload_format)
+  - [`event_id_format`](#event_id_format)
   - [CORS and `allowed_origins`](#cors-and-allowed_origins)
   - [Subscriber authentication and topic authorization](#subscriber-authentication-and-topic-authorization)
   - [Liveness And Readiness Checks](#liveness-and-readiness-checks)
@@ -65,6 +81,8 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 - [Client Usage](#client-usage)
   - [JavaScript EventSource](#javascript-eventsource)
   - [Replay-aware JavaScript helper](#replay-aware-javascript-helper)
+  - [Transient failures and EventSource](#transient-failures-and-eventsource)
+  - [Retry hints: `sse_retry` and `transient_retry`](#retry-hints-sse_retry-and-transient_retry)
   - [Slow Clients And Replay](#slow-clients-and-replay)
   - [Message Replay with `last-id` or `Last-Event-ID`](#message-replay-with-last-id-or-last-event-id)
   - [Message Format](#message-format)
@@ -1410,7 +1428,8 @@ Its `id` is the stream position the subscription starts after: the stream's
 last sequence for a request without a cursor, or the requested cursor for a
 replay. Treat it like any other event ID. It is omitted when the stream
 starts in a fallback replay mode, in which case the client keeps its previous
-cursor.
+cursor. With [`sse_retry`](#retry-hints-sse_retry-and-transient_retry), the
+frame starts with a `retry:` line.
 
 When the JetStream stream is deleted and created again, or restored from a
 backup, under an open stream, NUTS ends the stream with a `reset` event:
@@ -1426,9 +1445,10 @@ id: 0
 The new or restored stream numbers the messages after its start or its
 backup's end anew, so the event sets the client's last event ID to `0`, and
 EventSource replays the stream from its start after the `retry` delay. The
-`reason` is `stream_recreated` or `stream_rewound`. A page that keeps the last event ID across
-page reloads must take it from `reset` events too, as the
-[JavaScript example](#javascript-eventsource) does. See
+`reason` is `stream_recreated` or `stream_rewound`. A page that keeps the
+last event ID across page reloads must take it from `reset` events too, as
+the [JavaScript example](#javascript-eventsource) and the
+[helper](#replay-aware-javascript-helper) do. See
 [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#streams-close-after-the-stream-was-recreated-or-restored).
 
 #### Response headers
@@ -1458,7 +1478,8 @@ rather than published by an application. NUTS does not forward them:
 
 They are counted as `nuts_messages_dropped_total{reason="control_message"}`.
 Their sequence numbers never appear as event IDs, so IDs can skip them.
-Apart from these two headers, NUTS does not look at message headers.
+Apart from these two headers and the one [`event_type header`](#event_type)
+names, NUTS does not look at message headers.
 
 ## Example Scenarios
 
@@ -1603,6 +1624,15 @@ Feature: SSE Streaming with JetStream
     And the event should have an ID
 ```
 
+#### JavaScript Client
+
+The example client's tests use Node.js's built-in test runner (Node.js 20 or
+later, no packages):
+
+```bash
+make test-js
+```
+
 #### All Tests
 
 ```bash
@@ -1692,6 +1722,7 @@ make build              # Build the Caddy binary
 make test               # Run all tests (unit + functional)
 make test-unit          # Run unit tests with embedded NATS
 make test-functional    # Run BDD tests with Docker
+make test-js            # Test the example JavaScript client with Node.js
 make mutate-tools       # Install the pinned gremlins binary
 make mutate             # Run mutation testing on the whole module
 make mutate-pkg PKG=… # Run mutation testing scoped to one file/dir
