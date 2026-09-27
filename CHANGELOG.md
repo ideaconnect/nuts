@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Release notes told users to `docker pull idcttech/nuts:<version>` without
+  the `v` the image tags carry (`idcttech/nuts:v0.5.0`); the footer now uses
+  the tag. The v0.4.3 and v0.5.0 notes are corrected.
+- A version tag also pushed `idcttech/nuts:latest`, so tagging an older commit
+  pointed `latest` back at it (briefly, when v0.4.3 was tagged after `main`
+  had moved on). `latest` is pushed only from `main`, as documented.
+
 ## [0.5.0] - 2026-09-27
 
 A development release on the 0.x line: it makes the breaking changes planned

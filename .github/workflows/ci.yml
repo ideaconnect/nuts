@@ -251,8 +251,11 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: idcttech/nuts
+          # :latest follows main only. {{is_default_branch}} is also true for a
+          # tag on a commit of main, so tagging an older commit (v0.4.3 after
+          # main moved on) used to point :latest back at it.
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
             type=ref,event=tag
 
       # Pre-push gate: build the amd64 image locally (`load: true`) and

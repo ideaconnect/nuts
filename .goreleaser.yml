@@ -104,4 +104,4 @@ release:
     See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
   footer: |
     ---
-    Docker image: `docker pull idcttech/nuts:{{ .Version }}`
+    Docker image: `docker pull idcttech/nuts:{{ .Tag }}`
