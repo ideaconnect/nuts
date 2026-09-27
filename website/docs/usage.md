@@ -362,19 +362,28 @@ const events = new EventSource('/events/my-topic');
 ### Handling Messages
 
 ```javascript
+// Keep the last event ID for replay after a page reload. The handshake and
+// every message carry one, and a reset (the stream was recreated or
+// restored) sets it back to 0. sessionStorage keeps one per tab.
+function remember(e) {
+    if (e.lastEventId) {
+        sessionStorage.setItem('lastEventId', e.lastEventId);
+    }
+}
+
 events.addEventListener('connected', (e) => {
     const { topics } = JSON.parse(e.data);
     console.log('Connected to:', topics);
+    remember(e);
 });
 
 events.addEventListener('message', (e) => {
     const { topic, payload, time } = JSON.parse(e.data);
     console.log(`[${topic}] at ${time}:`, payload);
-
-    if (e.lastEventId) {
-        localStorage.setItem('lastEventId', e.lastEventId);
-    }
+    remember(e);
 });
+
+events.addEventListener('reset', remember);
 
 events.onerror = (e) => {
     console.error('SSE error:', e);
@@ -400,7 +409,7 @@ Clients can resume from where they left off using `last-id` or the standard
 `Last-Event-ID` header:
 
 ```javascript
-const lastId = localStorage.getItem('lastEventId');
+const lastId = sessionStorage.getItem('lastEventId');
 const url = lastId
     ? `/events?topic=notifications&last-id=${encodeURIComponent(lastId)}`
     : '/events?topic=notifications';
@@ -422,6 +431,36 @@ const events = new EventSource(url);
 > **Replay storm caveat:** when the fallback fires, all retained messages are
 > replayed. Cap with `replay_max_messages` and/or `replay_window` for public
 > or multi-tenant routes.
+
+### Replay-Aware Helper
+
+[`example/nuts-client.js`](https://github.com/ideaconnect/nuts/blob/main/example/nuts-client.js)
+wraps `EventSource` with the replay handling above: a dependency-free ES module
+to copy into your application. It keeps the cursor of every event that carries
+one (the handshake, messages and the reset) in `sessionStorage`, resumes from
+it after a reload, and opens a new `EventSource` when one gives up for good:
+
+```javascript
+import { subscribe } from './nuts-client.js';
+
+const stream = subscribe('/events', {
+    topics: ['orders', 'invoices'],
+    on: {
+        message({ topic, payload }) {
+            console.log(`[${topic}]`, payload);
+        },
+    },
+});
+
+// Later:
+stream.close();
+```
+
+With `event_type topic` or `header`, list every event name the route sends in
+`on`: the helper does not see the ID of an event without a listener. The
+[README](https://github.com/ideaconnect/nuts#replay-aware-javascript-helper)
+describes its options, and how to send subscriber JWTs as headers outside
+browsers.
 
 ### Slow Clients
 

@@ -104,7 +104,7 @@ Operational and deployment assets:
 | [Caddyfile](Caddyfile), [Caddyfile.test](Caddyfile.test) | Reference configurations; `Caddyfile.test` powers the functional stack. |
 | [Dockerfile](Dockerfile), [Dockerfile.test](Dockerfile.test) | Production and test images (non-root, uid 10001). |
 | [docker-compose.yml](docker-compose.yml) | Functional-test stack (NATS + NUTS built from source). |
-| [example/](example/), [example_docker/](example_docker/) | Interactive demos (source build vs. published image). |
+| [example/](example/), [example_docker/](example_docker/) | Interactive demos (source build vs. published image). Both pages use the replay-aware client [example/nuts-client.js](example/nuts-client.js), of which `example_docker/` keeps a copy. |
 | [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml), [ops/grafana-dashboard.json](ops/grafana-dashboard.json) | Reference alerts and dashboard. |
 | [scripts/](scripts/) | Helper scripts (e.g. `setup-dev.sh`). |
 | [docs/](docs/) | All in-depth documentation; see the index in [README.md](README.md#further-documentation). |
@@ -129,6 +129,7 @@ go build ./cmd/caddy       # equivalent
 | `make test-unit` | Unit/integration tests with embedded NATS (no Docker). |
 | `make test-performance` | `TestPerformance_*` plus the named hot-path benchmarks. |
 | `make test-functional` | Godog BDD scenarios against the Docker Compose stack. |
+| `make test-js` | Node.js's built-in test runner on the example JavaScript client, [example/nuts-client.js](example/nuts-client.js) (Node.js 20+, no packages); also checks that `example_docker/` has the same copy. |
 | `make test-functional-stress FUNCTIONAL_TEST_STRESS_COUNT=N` | Repeats the functional suite N times to catch flakes. |
 | `make test-functional-matrix` | Runs functional tests against `nats:2.10-alpine` (the supported floor), `nats:2.12-alpine`, `nats:2.14-alpine` (2.14.7+, first release with the multi-filter purge fix) and `nats:2.15-alpine` (matches the embedded `nats-server/v2` major.minor pinned in `go.mod`). |
 | `make test` | `test-unit` + `test-functional`. |
@@ -271,7 +272,8 @@ CI is GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml),
 PRs run, in this order:
 
 1. `gofmt`, `go mod tidy` diff check, golangci-lint, unit tests with coverage,
-   focused race tests, `go vet`, `govulncheck`.
+   focused race tests, `go vet`, the example JavaScript client's tests,
+   `govulncheck`.
 2. Functional test matrix (`nats:2.10-alpine`, `nats:2.12-alpine`,
    `nats:2.14-alpine`, `nats:2.15-alpine`) and a 3× functional stress pass.
 3. Coverage upload to Codecov.

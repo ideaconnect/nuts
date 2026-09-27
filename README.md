@@ -64,6 +64,7 @@ A Caddy Server module that bridges NATS.io JetStream messages to Server-Sent Eve
 - [JetStream Setup](#jetstream-setup)
 - [Client Usage](#client-usage)
   - [JavaScript EventSource](#javascript-eventsource)
+  - [Replay-aware JavaScript helper](#replay-aware-javascript-helper)
   - [Slow Clients And Replay](#slow-clients-and-replay)
   - [Message Replay with `last-id` or `Last-Event-ID`](#message-replay-with-last-id-or-last-event-id)
   - [Message Format](#message-format)
@@ -1128,7 +1129,9 @@ const events = new EventSource('/events/my-topic');
 // Resume from a stored ID after a page reload. EventSource resends this URL,
 // ?last-id= included, on every auto-reconnect, but its own Last-Event-ID
 // header is fresher and takes precedence, so reconnects keep moving forward.
-const lastId = localStorage.getItem('lastEventId');
+// sessionStorage keeps one ID per tab; tabs sharing localStorage would
+// overwrite each other's.
+const lastId = sessionStorage.getItem('lastEventId');
 const url = lastId
     ? `/events?topic=notifications&last-id=${encodeURIComponent(lastId)}`
     : '/events?topic=notifications';
@@ -1139,7 +1142,7 @@ const events = new EventSource(url);
 // back to 0.
 function remember(e) {
     if (e.lastEventId) {
-        localStorage.setItem('lastEventId', e.lastEventId);
+        sessionStorage.setItem('lastEventId', e.lastEventId);
     }
 }
 
@@ -1167,6 +1170,94 @@ events.onerror = (e) => {
     // Custom clients should reconnect with the most recent event ID.
 };
 ```
+
+### Replay-aware JavaScript helper
+
+[`example/nuts-client.js`](example/nuts-client.js) wraps `EventSource` with the
+replay handling above. It is a dependency-free ES module to copy into your
+application, and the demo page in `example/` uses it:
+
+```javascript
+import { subscribe } from './nuts-client.js';
+
+const stream = subscribe('/events', {
+    topics: ['orders', 'invoices'],
+    on: {
+        message({ topic, payload }) {
+            console.log(`[${topic}]`, payload);
+        },
+        reset({ reason }) {
+            // The stream was recreated or restored; it is replayed next.
+            console.log('Stream replaced:', reason);
+        },
+    },
+    onState(state) {
+        // connecting, open, retrying, restarting or closed
+    },
+});
+
+// Later:
+stream.close();
+```
+
+- It takes the cursor from every event that carries one: the `connected`
+  handshake, messages, and the `reset` event, which sets it back to `0`.
+- It keeps the cursor in `sessionStorage`, so a reload resumes after the last
+  event the tab received.
+- When an `EventSource` gives up for good, it opens a new one from the latest
+  cursor after `restartDelay`. NUTS causes that only with answers that will
+  not change, such as a `401` or a `400`; a proxy in front of it can cause it
+  too.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `topics` | `[]` | Topics, each sent as `?topic=`. |
+| `on` | `{}` | Listeners by event name, called with the parsed data and the `MessageEvent`. `message` is the default event name; `connected` and `reset` are NUTS' own. |
+| `storage` | `sessionStorage` | Where the cursor survives reloads, one per tab. `localStorage` shares one between a site's tabs: a reloaded tab resumes where another one is, and misses what arrived in between. `null` keeps it in memory. |
+| `key` | `nuts:` and the URL with its topics | The storage key. |
+| `raw` | `false` | Pass message data as it is, for [`payload_format raw`](#payload_format). NUTS' own events are still parsed. |
+| `withCredentials` | `false` | Send cookies cross-origin, for `subscriber_jwt_cookie`. |
+| `restartDelay` | `10000` | Milliseconds before a new `EventSource` once one gave up. |
+| `onState` | none | Called with `connecting`, `open` (NUTS accepted the subscription), `retrying` (`EventSource` reconnects by itself), `restarting` and `closed`. |
+| `EventSource` | `globalThis.EventSource` | The implementation to use. |
+
+With [`event_type`](#event_type) `topic` or `header`, events are named after
+their topic or header value, so list every name the route sends in `on`. The
+helper does not see the ID of an event without a listener: a reload would
+resume from an earlier one and repeat events, though it never skips any.
+
+Browsers cannot set headers on `EventSource`, so subscriber JWTs travel in a
+cookie there ([`subscriber_jwt_cookie`](#subscriber-authentication-and-topic-authorization)).
+Elsewhere, pass an implementation that can send headers, such as the
+[`eventsource`](https://www.npmjs.com/package/eventsource) package:
+
+```javascript
+import { EventSource } from 'eventsource';
+import { subscribe } from './nuts-client.mjs';
+
+class AuthorizedEventSource extends EventSource {
+    constructor(url, init) {
+        super(url, {
+            ...init,
+            fetch: (input, request) => fetch(input, {
+                ...request,
+                headers: { ...request.headers, Authorization: `Bearer ${token}` },
+            }),
+        });
+    }
+}
+
+subscribe('https://example.com/events', {
+    topics: ['orders'],
+    storage: null,
+    EventSource: AuthorizedEventSource,
+    on: { message: (data) => console.log(data) },
+});
+```
+
+In Node.js, save it as `nuts-client.mjs`, or in a package with
+`"type": "module"`, so that it loads as an ES module. `make test-js` runs its
+tests with Node.js's built-in test runner (Node.js 20 or later, no packages).
 
 ### Transient failures and EventSource
 

@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `example/nuts-client.js`, a dependency-free ES module wrapping
+  EventSource for replay-aware pages (#146). It keeps the cursor of every
+  event that carries one, the `reset` included, in `sessionStorage` or a
+  storage of your choice, resumes from it after a reload, and opens a new
+  EventSource when one gives up for good. The demo pages use it, and
+  `make test-js` runs its tests with Node.js's built-in test runner. The
+  README and website snippets now keep their cursor in `sessionStorage`,
+  one per tab: tabs sharing `localStorage` overwrote each other's. The
+  source-build demo's `start.sh` now names the page's address,
+  `/example/` (`/example` redirects there), and the image demo pulls the
+  latest image before it starts.
 - `sse_retry <milliseconds>` sends `retry:` with every stream's handshake,
   setting EventSource's reconnection delay after ordinary disconnects, and
   `transient_retry <seconds>` sets the average of the jittered delay NUTS

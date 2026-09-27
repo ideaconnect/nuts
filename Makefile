@@ -1,4 +1,4 @@
-.PHONY: all build test test-unit test-performance test-functional test-functional-dev test-functional-stress test-functional-matrix release-check docker-up wait-functional-stack docker-down docker-logs mutate mutate-pkg mutate-tools clean website-build website-serve website-clean
+.PHONY: all build test test-unit test-performance test-functional test-functional-dev test-functional-stress test-functional-matrix test-js release-check docker-up wait-functional-stack docker-down docker-logs mutate mutate-pkg mutate-tools clean website-build website-serve website-clean
 
 DOCKER_COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo docker compose; elif docker-compose version >/dev/null 2>&1; then echo docker-compose; fi)
 FUNCTIONAL_TEST_STRESS_COUNT ?= 3
@@ -31,6 +31,13 @@ test-unit:
 test-performance:
 	go test -run '^TestPerformance_' -timeout 180s .
 	go test -run '^$$' -bench 'Benchmark(FormatMessageEvent|FormatMessageEventLarge|WriteJSONPayload|IsValidTopic|StreamFeed|SharedFanOut)' -benchmem .
+
+# Run the example JavaScript client's tests with Node.js's built-in runner
+# (Node.js 20 or later, no packages), and check that example_docker carries
+# the same copy of the client.
+test-js:
+	node --test example/nuts-client.test.mjs
+	cmp example/nuts-client.js example_docker/nuts-client.js
 
 # Validate GoReleaser config without requiring a local GoReleaser install.
 release-check:
@@ -252,6 +259,7 @@ help:
 	@echo "  test             - Run all tests (unit + functional)"
 	@echo "  test-unit        - Run unit tests with embedded NATS"
 	@echo "  test-performance - Run performance confidence tests and benchmarks"
+	@echo "  test-js          - Run the example JavaScript client's tests with Node.js"
 	@echo "  test-functional  - Run functional/BDD tests with Docker"
 	@echo "  test-functional-stress - Run functional/BDD tests repeatedly with Docker"
 	@echo "  test-functional-matrix - Run functional/BDD tests against old and current NATS images"

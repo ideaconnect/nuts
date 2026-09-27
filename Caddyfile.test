@@ -111,6 +111,10 @@
 		}
 	}
 
+	# The demo page (example/) imports ./nuts-client.js, which resolves
+	# next to the page only under /example/.
+	redir /example /example/
+
 	handle /example* {
 		root * /srv/example
 		uri strip_prefix /example

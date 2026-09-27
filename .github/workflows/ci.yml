@@ -61,6 +61,14 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Run example client tests
+        run: make test-js
+
       - name: Run govulncheck
         # Pinned to match the rest of CI (golangci-lint, trivy, action SHAs).
         # Bump in lockstep with Renovate/Dependabot updates.

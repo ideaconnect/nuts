@@ -15,7 +15,8 @@
 		}
 	}
 
-	route / {
+	@static path / /nuts-client.js
+	route @static {
 		root * /srv/static
 		file_server
 	}

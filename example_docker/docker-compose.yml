@@ -41,6 +41,7 @@ services:
     volumes:
       - ./Caddyfile:/app/Caddyfile:ro
       - ./index.html:/srv/static/index.html:ro
+      - ./nuts-client.js:/srv/static/nuts-client.js:ro
     depends_on:
       nats-init:
         condition: service_completed_successfully

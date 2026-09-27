@@ -173,6 +173,7 @@ subset that matches the change when a full local pass would be unreasonable.
 - [ ] `make test-functional-matrix` passes for NATS compatibility changes.
 - [ ] `make test-performance` passes for formatter, buffering, replay, or
   concurrency changes.
+- [ ] `make test-js` passes for changes to `example/nuts-client.js`.
 - [ ] Production Docker image changes build and pass
   `caddy adapt --config /app/Caddyfile` inside the image.
 - [ ] Release tooling changes pass `make release-check` and a GoReleaser

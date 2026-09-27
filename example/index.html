@@ -144,7 +144,9 @@
         <div class="status-dot"><span class="dot wait" id="dot-both"></span> both</div>
     </div>
 
-    <script>
+    <script type="module">
+        import { subscribe } from './nuts-client.js';
+
         const MAX_ENTRIES = 30;
         const columns = {
             numbers: document.getElementById('col-numbers'),
@@ -201,57 +203,32 @@
             dots[name].className = 'dot ' + state;
         }
 
-        function subscribe(url, name, handler) {
-            var es;
-            var lastEventId = '';
-            function connect() {
-                // A new EventSource starts without a Last-Event-ID, so the
-                // cursor of the one that closed travels in the URL instead.
-                var target = lastEventId ? url + '&last-id=' + encodeURIComponent(lastEventId) : url;
-                es = new EventSource(target);
-                es.addEventListener('connected', function(e) {
-                    if (e.lastEventId) { lastEventId = e.lastEventId; }
-                    setDot(name, 'ok');
-                });
-                es.addEventListener('message', function(e) {
-                    if (e.lastEventId) { lastEventId = e.lastEventId; }
-                    handler(JSON.parse(e.data));
-                });
-                // The stream was recreated: its messages start again from 1,
-                // so a new EventSource must resume from the start as well.
-                es.addEventListener('reset', function(e) {
-                    lastEventId = e.lastEventId;
-                });
-                es.onerror = function() {
-                    if (es.readyState === EventSource.CLOSED) {
-                        setDot(name, 'err');
-                        // NUTS answers transient failures (NATS outage,
-                        // connection caps) with a retry delay that
-                        // EventSource follows by itself. It only closes on
-                        // errors that will not clear up on their own, or when
-                        // a proxy in front of NUTS fails, so retry slowly and
-                        // resume after the last event received.
-                        setTimeout(connect, 10000);
-                    } else {
-                        setDot(name, 'wait');
-                    }
-                };
-            }
-            connect();
+        // Each column is a subscription of its own. nuts-client.js keeps its
+        // cursor in sessionStorage, so a reload resumes after the last event
+        // the column received, and it opens a new EventSource when one gives
+        // up for good.
+        function watch(name, topics, handler) {
+            subscribe('/events', {
+                topics: topics,
+                on: { message: handler },
+                onState: function(state) {
+                    setDot(name, state === 'open' ? 'ok' : state === 'restarting' ? 'err' : 'wait');
+                },
+            });
         }
 
         // Column 1: numbers only
-        subscribe('/events?topic=numbers', 'numbers', function(data) {
+        watch('numbers', ['numbers'], function(data) {
             addEntry('numbers', extractValue(data), data.topic, data.time);
         });
 
         // Column 2: letters only
-        subscribe('/events?topic=letters', 'letters', function(data) {
+        watch('letters', ['letters'], function(data) {
             addEntry('letters', extractValue(data), data.topic, data.time);
         });
 
         // Column 3: both topics
-        subscribe('/events?topic=numbers&topic=letters', 'both', function(data) {
+        watch('both', ['numbers', 'letters'], function(data) {
             addEntry('both', extractValue(data), data.topic, data.time);
         });
     </script>

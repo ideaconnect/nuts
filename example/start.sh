@@ -9,6 +9,6 @@ fi
 echo ""
 echo "========================================"
 echo "  NUTS is ready!"
-echo "  Open: http://localhost:8080"
+echo "  Open: http://localhost:8080/example/"
 echo "========================================"
 echo ""
