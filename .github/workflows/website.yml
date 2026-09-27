@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
@@ -49,7 +49,7 @@ jobs:
       # 22, not 20: the pinned Wrangler below requires Node >= 22. Keep in step with
       # website/Dockerfile so `make website-build` still mirrors this build.
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
