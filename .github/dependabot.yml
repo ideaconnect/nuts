@@ -93,6 +93,15 @@ updates:
       - docker
     commit-message:
       prefix: deps(docker)
+    ignore:
+      # The golang build image follows the toolchain go.mod pins, which CI,
+      # the tests, govulncheck and the release archives use. A new Go minor
+      # is a deliberate move across go.mod, both Dockerfiles and
+      # golangci-lint, so only patch updates are proposed here (#160).
+      - dependency-name: golang
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
     groups:
       docker-minor-and-patch:
         applies-to: version-updates
