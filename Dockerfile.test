@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Build stage
-FROM golang:1.26.8-alpine AS builder
+FROM golang:1.27.1-alpine AS builder
 
 ENV GOTOOLCHAIN=auto CGO_ENABLED=0
 
