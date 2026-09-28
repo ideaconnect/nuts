@@ -87,7 +87,8 @@ jobs:
         uses: anchore/sbom-action/download-syft@v0
 
       - name: Install Cosign for checksum signing
-        uses: sigstore/cosign-installer@v4
+        # A full version: cosign-installer publishes no major tag (no v4).
+        uses: sigstore/cosign-installer@v4.1.2
         with:
           # Pin cosign itself, not just the installer action. The rest
           # of the supply-chain tooling pins tightly (golangci-lint

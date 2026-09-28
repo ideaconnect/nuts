@@ -295,8 +295,11 @@ CI is GitHub Actions:
 | [fuzz.yml](.github/workflows/fuzz.yml) | Nightly at 04:00 UTC: every fuzz target. |
 | [mutation.yml](.github/workflows/mutation.yml) | Weekly on Sunday at 03:00 UTC: the full gremlins run. |
 
-Actions are pinned by major version (`@v7`), and Dependabot proposes the
-bumps.
+Actions are pinned by major version (`@v7`), except
+`sigstore/cosign-installer`, which publishes no major tags and is pinned to a
+release (`@v4.1.2`); Dependabot proposes the bumps. A tag-only job is the
+first to use an action's new ref, so check that the ref exists before bumping
+one.
 
 PRs run, in this order:
 
