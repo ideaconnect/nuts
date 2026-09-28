@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-28
+
+The code of 0.6.0, which was tagged but never published: its release
+workflow could not resolve `sigstore/cosign-installer@v4`, so there is no
+`v0.6.0` image or GitHub release. Upgrading from 0.5.x, read the 0.6.0 notes
+below, **Upgrading** first.
+
+### Fixed
+- The CI and release workflows asked for `sigstore/cosign-installer@v4`, a
+  tag that action does not publish (it tags full versions only), so the
+  `v0.6.0` tag's image, signatures and GitHub release were never published.
+  They pin `v4.1.2`.
+
 ## [0.6.0] - 2026-09-28
+
+Tagged but not published; 0.6.1 carries the same code.
 
 A development release on the 0.x line. SSE streams on a JetStream stream that
 was recreated or restored no longer go silent, and requests no longer wait on

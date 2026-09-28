@@ -646,7 +646,8 @@ These are carried over from the v0.4 burn-list (P2 product polish).
 - [ ] Optional gap signal (D4e, from [#107]): opt-in by decision; no client
   has asked for it.
 
-All of the above shipped in v0.6.0 except the open items.
+All of the above shipped in v0.6.1 (v0.6.0 was tagged but not published),
+except the open items.
 
 ## Exit criteria
 
