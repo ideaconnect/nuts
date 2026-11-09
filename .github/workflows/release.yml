@@ -88,7 +88,7 @@ jobs:
 
       - name: Install Cosign for checksum signing
         # A full version: cosign-installer publishes no major tag (no v4).
-        uses: sigstore/cosign-installer@v4.1.2
+        uses: sigstore/cosign-installer@v4.1.3
         with:
           # Pin cosign itself, not just the installer action. The rest
           # of the supply-chain tooling pins tightly (golangci-lint
